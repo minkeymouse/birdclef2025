@@ -18,7 +18,7 @@ class CFG:  # pylint: disable=too-few-public-methods
     # Reproducibility & runtime
     # ────────────────────────────────────────────────────────────────────────
     SEED: int = 42              # master RNG seed
-    DEVICE: str = "gpu"         # "cuda" | "gpu" | "cpu"
+    DEVICE: str = "cuda"         # "cuda" | "gpu" | "cpu"
 
     # Helper: stable class ordering (optional)
     CLASSES: List[str] = []
