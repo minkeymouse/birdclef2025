@@ -238,7 +238,7 @@ def train(args: argparse.Namespace) -> None:
             t = torch.randint(0, Tsteps, (bs,), device=DEVICE)
 
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 pred = model(wav, t, noise, spectrogram=mel)
                 loss = F.mse_loss(pred, noise)
 
@@ -256,7 +256,6 @@ def train(args: argparse.Namespace) -> None:
     print(f"Saved checkpoint to {outp}")
 
 # ───── Generation ─────
-
 def generate(args: argparse.Namespace) -> None:
     model = DiffWaveCond().to(DEVICE)
     sd = torch.load(args.checkpoint, map_location=DEVICE)
