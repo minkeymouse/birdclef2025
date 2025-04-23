@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-diffwave.py – minority-class data synthesis
-=========================================
-Fine-tunes a *conditional* DiffWave model on under-represented
-species in BirdCLEF 2025, then generates extra 5-second waveforms
-that process.py can incorporate into train.csv.
+ diffwave.py – minority-class data synthesis
+ =========================================
+ Fine-tunes a *conditional* DiffWave model on under-represented
+ species in BirdCLEF 2025, then generates extra 5-second waveforms
+ that process.py can incorporate into train.csv.
 
-Usage:
-  python diffwave.py train [--epochs E] [--species S1,S2] [--pretrained PATH]
-  python diffwave.py generate [--checkpoint PATH] [--species S1,S2]
-  python diffwave.py remove
+ Usage:
+   python diffwave.py train [--epochs E] [--batch-size B] [--species S1,S2] [--pretrained PATH]
+   python diffwave.py generate [--checkpoint PATH] [--species S1,S2]
+   python diffwave.py remove
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ DIFFWAVE_CFG = {
 BETA_START, BETA_END = 1e-4, 0.02
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Mel extractor: output shape [n_mels, time]
+# Mel extractor (CPU)
 MEL_EXTRACTOR = T.MelSpectrogram(
     sample_rate=SAMPLE_RATE,
     n_fft=1024,
@@ -95,9 +95,9 @@ class MinorityDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx: int):
-        fp, _ = self.files[idx]
-        wav = load_audio(fp)                 # np.ndarray[T]
-        wav = torch.from_numpy(wav).unsqueeze(0)  # [1, T]
+        fp, sp = self.files[idx]
+        wav_np = load_audio(fp)                 # np.ndarray[T]
+        wav = torch.from_numpy(wav_np).unsqueeze(0)  # [1, T]
         # pad or random crop to SEG_SAMPLES
         if wav.size(1) < SEG_SAMPLES:
             reps = math.ceil(SEG_SAMPLES / wav.size(1))
@@ -106,8 +106,8 @@ class MinorityDataset(Dataset):
             off = random.randint(0, wav.size(1) - SEG_SAMPLES)
             wav = wav[:, off:off+SEG_SAMPLES]
         # mel: [n_mels, mel_len]
-        # mel-spectrogram: [n_mels, mel_len]
-        mel = MEL_EXTRACTOR(wav).squeeze(0)
+        mel = MEL_EXTRACTOR(wav)               # runs on CPU
+        mel = mel.squeeze(0)                   # [n_mels, mel_len]
         # Crop mel frames so mel_len * hop_length == SEG_SAMPLES
         hop = MEL_EXTRACTOR.hop_length
         target_frames = SEG_SAMPLES // hop
@@ -183,7 +183,6 @@ def remove_synthetic() -> None:
     print("Removed all synthetic files.")
 
 # ───── Training ─────
-
 def train(args: argparse.Namespace) -> None:
     plan = compute_plan(CFG.TRAIN_CSV)
     spec_list = args.species or [s for s,k in plan.items() if k>0]
@@ -192,15 +191,27 @@ def train(args: argparse.Namespace) -> None:
         return
 
     ds = MinorityDataset(spec_list)
-    loader = DataLoader(ds,
-                        batch_size=CFG.DIFF_BATCH_SIZE,
-                        shuffle=True,
-                        num_workers=CFG.DIFF_NUM_WORKERS,
-                        drop_last=True)
+    loader = DataLoader(
+        ds,
+        batch_size=CFG.DIFF_BATCH_SIZE,
+        shuffle=True,
+        num_workers=CFG.DIFF_NUM_WORKERS,
+        drop_last=True,
+        pin_memory=True,
+    )
 
     model = DiffWaveCond().to(DEVICE)
-    model = torch.compile(model, backend="inductor", mode="reduce-overhead")
-    opt = bnb.optim.AdamW8bit(model.parameters(), lr=CFG.DIFF_LR * 0.1, eps=1e-6)
+    # Mixed-precision
+    scaler = torch.cuda.amp.GradScaler()
+
+    # Optional TorchCompile (comment out if memory issues persist)
+    try:
+        model = torch.compile(model, backend="inductor", mode="reduce-overhead")
+    except Exception:
+        pass
+
+    opt = bnb.optim.AdamW8bit(model.parameters(), lr=CFG.DIFF_LR, eps=1e-6)
+
     if args.pretrained:
         sd = torch.load(args.pretrained, map_location=DEVICE)
         model.model.load_state_dict(sd, strict=False)
@@ -209,7 +220,8 @@ def train(args: argparse.Namespace) -> None:
         vb = DiffWaveVocoder.from_hparams(
             source="speechbrain/tts-diffwave-ljspeech",
             savedir="pretrained_models/diffwave-ljspeech",
-            run_opts={"device":DEVICE.type})
+            run_opts={"device":DEVICE.type},
+        )
         sd = vb.mods["diffwave"].state_dict()
         model.model.load_state_dict(sd, strict=False)
         print("Loaded LJSpeech pretrained weights.")
@@ -219,24 +231,27 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         running = 0.0
         for wav, mel in loader:
-            wav = wav.to(DEVICE)
-            mel = mel.to(DEVICE)
-            bs    = wav.size(0)
+            wav = wav.to(DEVICE, non_blocking=True)
+            mel = mel.to(DEVICE, non_blocking=True)
+            bs = wav.size(0)
             noise = torch.randn_like(wav)
-            t     = torch.randint(0, Tsteps, (bs,), device=DEVICE)
+            t = torch.randint(0, Tsteps, (bs,), device=DEVICE)
 
-            # Plain FP32 training step
-            pred = model(wav, t, noise, spectrogram=mel)
-            loss = F.mse_loss(pred, noise)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+            with torch.cuda.amp.autocast():
+                pred = model(wav, t, noise, spectrogram=mel)
+                loss = F.mse_loss(pred, noise)
+
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
 
             running += loss.item() * bs
         avg_loss = running / len(ds)
         print(f"Epoch {ep}/{args.epochs}  Loss {avg_loss:.6f}")
 
     outp = CFG.DIFFWAVE_MODEL_DIR / "diffwave_cond.pth"
+    outp.parent.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), outp)
     print(f"Saved checkpoint to {outp}")
 
@@ -262,12 +277,12 @@ def generate(args: argparse.Namespace) -> None:
                 rows.append((sp, fn))
             print(f"Generated {n} for {sp}")
     if manifest:
-        CFG.PROCESSED_DIR.mkdir(exist_ok=True)
-        pd.DataFrame(manifest).to_csv(CFG.PROCESSED_DIR/"synthetic_manifest.csv",index=False)
+        CFG.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(manifest).to_csv(CFG.PROCESSED_DIR/"synthetic_manifest.csv",
+                                       index=False)
         patch_train_csv(rows)
 
 # ───── CLI ─────
-
 def parse_args():
     p = argparse.ArgumentParser(description="DiffWave minority-class synthesizer")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -282,11 +297,15 @@ def parse_args():
     sub.add_parser("remove")
     return p.parse_args()
 
+
 def main():
     args = parse_args()
-    if args.cmd=="train": train(args)
-    elif args.cmd=="generate": generate(args)
-    else: remove_synthetic()
+    if args.cmd == "train":
+        train(args)
+    elif args.cmd == "generate":
+        generate(args)
+    else:
+        remove_synthetic()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
