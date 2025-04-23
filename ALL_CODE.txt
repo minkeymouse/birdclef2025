@@ -1,0 +1,2210 @@
+#### code_collector.py
+#!/usr/bin/env python3
+"""
+collect_code.py – concatenate code files into a single text file
+
+Walks the current directory and all subdirectories, finds files with common
+code extensions, and writes their contents (with headers) into one output file.
+
+Usage:
+  python collect_code.py [--output ALL_CODE.txt] [--extensions .py,.js,...]
+"""
+
+import os
+import argparse
+from pathlib import Path
+
+# Default extensions to include
+DEFAULT_EXTS = [
+    '.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.hpp', '.sh', '.bat', '.yaml', '.yml', '.json', '.md'
+]
+
+
+def collect_code_files(root: Path, extensions: list[str]) -> list[Path]:
+    """Recursively collect files under root matching the given extensions."""
+    matches = []
+    for dirpath, _, filenames in os.walk(root):
+        for fname in filenames:
+            if any(fname.endswith(ext) for ext in extensions):
+                matches.append(Path(dirpath) / fname)
+    return matches
+
+
+def concatenate_files(files: list[Path], output: Path) -> None:
+    """Write each file's path and contents into the output file."""
+    with output.open('w', encoding='utf-8') as out_f:
+        for fpath in sorted(files):
+            out_f.write(f"#### {fpath}\n")
+            try:
+                text = fpath.read_text(encoding='utf-8')
+            except Exception:
+                # Binary or unreadable file
+                out_f.write(f"[Could not read contents of {fpath}]\n\n")
+                continue
+            out_f.write(text)
+            out_f.write("\n\n")
+    print(f"Collected {len(files)} files into {output}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Concatenate code files into one text file.")
+    p.add_argument(
+        '--output', '-o', type=Path, default=Path('ALL_CODE.txt'),
+        help='Output file path'
+    )
+    p.add_argument(
+        '--extensions', '-e', type=lambda s: s.split(','),
+        default=DEFAULT_EXTS,
+        help='Comma-separated list of file extensions to include'
+    )
+    p.add_argument(
+        '--root', '-r', type=Path, default=Path('.'),
+        help='Root directory to search'
+    )
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    files = collect_code_files(args.root, args.extensions)
+    concatenate_files(files, args.output)
+
+
+if __name__ == '__main__':
+    main()
+
+
+#### configure.py
+# configure.py – central configuration for the **BirdCLEF 2025** pipeline
+# =============================================================================
+# One authoritative source of truth for every tunable used by the codebase.
+# Edit paths & hyper‑parameters here, re‑run the affected stage, and *never*
+# hunt for magic numbers scattered across modules again. ❤
+# =============================================================================
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List
+
+
+class CFG:  # pylint: disable=too-few-public-methods
+    """Global, immutable configuration namespace."""
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Reproducibility & runtime
+    # ────────────────────────────────────────────────────────────────────────
+    SEED: int = 42              # master RNG seed
+    DEVICE: str = "cuda"         # "cuda" | "gpu" | "cpu"
+
+    # Helper: stable class ordering (optional)
+    CLASSES: List[str] = []
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Filesystem layout  – adjust to your environment / Kaggle dataset mount
+    # ────────────────────────────────────────────────────────────────────────
+    DATA_ROOT: Path = Path("/data/birdclef")
+
+    TRAIN_AUDIO_DIR: Path = DATA_ROOT / "train_audio"
+    TRAIN_SOUNDSCAPE_DIR: Path = DATA_ROOT / "train_soundscapes"
+    TRAIN_CSV: Path = DATA_ROOT / "train.csv"
+    TAXONOMY_CSV: Path = DATA_ROOT / "taxonomy.csv"
+    TEST_DIR: Path = DATA_ROOT / "test_soundscapes"
+    SAMPLE_SUBMISSION: Path = DATA_ROOT / "sample_submission.csv"
+
+    # Pre‑processing outputs
+    PROCESSED_DIR: Path = DATA_ROOT / "processed"  # mels/ labels/ *_metadata.csv
+
+    # Model checkpoints
+    MODELS_DIR: Path = DATA_ROOT / "models"
+    EFF_MODEL_DIR: Path = MODELS_DIR / "efficientnet"
+    REG_MODEL_DIR: Path = MODELS_DIR / "regnety"
+    DIFFWAVE_MODEL_DIR: Path = MODELS_DIR / "diffwave"
+    BENCHMARK_MODEL: Path = MODELS_DIR / "benchmark/model_fold0.pth"  # ext. classifier or folder
+
+    # Inference artifact
+    SUBMISSION_OUT: Path = DATA_ROOT / "submission.csv"
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Audio / spectrogram params – **keep consistent across modules**
+    # ────────────────────────────────────────────────────────────────────────
+    SAMPLE_RATE: int = 32_000
+    N_FFT: int = 1024
+    HOP_LENGTH: int = 500
+    N_MELS: int = 128
+    FMIN: int = 40
+    FMAX: int = 15_000
+    POWER: float = 2.0
+
+    TARGET_SHAPE: tuple[int, int] = (256, 256)  # resize for CNN
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Chunking strategy
+    # ────────────────────────────────────────────────────────────────────────
+    TRAIN_CHUNK_SEC: int = 10
+    TRAIN_CHUNK_HOP_SEC: int = 5
+    SC_SEG_SEC: int = 5  # evaluation granularity
+
+    FOLD0_RATIO: float = 0.80  # % of cleanest clips used for training
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Pre‑processing heuristics
+    # ────────────────────────────────────────────────────────────────────────
+    TRIM_TOP_DB: int = 20
+    RMS_THRESHOLD: float = 0.01
+    MIN_RATING: int = 0
+    PSEUDO_THRESHOLD: float = 0.50
+
+    USE_SOFT_LABELS: bool = True
+    LABEL_WEIGHT_PRIMARY: float = 0.95
+    LABEL_WEIGHT_BENCH: float = 0.05
+
+    RARE_COUNT_THRESHOLD: int = 20
+    RARE_WEIGHT: float = 2.0
+    PSEUDO_WEIGHT: float = 0.5
+
+    MEL_CACHE_SIZE: int = 2048
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Data‑augmentation
+    # ────────────────────────────────────────────────────────────────────────
+    SPEC_AUG_FREQ_MASK_PARAM: int = 10
+    SPEC_AUG_TIME_MASK_PARAM: int = 50
+    SPEC_AUG_NUM_MASKS: int = 2
+    CUTMIX_PROB: float = 0.5
+
+    # ────────────────────────────────────────────────────────────────────────
+    # EfficientNet‑B0
+    # ────────────────────────────────────────────────────────────────────────
+    EFF_NUM_MODELS: int = 2
+    EFF_BATCH_SIZE: int = 32
+    EFF_EPOCHS: int = 10
+    EFF_LR: float = 2e-3
+    EFF_WEIGHT_DECAY: float = 1e-4
+    EFF_NUM_WORKERS: int = 4
+
+    # ────────────────────────────────────────────────────────────────────────
+    # RegNetY‑0.8GF
+    # ────────────────────────────────────────────────────────────────────────
+    REG_NUM_MODELS: int = 2
+    REG_BATCH_SIZE: int = 32
+    REG_EPOCHS: int = 10
+    REG_LR: float = 2e-3
+    REG_WEIGHT_DECAY: float = 1e-4
+    REG_NUM_WORKERS: int = 4
+
+    # ────────────────────────────────────────────────────────────────────────
+    # DiffWave minority‑class synthesis
+    # ────────────────────────────────────────────────────────────────────────
+    DIFF_BATCH_SIZE: int = 3
+    DIFF_EPOCHS: int = 40
+    DIFF_LR: float = 1e-4
+    DIFF_NUM_WORKERS: int = 8
+    DIFF_RARE_THRESHOLD: int = 10  # if real recordings < 10 ⇒ target for synth
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Inference / ensemble parameters
+    # ────────────────────────────────────────────────────────────────────────
+    INF_BATCH_SIZE: int = 16
+    INF_NUM_WORKERS: int = 4
+    INF_SMOOTH_NEIGHBORS: int = 2  # ±2 × 5 s segments
+
+    # ────────────────────────────────────────────────────────────────────────
+    # CPU optimisation (OpenVINO / ONNX)
+    # ────────────────────────────────────────────────────────────────────────
+    USE_OPENVINO: bool = True
+    OV_NUM_THREADS: int | None = None
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Convenience
+    # ────────────────────────────────────────────────────────────────────────
+    @classmethod
+    def use_cuda(cls) -> bool:  # tiny helper
+        return str(cls.DEVICE).lower() in {"cuda", "gpu"}
+
+
+# EOF
+
+
+#### data_utils.py
+#!/usr/bin/env python
+"""data_utils.py – shared utility layer for the **BirdCLEF 2025** solution
+====================================================================
+This module centralises *all* common data‑handling functionality so that the
+rest of the pipeline (``process.py``, ``efficientnet.py``, ``regnety.py``,
+``diffwave.py``) can remain lean.  Key capabilities:
+
+* **Audio I/O** with deterministic resampling (+ optional WebRTC VAD removal)
+* **Mel‑spectrogram extraction** via either SpeechBrain (GPU) or Librosa (CPU)
+* **SpecAugment** + **CutMix** implementations fully driven by ``configure.CFG``
+* **Soft‑label aware `torch.utils.data.Dataset`** (`MelDataset`)
+* **One‑chunk‑per‑file sampling** (`FileWiseSampler`) to match training recipe
+* **LRU‑cached on‑disk mel loader** to save repeated numpy I/O
+* **Noise metric** helper used by ``process.py`` for fold‑0 split
+
+The API surface is intentionally minimal – *import and call what you need*.
+"""
+from __future__ import annotations
+
+import json
+import os
+import random
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple, Union
+
+import cv2
+import librosa
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, Sampler
+
+from configure import CFG
+
+__all__ = [
+    "seed_everything",
+    "compute_noise_metric",
+    "load_audio",
+    "trim_silence",
+    "load_vad",
+    "remove_speech",
+    "compute_mel",
+    "segment_audio",
+    "spec_augment",
+    "cutmix",
+    "FileWiseSampler",
+    "MelDataset",
+]
+
+# ────────────────────────────────────────────────────────────────────────
+# Optional back‑ends – fail gracefully if missing
+# ────────────────────────────────────────────────────────────────────────
+try:
+    # SpeechBrain provides a highly‑optimised GPU mel routine – use if present
+    from speechbrain.lobes.models.HifiGAN import mel_spectrogram as sb_mel_spectrogram  # type: ignore
+
+    _HAS_SB = True
+except Exception:
+    _HAS_SB = False
+
+try:
+    import webrtcvad  # type: ignore
+
+    _HAS_VAD = True
+except ImportError:
+    _HAS_VAD = False
+
+# ────────────────────────────────────────────────────────────────────────
+# Reproducibility helpers
+# ────────────────────────────────────────────────────────────────────────
+
+
+def seed_everything(seed: int = 42) -> None:
+    """Seed *every* RNG we know about for deterministic runs."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Augmentations – SpecAugment & CutMix
+# ────────────────────────────────────────────────────────────────────────
+
+
+def _specaug_cfg() -> Tuple[int, int, int]:
+    """Return the triplet *(freq_mask, time_mask, num_masks)* from ``CFG``."""
+    fm = getattr(CFG, "SPEC_AUG_FREQ_MASK_PARAM", 10)
+    tm = getattr(CFG, "SPEC_AUG_TIME_MASK_PARAM", 50)
+    nm = getattr(CFG, "SPEC_AUG_NUM_MASKS", 2)
+    return fm, tm, nm
+
+
+def spec_augment(
+    mel: np.ndarray,
+    *,
+    freq_mask_param: int | None = None,
+    time_mask_param: int | None = None,
+    num_masks: int | None = None,
+) -> np.ndarray:
+    """Apply **SpecAugment** (frequency & time masking) *in‑place* copy."""
+    fm_d, tm_d, nm_d = _specaug_cfg()
+    fmp = freq_mask_param or fm_d
+    tmp = time_mask_param or tm_d
+    nmk = num_masks or nm_d
+
+    H, W = mel.shape
+    out = mel.copy()
+    for _ in range(nmk):
+        # Frequency mask
+        if fmp > 0:
+            fh = np.random.randint(0, fmp + 1)
+            f0 = np.random.randint(0, max(1, H - fh)) if fh else 0
+            out[f0 : f0 + fh, :] = 0.0
+        # Time mask
+        if tmp > 0:
+            th = np.random.randint(0, tmp + 1)
+            t0 = np.random.randint(0, max(1, W - th)) if th else 0
+            out[:, t0 : t0 + th] = 0.0
+    return out
+
+
+def cutmix(
+    m1: np.ndarray,
+    l1: torch.Tensor,
+    m2: np.ndarray,
+    l2: torch.Tensor,
+) -> Tuple[np.ndarray, torch.Tensor]:
+    """Horizontal **CutMix** for mels; label = length‑weighted interpolation."""
+    W = m1.shape[1]
+    if W < 2:
+        return m1, l1  # avoid degenerate cases
+    cut = np.random.randint(1, W)  # ensure at least 1 px on each side
+    mixed = np.concatenate([m1[:, :cut], m2[:, cut:]], axis=1)
+    alpha = cut / W
+    label = l1 * alpha + l2 * (1.0 - alpha)
+    return mixed, label
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Audio helpers (load / trim / VAD)
+# ────────────────────────────────────────────────────────────────────────
+
+
+def load_audio(
+    fp: Path | str,
+    sample_rate: int | None = None,
+    *,
+    return_sr: bool = False,
+) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
+    """Load **mono** audio as 32‑bit float @ ``sample_rate`` (default CFG).
+
+    Parameters
+    ----------
+    fp : Path | str
+        File path to load. Any format supported by *librosa*.
+    sample_rate : int | None, optional
+        Desired sampling rate. ``None`` ⇒ use ``CFG.SAMPLE_RATE``.
+    return_sr : bool, default = False
+        If *True*, also return the effective sample‑rate alongside the audio.
+    """
+    sr = sample_rate or CFG.SAMPLE_RATE
+    y, _ = librosa.load(str(fp), sr=sr, mono=True)
+    y = y.astype(np.float32)
+    if return_sr:
+        return y, sr  # type: ignore[return-value]
+    return y  # type: ignore[return-value]
+
+
+def trim_silence(y: np.ndarray) -> np.ndarray:
+    """Energy‑based leading / trailing trim."""
+    y_trim, _ = librosa.effects.trim(y, top_db=CFG.TRIM_TOP_DB)
+    return y_trim
+
+
+# ── noise score used for fold‑0 selection ───────────────────────────────
+
+def compute_noise_metric(y: np.ndarray) -> float:
+    """Composite "*noise*" metric – smaller ⇒ cleaner recording."""
+    return float(y.std() + y.var() + np.sqrt((y ** 2).mean()) + (y ** 2).sum())
+
+
+# ── VAD helpers ─────────────────────────────────────────────────────────
+
+
+def load_vad():
+    """Return a *WebRTC VAD* instance & helper TS‑function or ``(None, None)``."""
+    if not _HAS_VAD:
+        return None, None
+
+    vad = webrtcvad.Vad(3)
+
+    def _iter_frames(wav: np.ndarray, sr: int, frame_ms: int = 30):
+        flen = int(sr * frame_ms / 1000)
+        for i in range(0, len(wav) - flen, flen):
+            yield wav[i : i + flen]
+
+    def _get_ts(wav: np.ndarray, sr: int):
+        voiced: List[Tuple[int, int]] = []
+        flen = int(sr * 0.03)  # 30 ms
+        in_voiced = False
+        start = 0
+        for idx, frame in enumerate(_iter_frames(wav, sr)):
+            speech = vad.is_speech((frame * 32768).astype("int16").tobytes(), sr)
+            if speech and not in_voiced:
+                start = idx * flen
+                in_voiced = True
+            elif not speech and in_voiced:
+                voiced.append((start, idx * flen))
+                in_voiced = False
+        if in_voiced:
+            voiced.append((start, len(wav)))
+        return voiced
+
+    return vad, _get_ts
+
+
+def remove_speech(y: np.ndarray, vad_model, get_ts):
+    """Zero‑out VAD‑detected speech regions (if VAD available)."""
+    if vad_model is None:
+        return y
+    mask = np.ones_like(y, dtype=bool)
+    for s, e in get_ts(y, CFG.SAMPLE_RATE):
+        mask[s:e] = False
+    return y[mask]
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Mel‑spectrogram extraction
+# ────────────────────────────────────────────────────────────────────────
+
+
+def compute_mel(y: np.ndarray, *, to_db: bool = True) -> np.ndarray:
+    """Return *128 × T* mel spectrogram in linear or dB scale."""
+
+    if _HAS_SB:
+        # SpeechBrain path – uses GPU if available, ~4‑6× faster than Librosa
+        audio = torch.from_numpy(y).unsqueeze(0)
+        mel = sb_mel_spectrogram(
+            sample_rate=CFG.SAMPLE_RATE,
+            hop_length=CFG.HOP_LENGTH,
+            win_length=CFG.N_FFT,
+            n_fft=CFG.N_FFT,
+            n_mels=CFG.N_MELS,
+            f_min=CFG.FMIN,
+            f_max=CFG.FMAX,
+            power=CFG.POWER,
+            normalized=False,
+            norm="slaney",
+            mel_scale="slaney",
+            compression=True,
+            audio=audio,
+        ).squeeze(0).cpu().numpy()
+    else:
+        mel = librosa.feature.melspectrogram(
+            y=y,
+            sr=CFG.SAMPLE_RATE,
+            n_fft=CFG.N_FFT,
+            hop_length=CFG.HOP_LENGTH,
+            n_mels=CFG.N_MELS,
+            fmin=CFG.FMIN,
+            fmax=CFG.FMAX,
+            power=CFG.POWER,
+        )
+
+    if to_db:
+        mel = librosa.power_to_db(mel, ref=np.max)
+    return mel.astype(np.float32)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Segmentation helper – yields fixed‑length chunks (wrap‑pad)
+# ────────────────────────────────────────────────────────────────────────
+
+
+def segment_audio(
+    y: np.ndarray,
+    *,
+    chunk_sec: int = CFG.TRAIN_CHUNK_SEC,
+    hop_sec: int = CFG.TRAIN_CHUNK_HOP_SEC,
+    sr: int = CFG.SAMPLE_RATE,
+):
+    """Generator yielding ``(start_sec, chunk)`` padded to *chunk_sec* length."""
+    chunk_len = int(chunk_sec * sr)
+    hop_len = int(hop_sec * sr)
+    n = len(y)
+    for start in range(0, n, hop_len):
+        chunk = y[start : start + chunk_len]
+        if len(chunk) < chunk_len:
+            chunk = np.pad(chunk, (0, chunk_len - len(chunk)), mode="wrap")
+        yield start / sr, chunk
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Mel on‑disk cache – speeds up CutMix double‑load
+# ────────────────────────────────────────────────────────────────────────
+
+_CACHE_SIZE = getattr(CFG, "MEL_CACHE_SIZE", 0)
+
+
+@lru_cache(maxsize=_CACHE_SIZE if _CACHE_SIZE > 0 else None)
+def _load_mel_cached(full_path: str) -> np.ndarray:  # pragma: no cover
+    mel = np.load(full_path, allow_pickle=False).astype(np.float32)
+    # *Min‑max norm* to [0,1] stabilises CNN training regardless of dB scale
+    return (mel - mel.min()) / (mel.max() - mel.min() + 1e-6)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Dataset + Sampler for training
+# ────────────────────────────────────────────────────────────────────────
+
+class FileWiseSampler(Sampler[int]):
+    """Yield *one* random chunk per source file each epoch (as in 2024 recipe)."""
+
+    def __init__(self, df: pd.DataFrame, filepath_col: str = "filepath"):
+        self.groups: Dict[str, Sequence[int]] = df.groupby(filepath_col).indices
+        self.files: List[str] = list(self.groups.keys())
+
+    def __iter__(self) -> Iterable[int]:
+        random.shuffle(self.files)
+        for fp in self.files:
+            yield random.choice(self.groups[fp])
+
+    def __len__(self) -> int:  # noqa: D401 – lint false‑positive
+        return len(self.files)
+
+
+class MelDataset(Dataset):
+    """Thin wrapper around pre‑computed mel paths & JSON/NPY label vectors."""
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        species2idx: Dict[str, int],
+        *,
+        augment: bool = False,
+    ):
+        self.df = df.reset_index(drop=True)
+        self.s2i = species2idx
+        self.augment = augment
+        self.use_soft = bool(getattr(CFG, "USE_SOFT_LABELS", False))
+
+    # ‑‑‑ internal helpers ‑──────────────────────────────────────────────
+    def _load_norm(self, rel: str) -> np.ndarray:
+        full = str(CFG.PROCESSED_DIR / rel)
+        if _CACHE_SIZE > 0:
+            mel = _load_mel_cached(full)
+        else:
+            mel = np.load(full, allow_pickle=False).astype(np.float32)
+            mel = (mel - mel.min()) / (mel.max() - mel.min() + 1e-6)
+        mel = cv2.resize(mel, CFG.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
+        return mel
+
+    def _json_to_vec(self, js: str) -> torch.Tensor:
+        vec = np.zeros(len(self.s2i), dtype=np.float32)
+        for sp, w in json.loads(js).items():
+            idx = self.s2i.get(sp)
+            if idx is not None:
+                vec[idx] = w
+        return torch.from_numpy(vec)
+
+    # ‑‑‑ Dataset interface ‑────────────────────────────────────────────
+    def __len__(self) -> int:  # noqa: D401
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        mel = self._load_norm(row["mel_path"])
+
+        if self.augment:
+            mel = spec_augment(mel)
+
+        # ── label handling ────────────────────────────────────────────
+        if self.use_soft:
+            if row["label_path"].endswith(".npy"):
+                vec = np.load(CFG.PROCESSED_DIR / row["label_path"], allow_pickle=False)
+                label_vec = torch.from_numpy(vec.astype(np.float32))
+            else:
+                label_vec = self._json_to_vec(row["label_json"])
+        else:
+            sp = row.get("primary_label") or row.get("label")
+            label_vec = torch.tensor(self.s2i[sp], dtype=torch.long)
+
+        mel_tensor = torch.tensor(mel).unsqueeze(0)  # [1,H,W]
+
+        # ── CutMix ‑ only during *training* ───────────────────────────
+        if (
+            self.augment
+            and random.random() < getattr(CFG, "CUTMIX_PROB", 0.0)
+            and len(self.df) > 1
+        ):
+            j = random.randint(0, len(self.df) - 1)
+            if j == idx:
+                j = (j + 1) % len(self.df)
+            row2 = self.df.iloc[j]
+            mel2 = self._load_norm(row2["mel_path"])
+            if self.augment:
+                mel2 = spec_augment(mel2)
+
+            if self.use_soft:
+                if row2["label_path"].endswith(".npy"):
+                    vec2 = np.load(CFG.PROCESSED_DIR / row2["label_path"], allow_pickle=False)
+                    label_vec2 = torch.from_numpy(vec2.astype(np.float32))
+                else:
+                    label_vec2 = self._json_to_vec(row2["label_json"])
+            else:
+                sp2 = row2.get("primary_label") or row2.get("label")
+                label_vec2 = torch.tensor(self.s2i[sp2], dtype=torch.long)
+
+            mel, label_vec = cutmix(mel, label_vec, mel2, label_vec2)
+            mel_tensor = torch.tensor(mel).unsqueeze(0)
+
+        weight = float(row.get("weight", 1.0))
+        return mel_tensor, label_vec, weight
+
+
+#### diffwave.py
+#!/usr/bin/env python3
+"""
+diffwave.py – inference-only minority-class synthesis
+====================================================
+Uses a pretrained DiffWave vocoder to convert precomputed
+mel-spectrogram chunks (from process.py) into 5-second waveforms.
+Usage:
+  python diffwave.py generate [--species S1,S2]
+  python diffwave.py remove
+"""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import soundfile as sf
+import torch
+
+from speechbrain.inference.vocoders import DiffWaveVocoder
+from configure import CFG
+
+# ────────────────────────────────────────────────────────────
+# Config & Hyperparameters
+# ────────────────────────────────────────────────────────────
+SAMPLE_RATE = 32_000
+SEG_SECONDS = 5                                  # Clip length (s)
+N_MELS      = 80                                 # Must match vocoder config
+HOP_LENGTH  = 256                                # Must match vocoder config
+
+THRESH_LOW, THRESH_HIGH = 20, 50
+TARGET_LOW, TARGET_MID   = 20, 5
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────
+def compute_plan(csv_path: Path) -> Dict[str,int]:
+    """Decide how many synthetic clips per species."""
+    df = pd.read_csv(csv_path)
+    counts = df["primary_label"].value_counts()
+    plan: Dict[str,int] = {}
+    for sp, cnt in counts.items():
+        if cnt < THRESH_LOW:
+            plan[sp] = TARGET_LOW - cnt
+        elif cnt < THRESH_HIGH:
+            plan[sp] = TARGET_MID
+        else:
+            plan[sp] = 0
+    return plan
+
+
+def patch_train_csv(rows: List[Tuple[str,str]]) -> None:
+    """Append new synthetic entries to train.csv."""
+    df = pd.read_csv(CFG.TRAIN_CSV)
+    exist = set(zip(df["primary_label"], df["filename"]))
+    new = [r for r in rows if r not in exist]
+    if not new:
+        return
+    extra = pd.DataFrame(new, columns=["primary_label","filename"])
+    for c in df.columns:
+        if c not in extra.columns:
+            extra[c] = pd.NA
+    out = pd.concat([df, extra[df.columns]], ignore_index=True)
+    out.to_csv(CFG.TRAIN_CSV, index=False)
+
+
+def remove_synthetic() -> None:
+    """Delete all synthetic .ogg files."""
+    for spdir in CFG.TRAIN_AUDIO_DIR.iterdir():
+        if spdir.is_dir():
+            for f in spdir.glob("synthetic_*.ogg"):
+                f.unlink(missing_ok=True)
+
+# ────────────────────────────────────────────────────────────
+# Generation: Mel→Wave conversion
+# ────────────────────────────────────────────────────────────
+def generate(args: argparse.Namespace) -> None:
+    """Generate waveforms from precomputed mel-spectrogram files."""
+    vb = DiffWaveVocoder.from_hparams(
+        source="speechbrain/tts-diffwave-ljspeech",
+        savedir=CFG.DIFFWAVE_MODEL_DIR/"vocoder",
+        run_opts={"device": DEVICE.type},
+    )
+
+    plan = compute_plan(CFG.TRAIN_CSV)
+    rows: List[Tuple[str,str]] = []
+    base = CFG.PROCESSED_DIR / "mels" / "train"
+
+    for sp, n in plan.items():
+        if n <= 0 or (args.species and sp not in args.species):
+            continue
+        sp_dir = base / sp
+        if not sp_dir.exists():
+            continue
+        mel_files = sorted(sp_dir.glob("*.npy"))
+        count = 0
+
+        for mel_fp in mel_files:
+            if count >= n:
+                break
+            mel_np = np.load(mel_fp)
+            mel_tensor = torch.from_numpy(mel_np).unsqueeze(0).to(DEVICE)
+
+            wav_tensor = vb.decode_spectrogram(
+                mel_tensor,
+                hop_length=HOP_LENGTH,
+                fast_sampling=True,
+                fast_sampling_noise_schedule=[0.0001,0.001,0.01,0.05,0.2,0.5],
+            )  # returns [1, time]
+
+            out_fn = f"synthetic_{count:03d}.ogg"
+            out_fp = CFG.TRAIN_AUDIO_DIR / sp / out_fn
+            out_fp.parent.mkdir(parents=True, exist_ok=True)
+            sf.write(
+                str(out_fp),
+                wav_tensor.cpu().numpy(),
+                SAMPLE_RATE,
+                format="OGG",
+                subtype="VORBIS",
+            )
+
+            rows.append((sp, out_fn))
+            count += 1
+
+    if rows:
+        patch_train_csv(rows)
+
+# ────────────────────────────────────────────────────────────
+# CLI
+# ────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="diffwave.py",
+        description="DiffWave inference-only synthesizer",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    gen = sub.add_parser("generate", help="Generate synthetic audio from mel files")
+    gen.add_argument(
+        "--species", type=lambda s: s.split(","),
+        help="Comma-separated list of species to target",
+    )
+    sub.add_parser("remove", help="Remove all synthetic audio files")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.cmd == "generate":
+        generate(args)
+    else:
+        remove_synthetic()
+
+
+if __name__ == "__main__":
+    main()
+
+
+#### efficientnet.py
+#!/usr/bin/env python3
+"""
+efficientnet.py – EfficientNet‑B0 ensemble trainer for **BirdCLEF 2025**
+=====================================================================
+Trains *CFG.EFF_NUM_MODELS* EfficientNet‑B0 classifiers on the mel‑spectrogram
+chunks produced by ``process.py``.  The script follows the 2024 winning recipe
+and the workflow requested by the user:
+
+* Cross‑entropy with **soft‑label** support
+* One‑chunk‑per‑file sampling via ``FileWiseSampler``
+* SpecAugment + CutMix enabled through *data_utils*
+* Cosine‑annealing LR schedule & mixed‑precision (AMP)
+* Optional device override via ``--device`` (auto / cpu / gpu)
+* Reproducible ensemble – each run uses a different seed offset
+* Checkpoints saved under ``CFG.EFF_MODEL_DIR`` as
+  ``efficientnet_b0_run{RUN}.pth`` (state + species mapping)
+
+Usage
+-----
+```bash
+# train two models on GPU (default)
+python efficientnet.py              #   → models/efficientnet/*.pth
+
+# force CPU training & 5 epochs only (quick test)
+python efficientnet.py --device cpu --epochs 5
+```
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+import timm
+from torch import optim
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
+
+from configure import CFG
+from data_utils import FileWiseSampler, MelDataset, seed_everything
+
+# ───────────────────────── logging ──────────────────────────
+
+def _logger() -> logging.Logger:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
+    return logging.getLogger("efficientnet")
+
+
+# ──────────────────── soft‑label CE helper ───────────────────
+
+def _soft_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Cross‑entropy that supports *either* hard indices *or* soft vectors."""
+    if targets.dtype == torch.long:
+        return F.cross_entropy(logits, targets, reduction="none")
+    logp = torch.log_softmax(logits, dim=1)
+    return -(targets * logp).sum(dim=1)
+
+
+# ───────────────────────── trainer ───────────────────────────
+
+class _Trainer:
+    """Encapsulates one EfficientNet run (different seed / init)."""
+
+    def __init__(self, run_id: int, classes: List[str], log: logging.Logger):
+        self.run_id, self.log = run_id, log
+        self.device = torch.device("cuda" if CFG.use_cuda() else "cpu")
+        self.classes = classes
+
+        # model – EfficientNet‑B0  (1‑channel input)
+        self.model = timm.create_model(
+            "efficientnet_b0",
+            pretrained=True,
+            in_chans=1,
+            num_classes=len(classes),
+        ).to(self.device)
+
+        self.opt = optim.AdamW(
+            self.model.parameters(),
+            lr=CFG.EFF_LR,
+            weight_decay=CFG.EFF_WEIGHT_DECAY,
+        )
+        self.sched = optim.lr_scheduler.CosineAnnealingLR(
+            self.opt, T_max=CFG.EFF_EPOCHS
+        )
+        self.scaler = GradScaler(enabled=CFG.use_cuda())
+
+    # ‑‑ one optimisation step ‑─────────────────────────────
+    def _step(self, batch):
+        x, y, w = (t.to(self.device, non_blocking=True) for t in batch)
+        self.opt.zero_grad(set_to_none=True)
+        with autocast(enabled=CFG.use_cuda()):
+            logits = self.model(x)
+            loss = (_soft_ce(logits, y) * w).mean()
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.opt)
+        self.scaler.update()
+        return float(loss.detach())
+
+    # ‑‑ epoch loop ‑─────────────────────────────────────────
+    def fit(self, loader: DataLoader) -> None:
+        for ep in range(1, self._epochs + 1):
+            self.model.train(); run_loss = 0.0
+            for batch in loader:
+                run_loss += self._step(batch) * batch[0].size(0)
+            self.sched.step()
+            self.log.info(
+                "run=%d  epoch=%d/%d  loss=%.5f  lr=%.2e",
+                self.run_id,
+                ep,
+                self._epochs,
+                run_loss / len(loader.dataset),
+                self.sched.get_last_lr()[0],
+            )
+
+    # property wrapper to cope with CLI‑overridden epochs
+    @property
+    def _epochs(self) -> int:
+        return getattr(CFG, "EFF_EPOCHS", 10)
+
+    # ‑‑ save checkpoint ‑────────────────────────────────────
+    def save(self, out_dir: Path) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = {
+            "arch": "efficientnet_b0",
+            "model": self.model.state_dict(),
+            "species2idx": {s: i for i, s in enumerate(self.classes)},
+        }
+        fp = out_dir / f"efficientnet_b0_run{self.run_id}.pth"
+        torch.save(ckpt, fp)
+        self.log.info("✔ saved checkpoint → %s", fp.name)
+
+
+# ─────────────────── metadata & DataLoader ───────────────────
+
+def _load_meta() -> pd.DataFrame:
+    df = pd.read_csv(CFG.PROCESSED_DIR / "train_metadata.csv")
+    sc = CFG.PROCESSED_DIR / "soundscape_metadata.csv"
+    if sc.exists():
+        df = pd.concat([df, pd.read_csv(sc)], ignore_index=True)
+    return df
+
+
+# ─────────────────────────── main ────────────────────────────
+
+def main() -> None:  # noqa: D401
+    cli = argparse.ArgumentParser(description="Train EfficientNet‑B0 ensemble")
+    cli.add_argument("--device", choices=["auto", "cpu", "gpu", "cuda"], default="auto")
+    cli.add_argument("--epochs", type=int, default=None, help="override CFG.EFF_EPOCHS")
+    args = cli.parse_args()
+
+    # runtime config overrides – device & epochs
+    if args.device != "auto":
+        CFG.DEVICE = args.device  # type: ignore[attr-defined]
+    if args.epochs is not None:
+        CFG.EFF_EPOCHS = args.epochs  # type: ignore[attr-defined]
+
+    seed_everything(CFG.SEED)
+    log = _logger()
+    log.info("Device: %s", CFG.DEVICE)
+
+    df = _load_meta()
+    if df.empty:
+        log.error("No metadata found – run process.py first."); return
+
+    # Determine full class list from metadata (robust to pruning)
+    cls_set = {k for js in df["label_json"] for k in json.loads(js)}
+    classes = sorted(cls_set)
+    s2i = {s: i for i, s in enumerate(classes)}
+    log.info("Classes: %d", len(classes))
+
+    # DataLoader – one random 10‑s chunk per source file each epoch
+    dataset = MelDataset(df, s2i, augment=True)
+    df["_src"] = df["mel_path"].str.extract(r"([^/]+)_\d+s.npy$", expand=False)
+    loader = DataLoader(
+        dataset,
+        batch_size=CFG.EFF_BATCH_SIZE,
+        sampler=FileWiseSampler(df, "_src"),
+        num_workers=CFG.EFF_NUM_WORKERS,
+        pin_memory=CFG.use_cuda(),
+        drop_last=True,
+    )
+
+    # Ensemble training loop -------------------------------------------------
+    for run in range(1, CFG.EFF_NUM_MODELS + 1):
+        seed_everything(CFG.SEED + run)  # new seed each run
+        trainer = _Trainer(run, classes, log)
+        trainer.fit(loader)
+        trainer.save(CFG.EFF_MODEL_DIR)
+        del trainer; torch.cuda.empty_cache()
+
+    log.info("🏁 Finished – checkpoints in %s", CFG.EFF_MODEL_DIR)
+
+
+if __name__ == "__main__":
+    main()
+
+
+#### pretrained_models/diffwave-ljspeech/hyperparams.yaml
+# ################################################
+# Basic parameters for a diffwave vocoder
+#
+# Author:
+#  * Yingzhi Wang 2022
+# ################################################
+
+train_timesteps: 50
+beta_start: 0.0001
+beta_end: 0.05
+
+residual_layers: 30
+residual_channels: 64
+dilation_cycle_length: 10
+
+unconditional: False
+
+spec_n_mels: 80
+spec_hop_length: 256
+
+diffwave: !new:speechbrain.lobes.models.DiffWave.DiffWave
+    input_channels: !ref <spec_n_mels>
+    residual_layers: !ref <residual_layers>
+    residual_channels: !ref <residual_channels>
+    dilation_cycle_length: !ref <dilation_cycle_length>
+    total_steps: !ref <train_timesteps>
+    unconditional: !ref <unconditional>
+
+noise: !new:speechbrain.nnet.diffusion.GaussianNoise
+
+diffusion: !new:speechbrain.lobes.models.DiffWave.DiffWaveDiffusion
+    model: !ref <diffwave>
+    beta_start: !ref <beta_start>
+    beta_end: !ref <beta_end>
+    timesteps: !ref <train_timesteps>
+    noise: !ref <noise>
+
+modules:
+    diffwave: !ref <diffwave>
+    diffusion: !ref <diffusion>
+
+pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
+    loadables:
+        diffwave: !ref <diffwave>
+
+
+#### process.py
+#!/usr/bin/env python
+"""
+process.py ‑‑ BirdCLEF 2025 preprocessing pipeline
+=================================================
+Cleans raw *train_audio* / *train_soundscape* recordings, applies Voice‑Activity
+Detection (VAD), deduplicates, builds **10‑second mel‑spectrogram chunks** with
+*soft labels* and sample weighting, then saves three artefacts under
+``CFG.PROCESSED_DIR``:
+
+* ``mels/<split>/.../*.npy`` ‑ normalised mel spectrogram arrays
+* ``labels/<split>/.../*.label.npy`` ‑ dense probability vectors (206‑long)
+* ``<split>_metadata.csv`` – one row per chunk with paths + metadata
+
+The script is idempotent and safe to rerun after you add new recordings or
+update configuration in ``configure.py``.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import random
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+import torch
+import timm
+
+from configure import CFG
+from data_utils import (
+    compute_mel,
+    compute_noise_metric,
+    load_audio,
+    load_vad,
+    remove_speech,
+    seed_everything,
+    segment_audio,
+    trim_silence,
+)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Globals derived from configuration / dataset
+# ────────────────────────────────────────────────────────────────────────────────
+
+# ── Single‑model benchmark loader ────────────────────────────────────────────────
+class BenchmarkModel(torch.nn.Module):
+    """
+    Wraps an EfficientNet‑B0 to load a single state_dict for benchmark smoothing.
+    """
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.net = timm.create_model(
+            "efficientnet_b0",
+            pretrained=False,
+            in_chans=1,
+            num_classes=num_classes,
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def _load_benchmark() -> Optional[torch.nn.Module]:
+    """
+    Load a single‑checkpoint benchmark model (state_dict) and return it in eval mode.
+    """
+    if not CFG.BENCHMARK_MODEL:
+        return None
+    bp = Path(CFG.BENCHMARK_MODEL)
+    if not bp.exists():
+        logging.warning("Benchmark path %s missing – skipping.", bp)
+        return None
+
+    ckpt = torch.load(bp, map_location="cuda")
+    state = ckpt.get("model_state_dict", ckpt)
+    model = BenchmarkModel(num_classes=len(ALL_CLASSES))
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+# ── Class list discovery ────────────────────────────────────────────────────────
+def _discover_classes() -> List[str]:
+    if hasattr(CFG, "CLASSES") and CFG.CLASSES:
+        return list(CFG.CLASSES)
+    if CFG.TAXONOMY_CSV.exists():
+        df_tax = pd.read_csv(CFG.TAXONOMY_CSV)
+        if "primary_label" in df_tax.columns:
+            return sorted(df_tax["primary_label"].unique())
+    if CFG.TRAIN_CSV.exists():
+        df_train = pd.read_csv(CFG.TRAIN_CSV)
+        if "primary_label" in df_train.columns:
+            return sorted(df_train["primary_label"].unique())
+    raise RuntimeError("Unable to infer species list – please set CFG.CLASSES")
+
+ALL_CLASSES: List[str] = _discover_classes()
+CLASS2IDX: Dict[str, int] = {sp: i for i, sp in enumerate(ALL_CLASSES)}
+
+# weight hyper‑params (fallback defaults)
+LABEL_W_PRIMARY = getattr(CFG, "LABEL_WEIGHT_PRIMARY", 0.95)
+LABEL_W_BENCH = getattr(CFG, "LABEL_WEIGHT_BENCH", 0.05)
+RARE_WEIGHT = getattr(CFG, "RARE_WEIGHT", 2.0)
+PSEUDO_WEIGHT = getattr(CFG, "PSEUDO_WEIGHT", 0.5)
+RARE_COUNT_THRESHOLD = getattr(CFG, "RARE_COUNT_THRESHOLD", 20)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Logging helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _setup_logger(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Utility functions
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _md5(fp: Path) -> str:
+    """
+    Compute an MD5 hash of a file’s contents.
+    """
+    h = hashlib.md5()
+    with fp.open("rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _deduplicate(paths: Sequence[Path]) -> List[Path]:
+    """
+    Return unique file paths in first-seen order by file MD5.
+    """
+    seen_hashes: set[str] = set()
+    unique: List[Path] = []
+    for p in paths:
+        try:
+            sig = _md5(p)
+        except Exception:
+            # if hashing fails, just keep the path
+            unique.append(p)
+            continue
+        if sig not in seen_hashes:
+            seen_hashes.add(sig)
+            unique.append(p)
+    return unique
+
+
+def _np_save(fp: Path, arr: np.ndarray) -> None:
+    """Save a numpy array safely, creating parent dirs."""
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    np.save(fp, arr.astype(np.float32), allow_pickle=False)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Soft‑label construction
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _secondary_list(raw: str | float | int) -> List[str]:
+    if isinstance(raw, str) and raw:
+        return [s for s in raw.split(";") if s]
+    return []
+
+
+def build_soft_label(
+    primary: str,
+    secondaries: List[str],
+    bench_model: Optional[torch.nn.Module] = None,
+    wav: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """
+    Compose a normalized {species: prob} dict summing to 1,
+    mixing primary/secondary ground truth with benchmark smoothing.
+    """
+    # base weights
+    label: Dict[str, float] = defaultdict(float)
+    rem = 1.0 - LABEL_W_BENCH
+    if secondaries:
+        sec_share = rem - LABEL_W_PRIMARY
+        sec_w = sec_share / len(secondaries)
+        for s in secondaries:
+            label[s] += sec_w
+        label[primary] += LABEL_W_PRIMARY
+    else:
+        label[primary] += rem
+
+    # benchmark smoothing
+    if bench_model is not None and wav is not None:
+        mel = compute_mel(wav)
+        x = torch.from_numpy(mel).unsqueeze(0).unsqueeze(0)
+        with torch.no_grad():
+            logits = bench_model(x)
+            probs = torch.sigmoid(logits)[0].cpu().numpy()
+        for i, p in enumerate(probs):
+            if p > 0:
+                label[ALL_CLASSES[i]] += LABEL_W_BENCH * float(p)
+
+    # normalize for safety
+    total = sum(label.values())
+    for k in list(label):
+        label[k] /= total
+    return dict(label)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Core processing functions
+# ────────────────────────────────────────────────────────────────────────────────
+
+def _process_recordings() -> None:
+    """Process label‑verified *train_audio* recordings into 10‑s mel chunks."""
+    log = logging.getLogger()
+    log.info("✨ Processing labelled recordings …")
+
+    # Load metadata CSV
+    df_meta = pd.read_csv(CFG.TRAIN_CSV)
+
+    # Quality gate
+    if getattr(CFG, "MIN_RATING", 0) > 0 and "rating" in df_meta.columns:
+        df_meta = df_meta[df_meta["rating"] >= CFG.MIN_RATING]
+
+    # Map to existing files
+    records: List[dict] = []
+    for r in df_meta.itertuples(index=False):
+        fp = CFG.TRAIN_AUDIO_DIR / r.filename
+        if not fp.exists():
+            log.warning("Missing %s", fp)
+            continue
+        d = r._asdict()  # type: ignore[attr-defined]
+        d["filepath"] = fp
+        records.append(d)
+    df = pd.DataFrame.from_records(records)
+    if df.empty:
+        log.warning("No recordings found – aborting train stage")
+        return
+
+    # Deduplicate identical files
+    df = df[df["filepath"].isin(_deduplicate(df["filepath"].tolist()))].reset_index(drop=True)
+
+    # Compute noise score & select fold‑0 subset
+    noise_scores: List[float] = []
+    for fp in df["filepath"]:
+        y = load_audio(fp)
+        noise_scores.append(compute_noise_metric(y))
+    df["noise_score"] = noise_scores
+
+    ratio = getattr(CFG, "FOLD0_RATIO", 1.0)
+    if 0 < ratio < 1.0:
+        thresh = np.quantile(df["noise_score"], ratio)
+        df = df[df["noise_score"] <= thresh].reset_index(drop=True)
+        log.info("Selected %d clean recordings (%.0f%%)", len(df), 100 * ratio)
+
+    # Load single-model benchmark for smoothing & swap logic
+    bench_model = _load_benchmark()
+    if bench_model:
+        log.info("Benchmark model loaded for smoothing and swap logic.")
+    vad_model, vad_ts = load_vad()
+
+    # Prepare output directories
+    mel_root = CFG.PROCESSED_DIR / "mels" / "train"
+    lbl_root = CFG.PROCESSED_DIR / "labels" / "train"
+    mel_root.mkdir(parents=True, exist_ok=True)
+    lbl_root.mkdir(parents=True, exist_ok=True)
+
+    rows: List[dict] = []
+    for rec in df.itertuples(index=False):
+        y = load_audio(rec.filepath)
+        y = trim_silence(y)
+        y = remove_speech(y, vad_model, vad_ts)
+        if np.sqrt((y ** 2).mean()) < CFG.RMS_THRESHOLD:
+            continue  # too quiet
+
+        secondaries = _secondary_list(getattr(rec, "secondary_labels", ""))
+        primary_lbl = rec.primary_label
+
+        # Swap logic using full-clip benchmark prediction
+        if bench_model is not None:
+            mel_full = compute_mel(y)
+            x_full = torch.from_numpy(mel_full).unsqueeze(0).unsqueeze(0)
+            with torch.no_grad():
+                logits_full = bench_model(x_full)
+                probs_full = torch.sigmoid(logits_full)[0].cpu().numpy()
+            top_lbl = ALL_CLASSES[int(probs_full.argmax())]
+            if top_lbl != primary_lbl and top_lbl in secondaries:
+                log.info("Swapping primary %s → %s", primary_lbl, top_lbl)
+                primary_lbl = top_lbl
+            elif top_lbl != primary_lbl and top_lbl not in secondaries:
+                log.debug("Discarding mislabeled clip %s", rec.filepath.name)
+                continue
+
+        # Segment into fixed-length chunks
+        for start_sec, chunk in segment_audio(y):
+            if len(chunk) < CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE:
+                pad = CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE - len(chunk)
+                chunk = np.pad(chunk, (0, pad), mode="wrap")
+
+            mel_chunk = compute_mel(chunk)
+            soft = build_soft_label(primary_lbl, secondaries, bench_model, chunk)
+
+            base = f"{rec.filepath.stem}_{int(start_sec)}s"
+            mel_fp = mel_root / primary_lbl / f"{base}.npy"
+            lbl_fp = lbl_root / primary_lbl / f"{base}.label.npy"
+
+            _np_save(mel_fp, mel_chunk)
+
+            vec = np.zeros(len(ALL_CLASSES), dtype=np.float32)
+            for k, v in soft.items():
+                vec[CLASS2IDX[k]] = v
+            _np_save(lbl_fp, vec)
+
+            rows.append({
+                "mel_path": str(mel_fp.relative_to(CFG.PROCESSED_DIR)),
+                "label_path": str(lbl_fp.relative_to(CFG.PROCESSED_DIR)),
+                "label_json": json.dumps(soft, separators=(",",":")),
+                "duration": CFG.TRAIN_CHUNK_SEC,
+                "rating": getattr(rec, "rating", ""),
+                "noise_score": rec.noise_score,  # type: ignore[attr-defined]
+                "weight": 1.0,
+            })
+
+    out_csv = CFG.PROCESSED_DIR / "train_metadata.csv"
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    log.info("Saved %d mel chunks → %s", len(rows), out_csv.name)
+
+
+# Pseudo‑labelling soundscapes ----------------------------------------------------
+
+def _process_soundscapes() -> None:
+    log = logging.getLogger()
+    if not CFG.TRAIN_SOUNDSCAPE_DIR.exists():
+        log.info("No soundscape directory – skipping pseudo‑labelling stage")
+        return
+    bench_model = _load_benchmark()
+    if bench_model is None:
+        log.warning("Benchmark unavailable – skipping soundscape pseudo‑labelling")
+        return
+    vad_model, vad_ts = load_vad()
+
+    mel_root = CFG.PROCESSED_DIR / "mels" / "soundscape"
+    lbl_root = CFG.PROCESSED_DIR / "labels" / "soundscape"
+    mel_root.mkdir(parents=True, exist_ok=True)
+    lbl_root.mkdir(parents=True, exist_ok=True)
+
+    rows: List[dict] = []
+    for fp in sorted(CFG.TRAIN_SOUNDSCAPE_DIR.glob("*.ogg")):
+        y = load_audio(fp)
+        y = trim_silence(y)
+        y = remove_speech(y, vad_model, vad_ts)
+
+        for start_sec, seg in segment_audio(y):
+            if len(seg) < CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE:
+                seg = np.pad(seg, (0, CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE - len(seg)), mode="wrap")
+
+            mel_seg = compute_mel(seg)
+            x_seg = torch.from_numpy(mel_seg).unsqueeze(0).unsqueeze(0)
+            with torch.no_grad():
+                logits_seg = bench_model(x_seg)
+                probs = torch.sigmoid(logits_seg)[0].cpu().numpy()
+
+            if float(probs.max()) < CFG.PSEUDO_THRESHOLD:
+                continue
+
+            mel_fp = mel_root / f"{fp.stem}_{int(start_sec)}s.npy"
+            lbl_fp = lbl_root / f"{fp.stem}_{int(start_sec)}s.label.npy"
+            _np_save(mel_fp, mel_seg)
+            _np_save(lbl_fp, probs.astype(np.float32))
+
+            soft = {ALL_CLASSES[i]: float(p) for i, p in enumerate(probs) if p > 0}
+            rows.append({
+                "mel_path": str(mel_fp.relative_to(CFG.PROCESSED_DIR)),
+                "label_path": str(lbl_fp.relative_to(CFG.PROCESSED_DIR)),
+                "label_json": json.dumps(soft, separators=(",",":")),
+                "duration": CFG.TRAIN_CHUNK_SEC,
+                "rating": "pseudo",
+                "noise_score": compute_noise_metric(seg),
+                "weight": PSEUDO_WEIGHT,
+            })
+
+    if rows:
+        out_csv = CFG.PROCESSED_DIR / "soundscape_metadata.csv"
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+        log.info("Saved %d pseudo‑labelled chunks → %s", len(rows), out_csv.name)
+
+
+def _apply_rare_weighting() -> None:
+    meta_files = [
+        CFG.PROCESSED_DIR / "train_metadata.csv",
+        CFG.PROCESSED_DIR / "soundscape_metadata.csv",
+    ]
+    dfs = [pd.read_csv(p) for p in meta_files if p.exists()]
+    if not dfs:
+        return
+
+    all_meta = pd.concat(dfs, ignore_index=True)
+    counts = Counter(max(json.loads(js), key=json.loads(js).get) for js in all_meta["label_json"])
+    rare_species = {sp for sp, c in counts.items() if c < RARE_COUNT_THRESHOLD}
+
+    for p in meta_files:
+        if not p.exists():
+            continue
+        df = pd.read_csv(p)
+        df["weight"] = [
+            RARE_WEIGHT if max(json.loads(js), key=json.loads(js).get) in rare_species else 1.0
+            for js in df["label_json"]
+        ]
+        df.to_csv(p, index=False)
+
+    logging.getLogger().info(
+        "Applied rare‑species weighting (x%.1f) to %d species", RARE_WEIGHT, len(rare_species)
+    )
+
+
+def main() -> None:
+    pa = argparse.ArgumentParser(description="Preprocess BirdCLEF 2025 audio")
+    pa.add_argument("--verbose", action="store_true", help="debug logging")
+    args = pa.parse_args()
+
+    _setup_logger(args.verbose)
+    seed_everything(getattr(CFG, "SEED", 42))
+
+    CFG.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+    _process_recordings()
+    _process_soundscapes()
+    _apply_rare_weighting()
+
+    logging.info("✅ Preprocessing finished – data saved to %s", CFG.PROCESSED_DIR)
+
+if __name__ == "__main__":
+    main()
+
+
+#### regnety.py
+#!/usr/bin/env python
+"""
+regnety.py – BirdCLEF 2025 trainer (fixed)
+========================================
+Trains **CFG.REG_NUM_MODELS** class‑conditional RegNetY‑0.8GF models on the
+pre‑processed mel‑spectrogram chunks.  This revision fixes the CSV‑loading
+bugs flagged in the review:
+
+* **Uses `pd.read_csv` / `pd.concat`** instead of the erroneous
+  `Path.read_csv()` call.
+* Adds the missing **`import pandas as pd`** statement.
+* Keeps all earlier improvements (model‑name guard, CUDA pin‑memory toggle,
+  checkpoint arch string, seed offset, CLI alias, etc.).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List
+
+import pandas as pd  # <‑‑‑ FIXED: explicit pandas import
+import torch
+import torch.nn.functional as F
+import timm
+from torch import optim
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
+
+from configure import CFG
+from data_utils import FileWiseSampler, MelDataset, seed_everything
+
+# ────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────
+
+def _get_model_name() -> str:
+    for name in ("regnety_008", "regnety_008gf"):
+        if name in timm.list_models():
+            return name
+    raise RuntimeError("RegNetY‑0.8GF backbone missing in timm build.")
+
+
+def _soft_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    if targets.dtype == torch.long:
+        return F.cross_entropy(logits, targets, reduction="none")
+    return -(targets * torch.log_softmax(logits, dim=1)).sum(1)
+
+
+def _logger() -> logging.Logger:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    return logging.getLogger("regnety")
+
+# ────────────────────────────────────────────────────────────────────────
+# Trainer
+# ────────────────────────────────────────────────────────────────────────
+
+class _Trainer:
+    def __init__(self, rid: int, n_cls: int, arch: str, log: logging.Logger):
+        self.rid, self.log = rid, log
+        self.device = torch.device("cuda" if CFG.use_cuda() else "cpu")
+        self.model = timm.create_model(arch, pretrained=True, in_chans=1,
+                                       num_classes=n_cls).to(self.device)
+        self.opt = optim.AdamW(self.model.parameters(), lr=CFG.REG_LR,
+                               weight_decay=CFG.REG_WEIGHT_DECAY)
+        self.sched = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=CFG.REG_EPOCHS)
+        self.scaler = GradScaler(enabled=CFG.use_cuda())
+
+    def _step(self, batch):
+        x, y, w = (t.to(self.device, non_blocking=True) for t in batch)
+        self.opt.zero_grad(set_to_none=True)
+        with autocast(enabled=CFG.use_cuda()):
+            loss = (_soft_ce(self.model(x), y) * w).mean()
+        self.scaler.scale(loss).backward(); self.scaler.step(self.opt); self.scaler.update()
+        return float(loss.detach())
+
+    def fit(self, loader: DataLoader):
+        for ep in range(1, CFG.REG_EPOCHS + 1):
+            self.model.train(); run = 0.0
+            for batch in loader:
+                run += self._step(batch) * batch[0].size(0)
+            self.sched.step()
+            self.log.info("run=%d ep=%d/%d loss=%.5f lr=%.2e", self.rid, ep,
+                          CFG.REG_EPOCHS, run / len(loader.dataset), self.sched.get_last_lr()[0])
+
+    def save(self, out: Path, arch: str, s2i: Dict[str, int]):
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save({"arch": arch, "model": self.model.state_dict(), "species2idx": s2i},
+                   out / f"{arch}_run{self.rid}.pth")
+        self.log.info("✔ saved checkpoint run%d", self.rid)
+
+# ────────────────────────────────────────────────────────────────────────
+# Data helpers
+# ────────────────────────────────────────────────────────────────────────
+
+def _load_meta() -> pd.DataFrame:  # <‑‑‑ FIXED: correct pandas usage
+    df = pd.read_csv(CFG.PROCESSED_DIR / "train_metadata.csv")
+    sc = CFG.PROCESSED_DIR / "soundscape_metadata.csv"
+    if sc.exists():
+        df = pd.concat([df, pd.read_csv(sc)], ignore_index=True)
+    return df
+
+# ────────────────────────────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    cli = argparse.ArgumentParser(description="Train RegNetY‑0.8GF ensemble")
+    cli.add_argument("--device", choices=["auto", "cpu", "gpu", "cuda"], default="auto")
+    args = cli.parse_args()
+    if args.device != "auto":
+        CFG.DEVICE = args.device  # type: ignore[attr-defined]
+
+    seed_everything(CFG.SEED)
+    log = _logger()
+    log.info("Device: %s", CFG.DEVICE)
+
+    df = _load_meta()
+    if df.empty:
+        log.error("No metadata – run process.py first."); return
+
+    cls_set = {k for js in df["label_json"] for k in json.loads(js)}
+    classes = sorted(cls_set); s2i = {s: i for i, s in enumerate(classes)}
+    log.info("Classes: %d", len(classes))
+
+    data = MelDataset(df, s2i, augment=True)
+    df["_src"] = df["mel_path"].str.extract(r"([^/]+)_\d+s.npy$", expand=False)
+    loader = DataLoader(data, batch_size=CFG.REG_BATCH_SIZE,
+                        sampler=FileWiseSampler(df, "_src"),
+                        num_workers=CFG.REG_NUM_WORKERS,
+                        pin_memory=CFG.use_cuda(), drop_last=True)
+
+    arch = _get_model_name()
+    for run in range(1, CFG.REG_NUM_MODELS + 1):
+        seed_everything(CFG.SEED + 1000 + run)
+        t = _Trainer(run, len(classes), arch, log); t.fit(loader); t.save(CFG.REG_MODEL_DIR, arch, s2i)
+        del t; torch.cuda.empty_cache()
+
+    log.info("🏁 Finished – checkpoints in %s", CFG.REG_MODEL_DIR)
+
+
+if __name__ == "__main__":
+    main()
+
+
+#### test/test_datautils.py
+import sys
+from pathlib import Path
+import json
+import random
+import numpy as np
+import torch
+import pandas as pd
+import pytest
+
+# ensure project root import
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import configure
+import data_utils as du
+
+@pytest.fixture(autouse=True)
+def deterministic_seed():
+    # Ensure reproducible randomness
+    du.seed_everything(123)
+    return None
+
+def test_seed_everything():
+    # Test that random, numpy, and torch seeds are consistent
+    du.seed_everything(42)
+    a = random.random()
+    b = np.random.rand()
+    c = torch.rand(1).item()
+
+    du.seed_everything(42)
+    assert random.random() == pytest.approx(a)
+    assert np.random.rand() == pytest.approx(b)
+    assert torch.rand(1).item() == pytest.approx(c)
+
+def test_compute_noise_metric():
+    # Create a known array
+    y = np.array([1.0, -1.0, 2.0], dtype=np.float32)
+    # compute std, var, rms, sum
+    expected = float(y.std() + y.var() + np.sqrt((y**2).mean()) + (y**2).sum())
+    assert du.compute_noise_metric(y) == pytest.approx(expected)
+
+def test_spec_augment_and_cutmix():
+    # Create dummy mel array
+    mel = np.ones((10, 20), dtype=np.float32)
+    # Spec augment should maintain shape
+    mel_aug = du.spec_augment(mel, freq_mask_param=2, time_mask_param=3, num_masks=1)
+    assert mel_aug.shape == mel.shape
+    # At least some zeros appear in augmented mel
+    assert np.any(mel_aug == 0.0)
+
+    # Test cutmix merges two arrays
+    m1 = np.ones((5, 10), dtype=np.float32)
+    l1 = torch.tensor([1.0, 0.0])  # dummy labels length mismatch but we care dimensions
+    m2 = np.zeros((5, 10), dtype=np.float32)
+    l2 = torch.tensor([0.5, 0.5])
+    mixed, label = du.cutmix(m1, l1, m2, l2)
+    # mixed shape same
+    assert mixed.shape == m1.shape
+    # label shape matches first target shape
+    assert isinstance(label, torch.Tensor)
+
+def test_segment_audio():
+    # Create sine wave of length 2 seconds at 1 Hz sample
+    sr = 10
+    y = np.arange(sr * 2).astype(np.float32)
+    # monkeypatch CFG for chunk/hop secs
+    monkey_cfg = configure.CFG
+    monkey_cfg.TRAIN_CHUNK_SEC = 1
+    monkey_cfg.TRAIN_CHUNK_HOP_SEC = 1
+    monkey_cfg.SAMPLE_RATE = sr
+    segments = list(du.segment_audio(y, sr=sr))
+    # Expect 2 segments (start 0,1)
+    assert len(segments) == 2
+    for start_sec, chunk in segments:
+        assert len(chunk) == sr * 1
+
+def test_load_and_trim_audio(monkeypatch):
+    # Stub librosa.load and trim functions
+    called = {}
+    def fake_load(fp, sr, mono=True):
+        called['load'] = (fp, sr, mono)
+        return np.array([0.1, -0.1], dtype=np.float32), sr
+    monkeypatch.setattr(du.librosa, 'load', fake_load)
+    def fake_trim(y, top_db):
+        called['trim'] = (y.tolist(), top_db)
+        return y[:1], (0,)
+    monkeypatch.setattr(du.librosa.effects, 'trim', fake_trim)
+
+    y = du.load_audio('dummy.wav', sample_rate=16000)
+    assert isinstance(y, np.ndarray)
+    y_trim = du.trim_silence(y)
+    assert isinstance(y_trim, np.ndarray)
+    assert 'load' in called and 'trim' in called
+
+def test_compute_mel_cpu(monkeypatch):
+    # Force CPU path
+    monkeypatch.setattr(du, '_HAS_SB', False)
+    # Stub librosa.feature and power_to_db
+    mel_out = np.ones((4,5), dtype=np.float32)
+    monkeypatch.setattr(du.librosa.feature, 'melspectrogram', lambda **kw: mel_out)
+    monkeypatch.setattr(du.librosa, 'power_to_db', lambda m, ref: m)
+    # Override CFG params
+    monkey_cfg = configure.CFG
+    monkey_cfg.SAMPLE_RATE = 16000
+    monkey_cfg.HOP_LENGTH = 128
+    monkey_cfg.N_FFT = 512
+    monkey_cfg.N_MELS = 4
+    monkey_cfg.FMIN = 0
+    monkey_cfg.FMAX = 8000
+    monkey_cfg.POWER = 2.0
+    # Dummy audio
+    y = np.random.randn(100).astype(np.float32)
+    mel = du.compute_mel(y, to_db=True)
+    assert np.allclose(mel, mel_out)
+
+def test_FileWiseSampler():
+    # Create DataFrame with two file groups
+    df = pd.DataFrame({'filepath': ['a.wav','a.wav','b.wav']})
+    sampler = du.FileWiseSampler(df, 'filepath')
+    indices = list(iter(sampler))
+    # Expect two indices, one for each file
+    assert len(indices) == 2
+    # Indices should be within valid range
+    assert set(indices).issubset({0,1,2})
+
+class DummyDataset(torch.utils.data.Dataset):
+    def __init__(self): self.df = pd.DataFrame({'mel_path':['p1.npy'], 'label_json':[json.dumps({'sp':1.0})]})
+    def __len__(self): return 1
+    def __getitem__(self, idx): return None
+
+def test_MelDataset(monkeypatch, tmp_path):
+    # Prepare fake data
+    processed = tmp_path / 'processed'
+    processed.mkdir()
+    # Save dummy mel and label .npy
+    mel_dir = processed / 'mels' / 'train' / 'sp'
+    label_dir = processed / 'labels' / 'train' / 'sp'
+    mel_dir.mkdir(parents=True)
+    label_dir.mkdir(parents=True)
+    mel_arr = np.ones((2,2),dtype=np.float32)
+    np.save(mel_dir/'p1.npy', mel_arr)
+    label_vec = np.array([1.0],dtype=np.float32)
+    np.save(label_dir/'p1.label.npy', label_vec)
+    # Monkeypatch CFG and dependencies
+    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed)
+    monkeypatch.setattr(configure.CFG, 'TARGET_SHAPE', (2,2))
+    monkey_cfg = configure.CFG
+    monkey_cfg.USE_SOFT_LABELS = True
+    # Dummy cv2.resize to identity
+    monkeypatch.setattr(du.cv2, 'resize', lambda img, shape, interpolation: img)
+    df = pd.DataFrame({
+        'mel_path': ['mels/train/sp/p1.npy'],
+        'label_path': ['labels/train/sp/p1.label.npy'],
+    })
+    ds = du.MelDataset(df, {'sp':0}, augment=False)
+    mel_tensor, label, weight = ds[0]
+    # Check shapes/types
+    assert isinstance(mel_tensor, torch.Tensor)
+    assert mel_tensor.shape[1:] == mel_arr.shape
+    assert isinstance(label, torch.Tensor)
+    assert weight == 1.0
+
+
+#### test/test_diffwave.py
+import sys
+from pathlib import Path
+import pytest
+import numpy as np
+import torch
+import pandas as pd
+
+# Ensure project root is on path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import configure
+import diffwave
+
+
+@pytest.fixture(autouse=True)
+def setup_diffwave_env(tmp_path, monkeypatch):
+    # Create test root and data directories
+    root = tmp_path / 'test'
+    root.mkdir()
+    data_dir = root / 'data'
+    audio_dir = data_dir / 'train_audio' / '41970'
+    audio_dir.mkdir(parents=True)
+    # Create a placeholder existing audio entry for plan calculation
+    (audio_dir / 'iNat327629.ogg').write_bytes(b'')
+
+    # Create train.csv for plan
+    train_csv = data_dir / 'train.csv'
+    train_csv.parent.mkdir(parents=True)
+    pd.DataFrame([
+        {'primary_label': '41970', 'filename': 'iNat327629.ogg'}
+    ]).to_csv(train_csv, index=False)
+
+    # Set configuration paths
+    monkeypatch.setattr(configure.CFG, 'TRAIN_AUDIO_DIR', data_dir / 'train_audio')
+    monkeypatch.setattr(configure.CFG, 'TRAIN_CSV', train_csv)
+    processed_dir = root / 'processed'
+    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed_dir)
+    processed_dir.mkdir()
+
+    # Create dummy mel spectrograms
+    mel_dir = processed_dir / 'mels' / 'train' / '41970'
+    mel_dir.mkdir(parents=True)
+    # 80 mel bins, 625 frames for 5s @32kHz hop=256
+    dummy_mel = np.random.rand(80, 625).astype(np.float32)
+    np.save(mel_dir / 'chunk0.npy', dummy_mel)
+
+    # Monkeypatch DiffWaveVocoder to stub decode_spectrogram
+    class DummyVocoder:
+        @classmethod
+        def from_hparams(cls, *args, **kwargs):
+            return cls()
+        def decode_spectrogram(self, mel_tensor, hop_length, fast_sampling, fast_sampling_noise_schedule):
+            # Return a waveform of shape [1, time]
+            frames = mel_tensor.shape[-1]
+            # time = frames * hop_length
+            time = frames * hop_length
+            return torch.zeros((1, time), dtype=torch.float32)
+    monkeypatch.setattr(diffwave, 'DiffWaveVocoder', DummyVocoder)
+
+    # Return context
+    return {'root': root, 'audio_dir': audio_dir, 'processed_dir': processed_dir, 'train_csv': train_csv}
+
+
+def test_diffwave_generate(setup_diffwave_env, monkeypatch):
+    ctx = setup_diffwave_env
+    # Simulate CLI args
+    monkeypatch.setattr(sys, 'argv', ['diffwave.py', 'generate'])
+    # Run diffwave generation
+    diffwave.main()
+
+    # Check that synthetic file was created
+    out_file = ctx['audio_dir'] / 'synthetic_000.ogg'
+    assert out_file.exists(), f"Expected synthetic file at {out_file}"
+
+    # Check train.csv was patched
+    df = pd.read_csv(ctx['train_csv'])
+    rows = set(zip(df['primary_label'], df['filename']))
+    assert ('41970', 'synthetic_000.ogg') in rows, "synthetic entry not found in train.csv"
+
+
+#### test/test_efficientnet.py
+import sys
+from pathlib import Path
+import json
+
+import pytest
+import numpy as np
+import torch
+import pandas as pd
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import configure
+import efficientnet
+
+
+def pytest_configure():
+    # Ensure deterministic behavior
+    torch.manual_seed(0)
+
+
+@pytest.fixture(autouse=True)
+def setup_efficientnet_env(tmp_path, monkeypatch):
+    # Create test root
+    root = tmp_path / 'test'
+    root.mkdir()
+    # Processed metadata directory
+    processed = root / 'processed'
+    processed.mkdir()
+
+    # Create minimal train_metadata.csv
+    train_meta = pd.DataFrame([
+        {
+            'mel_path': 'mels/train/sp1/chunk0.npy',
+            'label_json': json.dumps({'sp1': 1.0})
+        }
+    ])
+    train_meta.to_csv(processed / 'train_metadata.csv', index=False)
+    # No soundscape for this test
+
+    # Monkeypatch CFG paths
+    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed)
+    monkeypatch.setattr(configure.CFG, 'EFF_MODEL_DIR', root / 'models' / 'efficientnet')
+    (configure.CFG.EFF_MODEL_DIR).mkdir(parents=True)
+
+    # Stub MelDataset to yield one sample
+    class DummyDataset(torch.utils.data.Dataset):
+        def __init__(self, df, s2i, augment): pass
+        def __len__(self): return 1
+        def __getitem__(self, idx):
+            # x: [1,80,frames], y: long idx, w: float weight
+            frames = efficientnet.SEG_SECONDS * efficientnet.SAMPLE_RATE // efficientnet.HOP_LENGTH
+            x = torch.zeros((1, efficientnet.N_MELS, frames), dtype=torch.float32)
+            y = torch.tensor(0, dtype=torch.long)
+            w = torch.tensor(1.0, dtype=torch.float32)
+            return x, y, w
+    monkeypatch.setattr(efficientnet, 'MelDataset', DummyDataset)
+
+    # Stub FileWiseSampler to simple sequential sampler
+    monkeypatch.setattr(efficientnet, 'FileWiseSampler', lambda df, src: list(range(len(df))))
+
+    # Stub timm.create_model to lightweight model
+    class DummyModel(torch.nn.Module):
+        def __init__(self, in_chans, num_classes):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, num_classes)
+        def forward(self, x):
+            batch = x.shape[0]
+            return torch.zeros((batch, len({'sp1'})), dtype=torch.float32)
+    monkeypatch.setattr(efficientnet.timm, 'create_model',
+                        lambda name, pretrained, in_chans, num_classes:
+                        DummyModel(in_chans, num_classes))
+
+    # Override training hyperparams for speed
+    monkeypatch.setattr(configure.CFG, 'EFF_BATCH_SIZE', 1)
+    monkeypatch.setattr(configure.CFG, 'EFF_NUM_WORKERS', 0)
+    monkeypatch.setattr(configure.CFG, 'EFF_NUM_MODELS', 1)
+    monkeypatch.setattr(configure.CFG, 'EFF_EPOCHS', 1)
+    monkeypatch.setattr(configure.CFG, 'EFF_LR', 1e-3)
+    monkeypatch.setattr(configure.CFG, 'EFF_WEIGHT_DECAY', 0)
+
+    return {'root': root}
+
+
+def test_efficientnet_training(setup_efficientnet_env, caplog, monkeypatch):
+    caplog.set_level('INFO')
+    # Simulate CLI invocation for CPU and 1 epoch
+    monkeypatch.setattr(sys, 'argv', ['efficientnet.py', '--device', 'cpu', '--epochs', '1'])
+
+    # Run main training function
+    efficientnet.main()
+
+    # Check that checkpoint file exists
+    model_dir = configure.CFG.EFF_MODEL_DIR
+    ckpt_files = list(model_dir.glob('efficientnet_b0_run1.pth'))
+    assert ckpt_files, f"No checkpoint found in {model_dir}"
+
+    # Load checkpoint to verify structure
+    ckpt = torch.load(ckpt_files[0], map_location='cpu')
+    assert 'model' in ckpt and 'species2idx' in ckpt, "Checkpoint missing keys"
+
+    # Verify that species mapping contains our class
+    assert ckpt['species2idx'] == {'sp1': 0}
+
+    # Check log output contains finish message
+    assert 'Finished' in caplog.text
+
+
+#### test/test_process.py
+import sys
+from pathlib import Path
+# Add project root (one level up) to sys.path for module imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import os
+import shutil
+
+import pytest
+import pandas as pd
+import soundfile as sf
+import logging
+
+import configure
+import process
+
+
+@pytest.fixture(autouse=True)
+def setup_test_env(tmp_path, caplog, monkeypatch):
+    # Create test root directories under /test
+    root = tmp_path / "test"
+    root.mkdir()
+    # Data directories
+    data_dir = root / "data"
+    audio_dir = data_dir / "train_audio" / "41970"
+    audio_dir.mkdir(parents=True)
+    soundscape_dir = data_dir / "train_soundscapes"
+    soundscape_dir.mkdir(parents=True)
+
+    # Copy real test audio and soundscape
+    shutil.copy(
+        Path("/data/birdclef/train_audio/41970/iNat327629.ogg"),
+        audio_dir / "iNat327629.ogg"
+    )
+    shutil.copy(
+        Path("/data/birdclef/train_soundscapes/H02_20230420_074000.ogg"),
+        soundscape_dir / "H02_20230420_074000.ogg"
+    )
+
+    # Create train.csv and taxonomy.csv
+    train_csv = data_dir / "train.csv"
+    train_csv.parent.mkdir(parents=True)
+    pd.DataFrame([
+        {"primary_label": "41970", "filename": "41970/iNat327629.ogg"}
+    ]).to_csv(train_csv, index=False)
+    tax_csv = data_dir / "taxonomy.csv"
+    pd.DataFrame([{"primary_label": "41970"}]).to_csv(tax_csv, index=False)
+
+    # Configure CFG paths
+    monkeypatch.setattr(configure.CFG, 'TRAIN_AUDIO_DIR', data_dir / 'train_audio')
+    monkeypatch.setattr(configure.CFG, 'TRAIN_SOUNDSCAPE_DIR', soundscape_dir)
+    monkeypatch.setattr(configure.CFG, 'TRAIN_CSV', train_csv)
+    monkeypatch.setattr(configure.CFG, 'TAXONOMY_CSV', tax_csv)
+    processed_dir = root / 'processed'
+    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed_dir)
+    monkeypatch.setattr(configure.CFG, 'BENCHMARK_MODEL', None)
+    processed_dir.mkdir()
+
+    # Redirect logs to file under /test/log
+    log_dir = root / 'log'
+    log_dir.mkdir()
+    log_file = log_dir / 'process.log'
+    handler = logging.FileHandler(str(log_file))
+    logging.getLogger().addHandler(handler)
+    caplog.set_level('INFO')
+
+    return {'root': root, 'processed_dir': processed_dir, 'log_file': log_file}
+
+
+def test_process_run(setup_test_env, caplog):
+    env = setup_test_env
+    # Run preprocessing
+    process.main()
+
+    processed = env['processed_dir']
+    # Check train audio outputs
+    mel_train = processed / 'mels' / 'train' / '41970'
+    label_train = processed / 'labels' / 'train' / '41970'
+    assert mel_train.exists() and any(mel_train.iterdir()), f"No mel files in {mel_train}"
+    assert label_train.exists() and any(label_train.iterdir()), f"No label files in {label_train}"
+
+    # Check soundscape pseudo-label outputs
+    mel_sound = processed / 'mels' / 'soundscape'
+    label_sound = processed / 'labels' / 'soundscape'
+    assert mel_sound.exists() and any(mel_sound.iterdir()), f"No soundscape mels in {mel_sound}"
+    assert label_sound.exists() and any(label_sound.iterdir()), f"No soundscape labels in {label_sound}"
+
+    # Check metadata files
+    meta_train = processed / 'train_metadata.csv'
+    meta_sound = processed / 'soundscape_metadata.csv'
+    assert meta_train.exists(), "train_metadata.csv missing"
+    assert meta_sound.exists(), "soundscape_metadata.csv missing"
+
+    # Check log content
+    log_text = env['log_file'].read_text()
+    assert "Processing labelled recordings" in log_text
+
+
+#### test/test_regnety.py
+import sys
+from pathlib import Path
+import json
+import pytest
+import torch
+import numpy as np
+import pandas as pd
+import logging
+
+# Insert project root into sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import configure
+import regnety
+
+
+def pytest_configure():
+    # ensure reproducibility
+    torch.manual_seed(0)
+
+@pytest.fixture(autouse=True)
+def setup_regnety_env(tmp_path, monkeypatch, caplog):
+    # Create test root
+    root = tmp_path / 'test'
+    root.mkdir()
+    # Create processed metadata directory and sample mel-file
+    processed = root / 'processed'
+    processed.mkdir()
+    # train_metadata.csv
+    train_meta = pd.DataFrame([
+        {
+            'mel_path': 'mels/train/sp1/chunk0.npy',
+            'label_json': json.dumps({'sp1': 1.0})
+        }
+    ])
+    train_meta.to_csv(processed / 'train_metadata.csv', index=False)
+    # soundscape_metadata.csv
+    sound_meta = pd.DataFrame([
+        {
+            'mel_path': 'mels/soundscape/chunk0.npy',
+            'label_json': json.dumps({'sp1': 1.0})
+        }
+    ])
+    sound_meta.to_csv(processed / 'soundscape_metadata.csv', index=False)
+
+    # Monkeypatch configuration paths
+    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed)
+    model_dir = root / 'models' / 'regnety'
+    monkeypatch.setattr(configure.CFG, 'REG_MODEL_DIR', model_dir)
+    model_dir.mkdir(parents=True)
+
+    # Stub MelDataset to return one sample
+    class DummyMelDataset(torch.utils.data.Dataset):
+        def __init__(self, df, s2i, augment): pass
+        def __len__(self): return 1
+        def __getitem__(self, idx):
+            frames = regnety.SEG_SECONDS * regnety.SAMPLE_RATE // regnety.HOP_LENGTH
+            x = torch.zeros((1, regnety.N_MELS, frames), dtype=torch.float32)
+            y = torch.tensor(0, dtype=torch.long)
+            w = torch.tensor(1.0, dtype=torch.float32)
+            return x, y, w
+    monkeypatch.setattr(regnety, 'MelDataset', DummyMelDataset)
+
+    # Stub FileWiseSampler
+    monkeypatch.setattr(regnety, 'FileWiseSampler', lambda df, src: list(range(len(df))))
+
+    # Stub timm.create_model to lightweight model
+    class DummyRegNet(torch.nn.Module):
+        def __init__(self, arch, pretrained, in_chans, num_classes):
+            super().__init__()
+            self.fc = torch.nn.Linear(1, num_classes)
+        def forward(self, x):
+            batch = x.shape[0]
+            return torch.zeros((batch, num_classes), dtype=torch.float32)
+    # find model name stub
+    monkeypatch.setattr(regnety.timm, 'list_models', lambda: ['regnety_008', 'regnety_008gf'])
+    monkeypatch.setattr(regnety.timm, 'create_model', lambda arch, pretrained, in_chans, num_classes: DummyRegNet(arch, pretrained, in_chans, num_classes))
+
+    # Override hyperparams for quick test
+    monkeypatch.setattr(configure.CFG, 'REG_BATCH_SIZE', 1)
+    monkeypatch.setattr(configure.CFG, 'REG_NUM_WORKERS', 0)
+    monkeypatch.setattr(configure.CFG, 'REG_NUM_MODELS', 1)
+    monkeypatch.setattr(configure.CFG, 'REG_EPOCHS', 1)
+    monkeypatch.setattr(configure.CFG, 'REG_LR', 1e-3)
+    monkeypatch.setattr(configure.CFG, 'REG_WEIGHT_DECAY', 0)
+
+    # Capture logs
+    caplog.set_level(logging.INFO)
+    return {'processed': processed, 'model_dir': model_dir}
+
+
+def test_regnety_training(setup_regnety_env, caplog, monkeypatch):
+    ctx = setup_regnety_env
+    # Simulate CLI args
+    monkeypatch.setattr(sys, 'argv', ['regnety.py', '--device', 'cpu'])
+    # Run training main
+    regnety.main()
+
+    # Check checkpoint file exists
+    files = list(ctx['model_dir'].glob('regnety_008_run1.pth'))
+    assert files, f"Checkpoint not found in {ctx['model_dir']}"
+
+    # Load and inspect checkpoint
+    ckpt = torch.load(files[0], map_location='cpu')
+    assert 'arch' in ckpt and 'model' in ckpt and 'species2idx' in ckpt
+
+    # species2idx mapping
+    assert ckpt['species2idx'] == {'sp1': 0}
+
+    # Confirm finish log
+    assert 'Finished' in caplog.text
+
+
