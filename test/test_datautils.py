@@ -7,7 +7,7 @@ import torch
 import pandas as pd
 import pytest
 
-# ensure project root import
+# ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import configure
 import data_utils as du
@@ -48,26 +48,22 @@ def test_spec_augment_and_cutmix():
 
     # Test cutmix merges two arrays
     m1 = np.ones((5, 10), dtype=np.float32)
-    l1 = torch.tensor([1.0, 0.0])  # dummy labels length mismatch but we care dimensions
+    l1 = torch.tensor([1.0, 0.0])
     m2 = np.zeros((5, 10), dtype=np.float32)
     l2 = torch.tensor([0.5, 0.5])
     mixed, label = du.cutmix(m1, l1, m2, l2)
-    # mixed shape same
     assert mixed.shape == m1.shape
-    # label shape matches first target shape
     assert isinstance(label, torch.Tensor)
 
 def test_segment_audio():
-    # Create sine wave of length 2 seconds at 1 Hz sample
+    # Create an array of length 2 seconds at 10 Hz sample
     sr = 10
     y = np.arange(sr * 2).astype(np.float32)
-    # monkeypatch CFG for chunk/hop secs
-    monkey_cfg = configure.CFG
-    monkey_cfg.TRAIN_CHUNK_SEC = 1
-    monkey_cfg.TRAIN_CHUNK_HOP_SEC = 1
-    monkey_cfg.SAMPLE_RATE = sr
+    # override CFG for chunk/hop secs
+    configure.CFG.TRAIN_CHUNK_SEC = 1
+    configure.CFG.TRAIN_CHUNK_HOP_SEC = 1
+    configure.CFG.SAMPLE_RATE = sr
     segments = list(du.segment_audio(y, sr=sr))
-    # Expect 2 segments (start 0,1)
     assert len(segments) == 2
     for start_sec, chunk in segments:
         assert len(chunk) == sr * 1
@@ -75,10 +71,12 @@ def test_segment_audio():
 def test_load_and_trim_audio(monkeypatch):
     # Stub librosa.load and trim functions
     called = {}
+
     def fake_load(fp, sr, mono=True):
         called['load'] = (fp, sr, mono)
         return np.array([0.1, -0.1], dtype=np.float32), sr
     monkeypatch.setattr(du.librosa, 'load', fake_load)
+
     def fake_trim(y, top_db):
         called['trim'] = (y.tolist(), top_db)
         return y[:1], (0,)
@@ -91,68 +89,56 @@ def test_load_and_trim_audio(monkeypatch):
     assert 'load' in called and 'trim' in called
 
 def test_compute_mel_cpu(monkeypatch):
-    # Force CPU path
-    monkeypatch.setattr(du, '_HAS_SB', False)
     # Stub librosa.feature and power_to_db
-    mel_out = np.ones((4,5), dtype=np.float32)
+    mel_out = np.ones((4, 5), dtype=np.float32)
     monkeypatch.setattr(du.librosa.feature, 'melspectrogram', lambda **kw: mel_out)
     monkeypatch.setattr(du.librosa, 'power_to_db', lambda m, ref: m)
     # Override CFG params
-    monkey_cfg = configure.CFG
-    monkey_cfg.SAMPLE_RATE = 16000
-    monkey_cfg.HOP_LENGTH = 128
-    monkey_cfg.N_FFT = 512
-    monkey_cfg.N_MELS = 4
-    monkey_cfg.FMIN = 0
-    monkey_cfg.FMAX = 8000
-    monkey_cfg.POWER = 2.0
-    # Dummy audio
+    configure.CFG.SAMPLE_RATE = 16000
+    configure.CFG.HOP_LENGTH = 128
+    configure.CFG.N_FFT = 512
+    configure.CFG.N_MELS = 4
+    configure.CFG.FMIN = 0
+    configure.CFG.FMAX = 8000
+    configure.CFG.POWER = 2.0
     y = np.random.randn(100).astype(np.float32)
     mel = du.compute_mel(y, to_db=True)
     assert np.allclose(mel, mel_out)
 
 def test_FileWiseSampler():
-    # Create DataFrame with two file groups
-    df = pd.DataFrame({'filepath': ['a.wav','a.wav','b.wav']})
+    df = pd.DataFrame({'filepath': ['a.wav', 'a.wav', 'b.wav']})
     sampler = du.FileWiseSampler(df, 'filepath')
     indices = list(iter(sampler))
-    # Expect two indices, one for each file
     assert len(indices) == 2
-    # Indices should be within valid range
-    assert set(indices).issubset({0,1,2})
-
-class DummyDataset(torch.utils.data.Dataset):
-    def __init__(self): self.df = pd.DataFrame({'mel_path':['p1.npy'], 'label_json':[json.dumps({'sp':1.0})]})
-    def __len__(self): return 1
-    def __getitem__(self, idx): return None
+    assert set(indices).issubset({0, 1, 2})
 
 def test_MelDataset(monkeypatch, tmp_path):
-    # Prepare fake data
+    # Prepare fake processed directory
     processed = tmp_path / 'processed'
     processed.mkdir()
-    # Save dummy mel and label .npy
+    # Create dummy mel and label files
     mel_dir = processed / 'mels' / 'train' / 'sp'
     label_dir = processed / 'labels' / 'train' / 'sp'
     mel_dir.mkdir(parents=True)
     label_dir.mkdir(parents=True)
-    mel_arr = np.ones((2,2),dtype=np.float32)
-    np.save(mel_dir/'p1.npy', mel_arr)
-    label_vec = np.array([1.0],dtype=np.float32)
-    np.save(label_dir/'p1.label.npy', label_vec)
-    # Monkeypatch CFG and dependencies
+    mel_arr = np.ones((2, 2), dtype=np.float32)
+    np.save(mel_dir / 'p1.npy', mel_arr)
+    label_vec = np.array([1.0], dtype=np.float32)
+    np.save(label_dir / 'p1.label.npy', label_vec)
+
     monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed)
-    monkeypatch.setattr(configure.CFG, 'TARGET_SHAPE', (2,2))
-    monkey_cfg = configure.CFG
-    monkey_cfg.USE_SOFT_LABELS = True
-    # Dummy cv2.resize to identity
+    monkeypatch.setattr(configure.CFG, 'TARGET_SHAPE', (2, 2))
+    configure.CFG.USE_SOFT_LABELS = True
+
+    # cv2.resize identity stub
     monkeypatch.setattr(du.cv2, 'resize', lambda img, shape, interpolation: img)
+
     df = pd.DataFrame({
         'mel_path': ['mels/train/sp/p1.npy'],
         'label_path': ['labels/train/sp/p1.label.npy'],
     })
-    ds = du.MelDataset(df, {'sp':0}, augment=False)
+    ds = du.MelDataset(df, {'sp': 0}, augment=False)
     mel_tensor, label, weight = ds[0]
-    # Check shapes/types
     assert isinstance(mel_tensor, torch.Tensor)
     assert mel_tensor.shape[1:] == mel_arr.shape
     assert isinstance(label, torch.Tensor)

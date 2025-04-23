@@ -119,10 +119,10 @@ class CFG:  # pylint: disable=too-few-public-methods
     # ────────────────────────────────────────────────────────────────────────
     # DiffWave minority‑class synthesis
     # ────────────────────────────────────────────────────────────────────────
-    DIFF_BATCH_SIZE: int = 3
+    DIFF_BATCH_SIZE: int = 8
     DIFF_EPOCHS: int = 40
     DIFF_LR: float = 1e-4
-    DIFF_NUM_WORKERS: int = 8
+    DIFF_NUM_WORKERS: int = 10
     DIFF_RARE_THRESHOLD: int = 10  # if real recordings < 10 ⇒ target for synth
 
     # ────────────────────────────────────────────────────────────────────────

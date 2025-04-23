@@ -22,7 +22,7 @@ import os
 import random
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple, Union, Optional
+from typing import Dict, Iterable, List, Tuple, Union, Optional
 
 import cv2
 import librosa
@@ -91,7 +91,8 @@ def spec_augment(
             out[:, t0 : t0 + th] = 0.0
     return out
 
- def cutmix(
+
+def cutmix(
     m1: np.ndarray,
     l1: torch.Tensor,
     m2: np.ndarray,
@@ -123,14 +124,17 @@ def load_audio(
     y = y.astype(np.float32)
     return (y, sr) if return_sr else y
 
+
 def trim_silence(y: np.ndarray) -> np.ndarray:
     """Energy-based leading / trailing trim."""
     y_trim, _ = librosa.effects.trim(y, top_db=CFG.TRIM_TOP_DB)
     return y_trim
 
+
 def compute_noise_metric(y: np.ndarray) -> float:
     """Composite "noise" metric – smaller ⇒ cleaner recording."""
     return float(y.std() + y.var() + np.sqrt((y ** 2).mean()) + (y ** 2).sum())
+
 
 def load_vad():
     """Return a *WebRTC VAD* instance & helper TS-function or ``(None, None)``."""
@@ -160,6 +164,7 @@ def load_vad():
             voiced.append((start, len(wav)))
         return voiced
     return vad, _get_ts
+
 
 def remove_speech(y: np.ndarray, vad_model, get_ts):
     """Zero-out VAD-detected speech regions (if VAD available)."""
