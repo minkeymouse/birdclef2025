@@ -74,7 +74,7 @@ def _load_benchmark() -> Optional[torch.nn.Module]:
         logging.warning("Benchmark path %s missing – skipping.", bp)
         return None
 
-    ckpt = torch.load(bp, map_location="cpu")
+    ckpt = torch.load(bp, map_location="cuda")
     state = ckpt.get("model_state_dict", ckpt)
     model = BenchmarkModel(num_classes=len(ALL_CLASSES))
     model.load_state_dict(state)

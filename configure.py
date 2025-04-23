@@ -43,7 +43,7 @@ class CFG:  # pylint: disable=too-few-public-methods
     EFF_MODEL_DIR: Path = MODELS_DIR / "efficientnet"
     REG_MODEL_DIR: Path = MODELS_DIR / "regnety"
     DIFFWAVE_MODEL_DIR: Path = MODELS_DIR / "diffwave"
-    BENCHMARK_MODEL: Path = MODELS_DIR / "benchmark"  # ext. classifier or folder
+    BENCHMARK_MODEL: Path = MODELS_DIR / "benchmark/model_fold0.pth"  # ext. classifier or folder
 
     # Inference artifact
     SUBMISSION_OUT: Path = DATA_ROOT / "submission.csv"
@@ -119,7 +119,7 @@ class CFG:  # pylint: disable=too-few-public-methods
     # ────────────────────────────────────────────────────────────────────────
     # DiffWave minority‑class synthesis
     # ────────────────────────────────────────────────────────────────────────
-    DIFF_BATCH_SIZE: int = 4
+    DIFF_BATCH_SIZE: int = 3
     DIFF_EPOCHS: int = 40
     DIFF_LR: float = 1e-4
     DIFF_NUM_WORKERS: int = 8
