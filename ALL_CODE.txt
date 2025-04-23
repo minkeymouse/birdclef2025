@@ -2207,4 +2207,208 @@ def test_regnety_training(setup_regnety_env, caplog, monkeypatch):
     # Confirm finish log
     assert 'Finished' in caplog.text
 
+TEST RESULTS:
+(birdclef) (base) minkeymouse@mvalley:~/kaggle_projects/birdclef$ python code_collector.py 
+Collected 13 files into ALL_CODE.txt
+(birdclef) (base) minkeymouse@mvalley:~/kaggle_projects/birdclef$ pytest
+================================================================================== test session starts ==================================================================================
+platform linux -- Python 3.12.9, pytest-8.3.5, pluggy-1.5.0
+rootdir: /home/minkeymouse/kaggle_projects/birdclef
+collected 12 items                                                                                                                                                                      
 
+test/test_datautils.py ...F....                                                                                                                                                   [ 66%]
+test/test_diffwave.py E                                                                                                                                                           [ 75%]
+test/test_efficientnet.py F                                                                                                                                                       [ 83%]
+test/test_process.py E                                                                                                                                                            [ 91%]
+test/test_regnety.py F                                                                                                                                                            [100%]
+
+======================================================================================== ERRORS =========================================================================================
+_______________________________________________________________________ ERROR at setup of test_diffwave_generate ________________________________________________________________________
+
+tmp_path = PosixPath('/tmp/pytest-of-minkeymouse/pytest-0/test_diffwave_generate0'), monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7a0b69712f30>
+
+    @pytest.fixture(autouse=True)
+    def setup_diffwave_env(tmp_path, monkeypatch):
+        # Create test root and data directories
+        root = tmp_path / 'test'
+        root.mkdir()
+        data_dir = root / 'data'
+        audio_dir = data_dir / 'train_audio' / '41970'
+        audio_dir.mkdir(parents=True)
+        # Create a placeholder existing audio entry for plan calculation
+        (audio_dir / 'iNat327629.ogg').write_bytes(b'')
+    
+        # Create train.csv for plan
+        train_csv = data_dir / 'train.csv'
+>       train_csv.parent.mkdir(parents=True)
+
+test/test_diffwave.py:27: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = PosixPath('/tmp/pytest-of-minkeymouse/pytest-0/test_diffwave_generate0/test/data'), mode = 511, parents = True, exist_ok = False
+
+    def mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        """
+        Create a new directory at this given path.
+        """
+        try:
+>           os.mkdir(self, mode)
+E           FileExistsError: [Errno 17] File exists: '/tmp/pytest-of-minkeymouse/pytest-0/test_diffwave_generate0/test/data'
+
+../../miniconda3/envs/birdclef/lib/python3.12/pathlib.py:1311: FileExistsError
+__________________________________________________________________________ ERROR at setup of test_process_run ___________________________________________________________________________
+
+tmp_path = PosixPath('/tmp/pytest-of-minkeymouse/pytest-0/test_process_run0'), caplog = <_pytest.logging.LogCaptureFixture object at 0x7a0b696cb290>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7a0b696c97c0>
+
+    @pytest.fixture(autouse=True)
+    def setup_test_env(tmp_path, caplog, monkeypatch):
+        # Create test root directories under /test
+        root = tmp_path / "test"
+        root.mkdir()
+        # Data directories
+        data_dir = root / "data"
+        audio_dir = data_dir / "train_audio" / "41970"
+        audio_dir.mkdir(parents=True)
+        soundscape_dir = data_dir / "train_soundscapes"
+        soundscape_dir.mkdir(parents=True)
+    
+        # Copy real test audio and soundscape
+        shutil.copy(
+            Path("/data/birdclef/train_audio/41970/iNat327629.ogg"),
+            audio_dir / "iNat327629.ogg"
+        )
+        shutil.copy(
+            Path("/data/birdclef/train_soundscapes/H02_20230420_074000.ogg"),
+            soundscape_dir / "H02_20230420_074000.ogg"
+        )
+    
+        # Create train.csv and taxonomy.csv
+        train_csv = data_dir / "train.csv"
+>       train_csv.parent.mkdir(parents=True)
+
+test/test_process.py:42: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = PosixPath('/tmp/pytest-of-minkeymouse/pytest-0/test_process_run0/test/data'), mode = 511, parents = True, exist_ok = False
+
+    def mkdir(self, mode=0o777, parents=False, exist_ok=False):
+        """
+        Create a new directory at this given path.
+        """
+        try:
+>           os.mkdir(self, mode)
+E           FileExistsError: [Errno 17] File exists: '/tmp/pytest-of-minkeymouse/pytest-0/test_process_run0/test/data'
+
+../../miniconda3/envs/birdclef/lib/python3.12/pathlib.py:1311: FileExistsError
+======================================================================================= FAILURES ========================================================================================
+__________________________________________________________________________________ test_segment_audio ___________________________________________________________________________________
+
+    def test_segment_audio():
+        # Create sine wave of length 2 seconds at 1 Hz sample
+        sr = 10
+        y = np.arange(sr * 2).astype(np.float32)
+        # monkeypatch CFG for chunk/hop secs
+        monkey_cfg = configure.CFG
+        monkey_cfg.TRAIN_CHUNK_SEC = 1
+        monkey_cfg.TRAIN_CHUNK_HOP_SEC = 1
+        monkey_cfg.SAMPLE_RATE = sr
+        segments = list(du.segment_audio(y, sr=sr))
+        # Expect 2 segments (start 0,1)
+>       assert len(segments) == 2
+E       assert 1 == 2
+E        +  where 1 = len([(0.0, array([ 0.,  1.,  2.,  3.,  4.,  5.,  6.,  7.,  8.,  9., 10., 11., 12.,\n       13., 14., 15., 16., 17., 18., 19... 1.,  2.,  3.,  4.,  5.,  6.,  7.,  8.,  9., 10.,\n       11., 12., 13., 14., 15., 16., 17., 18., 19.], dtype=float32))])
+
+test/test_datautils.py:71: AssertionError
+______________________________________________________________________________ test_efficientnet_training _______________________________________________________________________________
+
+setup_efficientnet_env = {'root': PosixPath('/tmp/pytest-of-minkeymouse/pytest-0/test_efficientnet_training0/test')}
+caplog = <_pytest.logging.LogCaptureFixture object at 0x7a0b6a2c8260>, monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7a0b69713b00>
+
+    def test_efficientnet_training(setup_efficientnet_env, caplog, monkeypatch):
+        caplog.set_level('INFO')
+        # Simulate CLI invocation for CPU and 1 epoch
+        monkeypatch.setattr(sys, 'argv', ['efficientnet.py', '--device', 'cpu', '--epochs', '1'])
+    
+        # Run main training function
+>       efficientnet.main()
+
+test/test_efficientnet.py:90: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+efficientnet.py:197: in main
+    trainer.fit(loader)
+efficientnet.py:113: in fit
+    for batch in loader:
+../../miniconda3/envs/birdclef/lib/python3.12/site-packages/torch/utils/data/dataloader.py:733: in __next__
+    data = self._next_data()
+../../miniconda3/envs/birdclef/lib/python3.12/site-packages/torch/utils/data/dataloader.py:789: in _next_data
+    data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+../../miniconda3/envs/birdclef/lib/python3.12/site-packages/torch/utils/data/_utils/fetch.py:52: in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <test_efficientnet.setup_efficientnet_env.<locals>.DummyDataset object at 0x7a0b69710bf0>, idx = 0
+
+    def __getitem__(self, idx):
+        # x: [1,80,frames], y: long idx, w: float weight
+>       frames = efficientnet.SEG_SECONDS * efficientnet.SAMPLE_RATE // efficientnet.HOP_LENGTH
+E       AttributeError: module 'efficientnet' has no attribute 'SEG_SECONDS'
+
+test/test_efficientnet.py:51: AttributeError
+----------------------------------------------------------------------------------- Captured log call -----------------------------------------------------------------------------------
+INFO     efficientnet:efficientnet.py:169 Device: cpu
+INFO     efficientnet:efficientnet.py:179 Classes: 1
+_________________________________________________________________________________ test_regnety_training _________________________________________________________________________________
+
+setup_regnety_env = {'model_dir': PosixPath('/tmp/pytest-of-minkeymouse/pytest-0/test_regnety_training0/test/models/regnety'), 'processed': PosixPath('/tmp/pytest-of-minkeymouse/pytest-0/test_regnety_training0/test/processed')}
+caplog = <_pytest.logging.LogCaptureFixture object at 0x7a0b696cae10>, monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7a0b696c9070>
+
+    def test_regnety_training(setup_regnety_env, caplog, monkeypatch):
+        ctx = setup_regnety_env
+        # Simulate CLI args
+        monkeypatch.setattr(sys, 'argv', ['regnety.py', '--device', 'cpu'])
+        # Run training main
+>       regnety.main()
+
+test/test_regnety.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+regnety.py:138: in main
+    t = _Trainer(run, len(classes), arch, log); t.fit(loader); t.save(CFG.REG_MODEL_DIR, arch, s2i)
+regnety.py:82: in fit
+    for batch in loader:
+../../miniconda3/envs/birdclef/lib/python3.12/site-packages/torch/utils/data/dataloader.py:733: in __next__
+    data = self._next_data()
+../../miniconda3/envs/birdclef/lib/python3.12/site-packages/torch/utils/data/dataloader.py:789: in _next_data
+    data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+../../miniconda3/envs/birdclef/lib/python3.12/site-packages/torch/utils/data/_utils/fetch.py:52: in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <test_regnety.setup_regnety_env.<locals>.DummyMelDataset object at 0x7a0b696c9880>, idx = 0
+
+    def __getitem__(self, idx):
+>       frames = regnety.SEG_SECONDS * regnety.SAMPLE_RATE // regnety.HOP_LENGTH
+E       AttributeError: module 'regnety' has no attribute 'SEG_SECONDS'
+
+test/test_regnety.py:56: AttributeError
+----------------------------------------------------------------------------------- Captured log call -----------------------------------------------------------------------------------
+INFO     regnety:regnety.py:118 Device: cpu
+INFO     regnety:regnety.py:126 Classes: 1
+=================================================================================== warnings summary ====================================================================================
+test/test_efficientnet.py::test_efficientnet_training
+  /home/minkeymouse/kaggle_projects/birdclef/efficientnet.py:95: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+    self.scaler = GradScaler(enabled=CFG.use_cuda())
+
+test/test_regnety.py::test_regnety_training
+  /home/minkeymouse/kaggle_projects/birdclef/regnety.py:69: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+    self.scaler = GradScaler(enabled=CFG.use_cuda())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================================================================================ short test summary info ================================================================================
+FAILED test/test_datautils.py::test_segment_audio - assert 1 == 2
+FAILED test/test_efficientnet.py::test_efficientnet_training - AttributeError: module 'efficientnet' has no attribute 'SEG_SECONDS'
+FAILED test/test_regnety.py::test_regnety_training - AttributeError: module 'regnety' has no attribute 'SEG_SECONDS'
+ERROR test/test_diffwave.py::test_diffwave_generate - FileExistsError: [Errno 17] File exists: '/tmp/pytest-of-minkeymouse/pytest-0/test_diffwave_generate0/test/data'
+ERROR test/test_process.py::test_process_run - FileExistsError: [Errno 17] File exists: '/tmp/pytest-of-minkeymouse/pytest-0/test_process_run0/test/data'
+=================================================================== 3 failed, 7 passed, 2 warnings, 2 errors in 4.11s ===================================================================
+(birdclef) (base) minkeymouse@mvalley:~/kaggle_projects/birdclef$ 

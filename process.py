@@ -1,18 +1,16 @@
 #!/usr/bin/env python
 """
-process.py ‑‑ BirdCLEF 2025 preprocessing pipeline
+process.py – BirdCLEF 2025 preprocessing pipeline
 =================================================
-Cleans raw *train_audio* / *train_soundscape* recordings, applies Voice‑Activity
-Detection (VAD), deduplicates, builds **10‑second mel‑spectrogram chunks** with
-*soft labels* and sample weighting, then saves three artefacts under
-``CFG.PROCESSED_DIR``:
+Cleans raw *train_audio* / *train_soundscape* audio, applies Voice-Activity
+Detection (VAD), deduplicates, builds **10-second mel-spectrogram chunks** with
+*soft labels* and sample weighting, then saves:
 
-* ``mels/<split>/.../*.npy`` ‑ normalised mel spectrogram arrays
-* ``labels/<split>/.../*.label.npy`` ‑ dense probability vectors (206‑long)
-* ``<split>_metadata.csv`` – one row per chunk with paths + metadata
+* `mels/<split>/.../*.npy` – normalized mel spectrogram arrays
+* `labels/<split>/.../*.label.npy` – soft-label vectors
+* `<split>_metadata.csv` – one row per chunk
 
-The script is idempotent and safe to rerun after you add new recordings or
-update configuration in ``configure.py``.
+Idempotent: safe to rerun after adding/updating raw data or CFG.
 """
 from __future__ import annotations
 
@@ -20,7 +18,6 @@ import argparse
 import hashlib
 import json
 import logging
-import random
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -42,391 +39,277 @@ from data_utils import (
     trim_silence,
 )
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Globals derived from configuration / dataset
-# ────────────────────────────────────────────────────────────────────────────────
+#──────────────────────────────────────────────────────────────────────────────
+# Global constants driven by CFG
+#──────────────────────────────────────────────────────────────────────────────
+LABEL_W_PRIMARY       = getattr(CFG, "LABEL_WEIGHT_PRIMARY", 0.95)
+LABEL_W_BENCH         = getattr(CFG, "LABEL_WEIGHT_BENCH", 0.05)
+RARE_COUNT_THRESHOLD  = getattr(CFG, "RARE_COUNT_THRESHOLD", 20)
+PSEUDO_WEIGHT         = getattr(CFG, "PSEUDO_WEIGHT", 0.5)
 
-# ── Single‑model benchmark loader ────────────────────────────────────────────────
+#──────────────────────────────────────────────────────────────────────────────
+# Class discovery & benchmark loader
+#──────────────────────────────────────────────────────────────────────────────
+
+def _discover_classes() -> List[str]:
+    if CFG.CLASSES:
+        return list(CFG.CLASSES)
+    if CFG.TAXONOMY_CSV.exists():
+        df = pd.read_csv(CFG.TAXONOMY_CSV)
+        if "primary_label" in df:
+            return sorted(df["primary_label"].unique())
+    if CFG.TRAIN_CSV.exists():
+        df = pd.read_csv(CFG.TRAIN_CSV)
+        if "primary_label" in df:
+            return sorted(df["primary_label"].unique())
+    raise RuntimeError("Cannot infer species list; set CFG.CLASSES explicitly")
+
+ALL_CLASSES = _discover_classes()
+CLASS2IDX   = {s: i for i, s in enumerate(ALL_CLASSES)}
+
 class BenchmarkModel(torch.nn.Module):
-    """
-    Wraps an EfficientNet‑B0 to load a single state_dict for benchmark smoothing.
-    """
-    def __init__(self, num_classes: int):
+    """Load single EfficientNet-B0 for smoothing/validation"""
+    def __init__(self, num_classes:int):
         super().__init__()
         self.net = timm.create_model(
-            "efficientnet_b0",
-            pretrained=False,
-            in_chans=1,
-            num_classes=num_classes,
+            "efficientnet_b0", pretrained=False, in_chans=1, num_classes=num_classes
         )
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
 def _load_benchmark() -> Optional[torch.nn.Module]:
-    """
-    Load a single‑checkpoint benchmark model (state_dict) and return it in eval mode.
-    """
-    if not CFG.BENCHMARK_MODEL:
+    path = CFG.BENCHMARK_MODEL
+    if not path:
         return None
-    bp = Path(CFG.BENCHMARK_MODEL)
+    bp = Path(path)
     if not bp.exists():
-        logging.warning("Benchmark path %s missing – skipping.", bp)
+        logging.warning("Benchmark model not found at %s", bp)
         return None
+    ck = torch.load(bp, map_location="gpu")
+    state = ck.get("model_state_dict", ck)
+    m = BenchmarkModel(len(ALL_CLASSES))
+    m.load_state_dict(state)
+    m.eval()
+    return m
 
-    ckpt = torch.load(bp, map_location="cuda")
-    state = ckpt.get("model_state_dict", ckpt)
-    model = BenchmarkModel(num_classes=len(ALL_CLASSES))
-    model.load_state_dict(state)
-    model.eval()
-    return model
-
-
-# ── Class list discovery ────────────────────────────────────────────────────────
-def _discover_classes() -> List[str]:
-    if hasattr(CFG, "CLASSES") and CFG.CLASSES:
-        return list(CFG.CLASSES)
-    if CFG.TAXONOMY_CSV.exists():
-        df_tax = pd.read_csv(CFG.TAXONOMY_CSV)
-        if "primary_label" in df_tax.columns:
-            return sorted(df_tax["primary_label"].unique())
-    if CFG.TRAIN_CSV.exists():
-        df_train = pd.read_csv(CFG.TRAIN_CSV)
-        if "primary_label" in df_train.columns:
-            return sorted(df_train["primary_label"].unique())
-    raise RuntimeError("Unable to infer species list – please set CFG.CLASSES")
-
-ALL_CLASSES: List[str] = _discover_classes()
-CLASS2IDX: Dict[str, int] = {sp: i for i, sp in enumerate(ALL_CLASSES)}
-
-# weight hyper‑params (fallback defaults)
-LABEL_W_PRIMARY = getattr(CFG, "LABEL_WEIGHT_PRIMARY", 0.95)
-LABEL_W_BENCH = getattr(CFG, "LABEL_WEIGHT_BENCH", 0.05)
-RARE_WEIGHT = getattr(CFG, "RARE_WEIGHT", 2.0)
-PSEUDO_WEIGHT = getattr(CFG, "PSEUDO_WEIGHT", 0.5)
-RARE_COUNT_THRESHOLD = getattr(CFG, "RARE_COUNT_THRESHOLD", 20)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Logging helpers
-# ────────────────────────────────────────────────────────────────────────────────
-
-def _setup_logger(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler()],
-    )
-
-# ────────────────────────────────────────────────────────────────────────────────
+#──────────────────────────────────────────────────────────────────────────────
 # Utility functions
-# ────────────────────────────────────────────────────────────────────────────────
+#──────────────────────────────────────────────────────────────────────────────
 
-def _md5(fp: Path) -> str:
-    """
-    Compute an MD5 hash of a file’s contents.
-    """
-    h = hashlib.md5()
+def _md5(fp:Path)->str:
+    h=hashlib.md5()
     with fp.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
+        for chunk in iter(lambda:f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
 
-def _deduplicate(paths: Sequence[Path]) -> List[Path]:
-    """
-    Return unique file paths in first-seen order by file MD5.
-    """
-    seen_hashes: set[str] = set()
-    unique: List[Path] = []
+
+def _deduplicate(paths:Sequence[Path])->List[Path]:
+    seen, unique = set(), []
     for p in paths:
         try:
             sig = _md5(p)
-        except Exception:
-            # if hashing fails, just keep the path
+        except:
             unique.append(p)
             continue
-        if sig not in seen_hashes:
-            seen_hashes.add(sig)
+        if sig not in seen:
+            seen.add(sig)
             unique.append(p)
     return unique
 
 
-def _np_save(fp: Path, arr: np.ndarray) -> None:
-    """Save a numpy array safely, creating parent dirs."""
+def _np_save(fp:Path, arr:np.ndarray)->None:
     fp.parent.mkdir(parents=True, exist_ok=True)
     np.save(fp, arr.astype(np.float32), allow_pickle=False)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Soft‑label construction
-# ────────────────────────────────────────────────────────────────────────────────
+#──────────────────────────────────────────────────────────────────────────────
+# Soft-label builder
+#──────────────────────────────────────────────────────────────────────────────
 
-def _secondary_list(raw: str | float | int) -> List[str]:
+def _secondary_list(raw)->List[str]:
     if isinstance(raw, str) and raw:
-        return [s for s in raw.split(";") if s]
+        return [s for s in raw.split(';') if s]
     return []
 
 
 def build_soft_label(
-    primary: str,
-    secondaries: List[str],
-    bench_model: Optional[torch.nn.Module] = None,
-    wav: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
-    """
-    Compose a normalized {species: prob} dict summing to 1,
-    mixing primary/secondary ground truth with benchmark smoothing.
-    """
-    # base weights
-    label: Dict[str, float] = defaultdict(float)
-    rem = 1.0 - LABEL_W_BENCH
+    primary:str,
+    secondaries:List[str],
+    bench_model:Optional[torch.nn.Module]=None,
+    wav:Optional[np.ndarray]=None,
+)->Dict[str,float]:
+    label=defaultdict(float)
+    rem=1.0 - LABEL_W_BENCH
     if secondaries:
-        sec_share = rem - LABEL_W_PRIMARY
-        sec_w = sec_share / len(secondaries)
+        share=(rem - LABEL_W_PRIMARY)/len(secondaries)
         for s in secondaries:
-            label[s] += sec_w
-        label[primary] += LABEL_W_PRIMARY
+            label[s]+=share
+        label[primary]+=LABEL_W_PRIMARY
     else:
-        label[primary] += rem
+        label[primary]+=rem
 
-    # benchmark smoothing
-    if bench_model is not None and wav is not None:
-        mel = compute_mel(wav)
-        x = torch.from_numpy(mel).unsqueeze(0).unsqueeze(0)
+    if bench_model and wav is not None:
+        m=compute_mel(wav)
+        t=torch.from_numpy(m).unsqueeze(0).unsqueeze(0)
         with torch.no_grad():
-            logits = bench_model(x)
-            probs = torch.sigmoid(logits)[0].cpu().numpy()
-        for i, p in enumerate(probs):
-            if p > 0:
-                label[ALL_CLASSES[i]] += LABEL_W_BENCH * float(p)
+            logits=bench_model(t)
+            probs=torch.sigmoid(logits)[0].cpu().numpy()
+        for i,p in enumerate(probs):
+            if p>0:
+                label[ALL_CLASSES[i]]+=LABEL_W_BENCH*p
 
-    # normalize for safety
-    total = sum(label.values())
-    for k in list(label):
-        label[k] /= total
-    return dict(label)
+    total=sum(label.values()) or 1.0
+    return {k:v/total for k,v in label.items()}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Core processing functions
-# ────────────────────────────────────────────────────────────────────────────────
+#──────────────────────────────────────────────────────────────────────────────
+# Recording & soundscape processing
+#──────────────────────────────────────────────────────────────────────────────
 
-def _process_recordings() -> None:
-    """Process label‑verified *train_audio* recordings into 10‑s mel chunks."""
-    log = logging.getLogger()
-    log.info("✨ Processing labelled recordings …")
+def _process_recordings():
+    log=logging.getLogger()
+    log.info("✨ Processing train_audio recordings...")
 
-    # Load metadata CSV
-    df_meta = pd.read_csv(CFG.TRAIN_CSV)
+    df=pd.read_csv(CFG.TRAIN_CSV)
+    if CFG.MIN_RATING>0 and 'rating' in df:
+        df=df[df['rating']>=CFG.MIN_RATING]
 
-    # Quality gate
-    if getattr(CFG, "MIN_RATING", 0) > 0 and "rating" in df_meta.columns:
-        df_meta = df_meta[df_meta["rating"] >= CFG.MIN_RATING]
-
-    # Map to existing files
-    records: List[dict] = []
-    for r in df_meta.itertuples(index=False):
-        fp = CFG.TRAIN_AUDIO_DIR / r.filename
+    recs=[]
+    for r in df.itertuples(index=False):
+        fp=CFG.TRAIN_AUDIO_DIR/ r.filename
         if not fp.exists():
-            log.warning("Missing %s", fp)
+            log.warning("Missing %s",fp)
             continue
-        d = r._asdict()  # type: ignore[attr-defined]
-        d["filepath"] = fp
-        records.append(d)
-    df = pd.DataFrame.from_records(records)
+        d=r._asdict() if hasattr(r,'_asdict') else r._asdict()
+        d['filepath']=fp
+        recs.append(d)
+    df=pd.DataFrame(recs)
     if df.empty:
-        log.warning("No recordings found – aborting train stage")
-        return
+        log.warning("No files to process."); return
 
-    # Deduplicate identical files
-    df = df[df["filepath"].isin(_deduplicate(df["filepath"].tolist()))].reset_index(drop=True)
+    df=df[df['filepath'].isin(_deduplicate(df['filepath'].tolist()))].reset_index(drop=True)
+    df['noise']= [compute_noise_metric(load_audio(fp)) for fp in df['filepath']]
+    ratio=CFG.FOLD0_RATIO
+    if 0<ratio<1:
+        th=np.quantile(df['noise'],ratio)
+        df=df[df['noise']<=th].reset_index(drop=True)
+        log.info("Using %d clean recordings",len(df))
 
-    # Compute noise score & select fold‑0 subset
-    noise_scores: List[float] = []
-    for fp in df["filepath"]:
-        y = load_audio(fp)
-        noise_scores.append(compute_noise_metric(y))
-    df["noise_score"] = noise_scores
+    bench=_load_benchmark()
+    if bench: log.info("Benchmark loaded.")
+    vad,ts=load_vad()
 
-    ratio = getattr(CFG, "FOLD0_RATIO", 1.0)
-    if 0 < ratio < 1.0:
-        thresh = np.quantile(df["noise_score"], ratio)
-        df = df[df["noise_score"] <= thresh].reset_index(drop=True)
-        log.info("Selected %d clean recordings (%.0f%%)", len(df), 100 * ratio)
+    mel_dir=CFG.PROCESSED_DIR/'mels'/'train'
+    lbl_dir=CFG.PROCESSED_DIR/'labels'/'train'
 
-    # Load single-model benchmark for smoothing & swap logic
-    bench_model = _load_benchmark()
-    if bench_model:
-        log.info("Benchmark model loaded for smoothing and swap logic.")
-    vad_model, vad_ts = load_vad()
+    rows=[]
+    for r in df.itertuples(index=False):
+        y=load_audio(r.filepath)
+        y=trim_silence(y)
+        y=remove_speech(y,vad,ts)
+        if np.sqrt((y**2).mean())<CFG.RMS_THRESHOLD: continue
 
-    # Prepare output directories
-    mel_root = CFG.PROCESSED_DIR / "mels" / "train"
-    lbl_root = CFG.PROCESSED_DIR / "labels" / "train"
-    mel_root.mkdir(parents=True, exist_ok=True)
-    lbl_root.mkdir(parents=True, exist_ok=True)
-
-    rows: List[dict] = []
-    for rec in df.itertuples(index=False):
-        y = load_audio(rec.filepath)
-        y = trim_silence(y)
-        y = remove_speech(y, vad_model, vad_ts)
-        if np.sqrt((y ** 2).mean()) < CFG.RMS_THRESHOLD:
-            continue  # too quiet
-
-        secondaries = _secondary_list(getattr(rec, "secondary_labels", ""))
-        primary_lbl = rec.primary_label
-
-        # Swap logic using full-clip benchmark prediction
-        if bench_model is not None:
-            mel_full = compute_mel(y)
-            x_full = torch.from_numpy(mel_full).unsqueeze(0).unsqueeze(0)
+        secs=list(segment_audio(y))
+        secs2=_secondary_list(getattr(r,'secondary_labels',''))
+        prim=r.primary_label
+        if bench:
+            mfull=compute_mel(y)
+            t1=torch.from_numpy(mfull).unsqueeze(0).unsqueeze(0)
             with torch.no_grad():
-                logits_full = bench_model(x_full)
-                probs_full = torch.sigmoid(logits_full)[0].cpu().numpy()
-            top_lbl = ALL_CLASSES[int(probs_full.argmax())]
-            if top_lbl != primary_lbl and top_lbl in secondaries:
-                log.info("Swapping primary %s → %s", primary_lbl, top_lbl)
-                primary_lbl = top_lbl
-            elif top_lbl != primary_lbl and top_lbl not in secondaries:
-                log.debug("Discarding mislabeled clip %s", rec.filepath.name)
-                continue
+                pfull=torch.sigmoid(bench(t1))[0].cpu().numpy()
+            top=ALL_CLASSES[int(pfull.argmax())]
+            if top!=prim:
+                if top in secs2: prim=top
+                else: continue
 
-        # Segment into fixed-length chunks
-        for start_sec, chunk in segment_audio(y):
-            if len(chunk) < CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE:
-                pad = CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE - len(chunk)
-                chunk = np.pad(chunk, (0, pad), mode="wrap")
+        for st,chunk in secs:
+            L=CFG.TRAIN_CHUNK_SEC*CFG.SAMPLE_RATE
+            if len(chunk)<L: chunk=np.pad(chunk,(0,L-len(chunk)),'wrap')
+            mel=compute_mel(chunk)
+            soft=build_soft_label(prim,secs2,bench,chunk)
 
-            mel_chunk = compute_mel(chunk)
-            soft = build_soft_label(primary_lbl, secondaries, bench_model, chunk)
-
-            base = f"{rec.filepath.stem}_{int(start_sec)}s"
-            mel_fp = mel_root / primary_lbl / f"{base}.npy"
-            lbl_fp = lbl_root / primary_lbl / f"{base}.label.npy"
-
-            _np_save(mel_fp, mel_chunk)
-
-            vec = np.zeros(len(ALL_CLASSES), dtype=np.float32)
-            for k, v in soft.items():
-                vec[CLASS2IDX[k]] = v
-            _np_save(lbl_fp, vec)
+            stem=f"{r.filepath.stem}_{int(st)}s"
+            mp=mel_dir/prim/f"{stem}.npy"; lp=lbl_dir/prim/f"{stem}.label.npy"
+            _np_save(mp,mel); _np_save(lp,np.array([soft.get(c,0) for c in ALL_CLASSES],dtype=np.float32))
 
             rows.append({
-                "mel_path": str(mel_fp.relative_to(CFG.PROCESSED_DIR)),
-                "label_path": str(lbl_fp.relative_to(CFG.PROCESSED_DIR)),
-                "label_json": json.dumps(soft, separators=(",",":")),
-                "duration": CFG.TRAIN_CHUNK_SEC,
-                "rating": getattr(rec, "rating", ""),
-                "noise_score": rec.noise_score,  # type: ignore[attr-defined]
-                "weight": 1.0,
+                'mel_path':str(mp.relative_to(CFG.PROCESSED_DIR)),
+                'label_path':str(lp.relative_to(CFG.PROCESSED_DIR)),
+                'label_json':json.dumps(soft,separators=(',',':')),
+                'duration':CFG.TRAIN_CHUNK_SEC,
+                'noise_score':getattr(r,'noise',0),
+                'weight':1.0,
             })
 
-    out_csv = CFG.PROCESSED_DIR / "train_metadata.csv"
-    pd.DataFrame(rows).to_csv(out_csv, index=False)
-    log.info("Saved %d mel chunks → %s", len(rows), out_csv.name)
+    pd.DataFrame(rows).to_csv(CFG.PROCESSED_DIR/'train_metadata.csv',index=False)
+    log.info("Wrote %d train chunks",len(rows))
 
 
-# Pseudo‑labelling soundscapes ----------------------------------------------------
+def _process_soundscapes():
+    log=logging.getLogger()
+    if not CFG.TRAIN_SOUNDSCAPE_DIR.exists(): log.info("No soundscapes"); return
+    bench=_load_benchmark()
+    if not bench:
+        raise RuntimeError("Benchmark model not found; cannot process soundscapes")
+    vad,ts=load_vad()
 
-def _process_soundscapes() -> None:
-    log = logging.getLogger()
-    if not CFG.TRAIN_SOUNDSCAPE_DIR.exists():
-        log.info("No soundscape directory – skipping pseudo‑labelling stage")
-        return
-    bench_model = _load_benchmark()
-    if bench_model is None:
-        log.warning("Benchmark unavailable – skipping soundscape pseudo‑labelling")
-        return
-    vad_model, vad_ts = load_vad()
+    mel_dir=CFG.PROCESSED_DIR/'mels'/'soundscape'
+    lbl_dir=CFG.PROCESSED_DIR/'labels'/'soundscape'
 
-    mel_root = CFG.PROCESSED_DIR / "mels" / "soundscape"
-    lbl_root = CFG.PROCESSED_DIR / "labels" / "soundscape"
-    mel_root.mkdir(parents=True, exist_ok=True)
-    lbl_root.mkdir(parents=True, exist_ok=True)
-
-    rows: List[dict] = []
-    for fp in sorted(CFG.TRAIN_SOUNDSCAPE_DIR.glob("*.ogg")):
-        y = load_audio(fp)
-        y = trim_silence(y)
-        y = remove_speech(y, vad_model, vad_ts)
-
-        for start_sec, seg in segment_audio(y):
-            if len(seg) < CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE:
-                seg = np.pad(seg, (0, CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE - len(seg)), mode="wrap")
-
-            mel_seg = compute_mel(seg)
-            x_seg = torch.from_numpy(mel_seg).unsqueeze(0).unsqueeze(0)
-            with torch.no_grad():
-                logits_seg = bench_model(x_seg)
-                probs = torch.sigmoid(logits_seg)[0].cpu().numpy()
-
-            if float(probs.max()) < CFG.PSEUDO_THRESHOLD:
-                continue
-
-            mel_fp = mel_root / f"{fp.stem}_{int(start_sec)}s.npy"
-            lbl_fp = lbl_root / f"{fp.stem}_{int(start_sec)}s.label.npy"
-            _np_save(mel_fp, mel_seg)
-            _np_save(lbl_fp, probs.astype(np.float32))
-
-            soft = {ALL_CLASSES[i]: float(p) for i, p in enumerate(probs) if p > 0}
+    rows=[]
+    for fp in sorted(CFG.TRAIN_SOUNDSCAPE_DIR.glob('*.ogg')):
+        y=load_audio(fp); y=trim_silence(y); y=remove_speech(y,vad,ts)
+        for st,seg in segment_audio(y):
+            L=CFG.TRAIN_CHUNK_SEC*CFG.SAMPLE_RATE
+            if len(seg)<L: seg=np.pad(seg,(0,L-len(seg)),'wrap')
+            mel=compute_mel(seg)
+            if bench:
+                with torch.no_grad():
+                    p=torch.sigmoid(bench(torch.from_numpy(mel).unsqueeze(0).unsqueeze(0)))[0].cpu().numpy()
+            else:
+                p=np.ones(len(ALL_CLASSES),dtype=np.float32)
+            if float(p.max())<CFG.PSEUDO_THRESHOLD: continue
+            stem=f"{fp.stem}_{int(st)}s"
+            mp=mel_dir/f"{stem}.npy"; lp=lbl_dir/f"{stem}.label.npy"
+            _np_save(mp,mel); _np_save(lp,p)
+            soft={ALL_CLASSES[i]:float(v) for i,v in enumerate(p) if v>0}
             rows.append({
-                "mel_path": str(mel_fp.relative_to(CFG.PROCESSED_DIR)),
-                "label_path": str(lbl_fp.relative_to(CFG.PROCESSED_DIR)),
-                "label_json": json.dumps(soft, separators=(",",":")),
-                "duration": CFG.TRAIN_CHUNK_SEC,
-                "rating": "pseudo",
-                "noise_score": compute_noise_metric(seg),
-                "weight": PSEUDO_WEIGHT,
+                'mel_path':str(mp.relative_to(CFG.PROCESSED_DIR)),
+                'label_path':str(lp.relative_to(CFG.PROCESSED_DIR)),
+                'label_json':json.dumps(soft,separators=(',',':')),
+                'duration':CFG.TRAIN_CHUNK_SEC,
+                'noise_score':compute_noise_metric(seg),
+                'weight':PSEUDO_WEIGHT,
             })
-
     if rows:
-        out_csv = CFG.PROCESSED_DIR / "soundscape_metadata.csv"
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
-        log.info("Saved %d pseudo‑labelled chunks → %s", len(rows), out_csv.name)
+        pd.DataFrame(rows).to_csv(CFG.PROCESSED_DIR/'soundscape_metadata.csv',index=False)
+        log.info("Wrote %d pseudo-labelled chunks",len(rows))
 
 
-def _apply_rare_weighting() -> None:
-    meta_files = [
-        CFG.PROCESSED_DIR / "train_metadata.csv",
-        CFG.PROCESSED_DIR / "soundscape_metadata.csv",
-    ]
-    dfs = [pd.read_csv(p) for p in meta_files if p.exists()]
-    if not dfs:
-        return
-
-    all_meta = pd.concat(dfs, ignore_index=True)
-    counts = Counter(max(json.loads(js), key=json.loads(js).get) for js in all_meta["label_json"])
-    rare_species = {sp for sp, c in counts.items() if c < RARE_COUNT_THRESHOLD}
-
-    for p in meta_files:
-        if not p.exists():
-            continue
-        df = pd.read_csv(p)
-        df["weight"] = [
-            RARE_WEIGHT if max(json.loads(js), key=json.loads(js).get) in rare_species else 1.0
-            for js in df["label_json"]
-        ]
-        df.to_csv(p, index=False)
-
-    logging.getLogger().info(
-        "Applied rare‑species weighting (x%.1f) to %d species", RARE_WEIGHT, len(rare_species)
-    )
+def _apply_rare_weighting():
+    files=[CFG.PROCESSED_DIR/'train_metadata.csv', CFG.PROCESSED_DIR/'soundscape_metadata.csv']
+    dfs=[pd.read_csv(f) for f in files if f.exists()]
+    if not dfs: return
+    allm=pd.concat(dfs,ignore_index=True)
+    cnt=Counter(max(json.loads(j), key=json.loads(j).get) for j in allm['label_json'])
+    rares={s for s,c in cnt.items() if c<RARE_COUNT_THRESHOLD}
+    for f in files:
+        if not f.exists(): continue
+        df=pd.read_csv(f)
+        df['weight']=[CFG.RARE_WEIGHT if max(json.loads(j),key=json.loads(j).get) in rares else 1.0 for j in df['label_json']]
+        df.to_csv(f,index=False)
+    logging.getLogger().info("Applied rare weighting to %d species", len(rares))
 
 
-def main() -> None:
-    pa = argparse.ArgumentParser(description="Preprocess BirdCLEF 2025 audio")
-    pa.add_argument("--verbose", action="store_true", help="debug logging")
-    args = pa.parse_args()
-
-    _setup_logger(args.verbose)
-    seed_everything(getattr(CFG, "SEED", 42))
-
+def main():
+    p=argparse.ArgumentParser(description="Preprocess BirdCLEF 2025 audio")
+    p.add_argument('--verbose',action='store_true')
+    args=p.parse_args()
+    lvl=logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=lvl, format="%(asctime)s [%(levelname)s] %(message)s")
+    seed_everything(CFG.SEED)
     CFG.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    _process_recordings(); _process_soundscapes(); _apply_rare_weighting()
+    logging.info("✅ Done – data in %s", CFG.PROCESSED_DIR)
 
-    _process_recordings()
-    _process_soundscapes()
-    _apply_rare_weighting()
-
-    logging.info("✅ Preprocessing finished – data saved to %s", CFG.PROCESSED_DIR)
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': main()
