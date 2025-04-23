@@ -1,0 +1,52 @@
+Based on our discussion so far, here's what I think is proper workflow.
+
+1. We read /data/birdclef/train.csv. The file contains columns 'primary_label', 'secondary_labels', 'type', 'filename', 'collection',
+       'rating', 'url', 'latitude', 'longitude', 'scientific_name',
+       'common_name', 'author', 'license'.
+We will be using 'primary_label', 'secondary_labels', 'type', 'filename', 'rating', 'latitude', 'longitude' For our analysis.
+Observing the data, I found that for the files that has rating of 5 they only had one label each.
+We will first construct our 'golden' dataset with these 5 rating one-labeled data. divide them into 10 second chunks and drop bad chunks, drop duplicate, drop human voices.
+Their label tensor will be 206 dimension and only has 1 for 1 corresponding index. class and index mapping is given in CFG. File's directory is given at CFG too.
+After processing the data, we now have 10 seconds chunks mel-spectogram tensor and corresponding label tensor. We need to save the meta data in new train_metadata.csv file in current directory.
+This train_metadata file will have each row for a chunk with columns 'filename', 'end_sec', 'mel_path', 'label_path', 'weight'.
+With this golden data, we will now construct training database further but only with those under-represented.
+The goal is to make as promising data as possible for initial training. Since there are about 26000 audio files and exactly 206 species, I want to add training files with following rule.
+I have following "rate_count.csv" file ready at my home directory.
+
+primary_label,rating,count
+21038,0,2
+21116,0,2
+21211,0,8
+21211,2,4
+21211,3,44
+21211,4,19
+21211,5,1
+22333,0,43
+22333,3,1
+22333,4,2
+22333,5,1
+22973,0,40
+...
+
+With this file we selectively choose files to make them into mel chunks. With some rules, we choose so called 'golden' filebase for initial training.
+For instance, if we have certain species with more than 100 5 rating files, we don't collect them any more.
+Also, we must include all the files that has sum of less than 20, we include all of them regardless of their ratings.
+With this rule in mind, we select files. Since now files have minorities, we should start doing the labeling.
+If there's not secondary label, we just create the one hot encoded vector label and save it with mel file and record this into train_metadata.csv.
+However, if there's secondary label, we first mark primary label's class with 1 and secondary labels with 0.05s.
+For instance, if a file has secondary label of 5 species, from the first to last in the list they get labels for 0.05.
+For the weight, if the file is rated 5 and has only one label, it has highest weight which is 1. However, if the file is from minority (less than 20) they also get weight of 1.
+weight will be used in dataloader for sampling the chunks.
+Now for the rest of the files, we use the similar strategy. We will control the data by pseudo labelling and weights.
+Files from minorities will get higher weights and files from abundant species will get smaller weights.
+For the labels, in initialization, primary label gets 1 and secondary labels get 0.05. I haven't decided on weight strategy so you should find your best way to do this.
+After initial set up with labelled data is done, we will train the model.
+We will be training 3 best models for each: efficientnet and regnety. We will save the model results in /data/birdclef/models with proper names.
+Though previous code uses benchmarks, we will not be using benchmarks of any. Our 6 models will become benchmarks.
+
+Once the training is done, we will make inferences based on trained models on chunks so we can make them more precise.
+For instance, with this process, we will be able to identify exactly which chunks contain birdcalls and which chunks contain secondary labels.
+Once inference is done, we will compare the result with actual train_metadata.
+If certain chunk does have species with higher probability than 0.5 and in metadata it is said to have such species(first or secondary label), then we will update the label for that species of that chunk into 1.
+Now once label is updated, 
+
