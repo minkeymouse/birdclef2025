@@ -74,7 +74,7 @@ minority_df = df[label_counts < rare_species_thresh]
 golden_df = pd.concat([best_rating_df, minority_df], ignore_index=True)
 selected_labels = set(golden_df["primary_label"].unique())
 
-for offset in [0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5]:
+for offset in [0.5, 1, 1.5, 2]:
     threshold = golden_rating - offset
     sub_df = df[df["rating"] >= threshold]
     new_df = sub_df[~sub_df["primary_label"].isin(selected_labels)]
