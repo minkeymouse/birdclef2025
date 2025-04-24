@@ -48,5 +48,20 @@ Once the training is done, we will make inferences based on trained models on ch
 For instance, with this process, we will be able to identify exactly which chunks contain birdcalls and which chunks contain secondary labels.
 Once inference is done, we will compare the result with actual train_metadata.
 If certain chunk does have species with higher probability than 0.5 and in metadata it is said to have such species(first or secondary label), then we will update the label for that species of that chunk into 1.
-Now once label is updated, 
+Now once label is updated and noises are dropped, we will do the training again with updated label.
+Such overfitting is (I think) good because our competition is closed set on 206 classes of birds.
+We will repeat the process about 5 times and then we will have our best 6 models.
+
+Now it's time to label unlabeled soundscapes.
+
+First we will make inferences and create pseudo labels with our model.
+Then, Using our 'golden data' with all the classes available as validation set, we will train our model with mixture of chunks from labeled and pseudo labelled data.
+After some iteration, we will have our 6 another updated models.
+
+Then, we will apply mixing of sounds(using golden data to create soundscapes) and synthetic data to create additional datasets.
+With these additional dataset, we will also train the model again.
+
+Then, we will submit.
+
+What do you think of this plan?
 
