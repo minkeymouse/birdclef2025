@@ -1,14 +1,3 @@
-#### .pytest_cache/README.md
-# pytest cache directory #
-
-This directory contains data from the pytest's cache plugin,
-which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
-
-**Do not** commit this to version control.
-
-See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
-
-
 #### code_collector.py
 #!/usr/bin/env python3
 """
@@ -85,2214 +74,1847 @@ if __name__ == '__main__':
     main()
 
 
-#### configure.py
-# configure.py – central configuration for the **BirdCLEF 2025** pipeline
-# =============================================================================
-# One authoritative source of truth for every tunable used by the codebase.
-# Edit paths & hyper‑parameters here, re‑run the affected stage, and *never*
-# hunt for magic numbers scattered across modules again.
-# =============================================================================
+#### config/inference.yaml
+# Inference configuration for chunk-level prediction using trained models
+paths:
+  test_audio_dir: "/data/birdclef/test_soundscapes"  # directory of test soundscape audio files
+  models_dir: "/data/birdclef/models"               # directory containing trained model files
+  output_file: "/data/birdclef/submission.csv"      # file to save inference results (e.g. submission format)
+  taxonomy_csv: "/data/birdclef/taxonomy.csv"       # taxonomy file to map class indices to species codes
+inference:
+  chunk_duration: 10.0        # duration of chunks to use for inference (seconds, should match training chunk length)
+  chunk_hop: 5.0              # hop length for sliding window (seconds, should match training hop)
+  batch_size: 16
+  num_workers: 4
+  smoothing_neighbors: 2      # smooth predictions by averaging over ±2 neighboring chunks in time
+  presence_threshold: 0.5     # probability threshold for deciding species presence in a 5s interval
+ensemble:
+  checkpoints:
+    - "efficientnet_b0_final_1.pth"
+    - "efficientnet_b0_final_2.pth"
+    - "efficientnet_b0_final_3.pth"
+    - "regnety_008_final_1.pth"
+    - "regnety_008_final_2.pth"
+    - "regnety_008_final_3.pth"
+  strategy: "average"         # ensemble strategy: average probabilities from all models
 
-from __future__ import annotations
 
-from pathlib import Path
-from typing import List, Dict
+#### config/initial_train.yaml
+# Training configuration for initial model training on golden labeled dataset
+dataset:
+  train_metadata: "/data/birdclef/processed/train_metadata.csv"
+  include_pseudo: false        # do not include pseudo-labeled samples in this stage
+  include_synthetic: false     # do not include synthetic samples in initial training
+model:
+  architectures:
+    - name: "efficientnet_b0"
+      num_models: 3            # train 3 EfficientNet-B0 models (e.g. different seeds)
+      pretrained: true         # use ImageNet-pretrained weights
+    - name: "regnety_008"
+      num_models: 3            # train 3 RegNetY-0.8GF models
+      pretrained: true         # use ImageNet-pretrained weights
+training:
+  epochs: 10
+  batch_size: 32
+  num_workers: 4
+  seed: 42                     # base random seed for reproducibility
+optimizer:
+  type: "AdamW"
+  lr: 0.002                    # initial learning rate
+  weight_decay: 0.0001
+loss: "BCEWithLogitsLoss"      # binary cross-entropy for multi-label (supports soft targets)
+scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 10                    # T_max set to number of epochs
+  eta_min: 1e-6                # minimum learning rate for cosine schedule
 
-class CFG:  # pylint: disable=too-few-public-methods
-    """Global, immutable configuration namespace."""
-    # ────────────────────────────────────────────────────────────────────────
-    # Reproducibility & runtime
-    # ────────────────────────────────────────────────────────────────────────
-    SEED: int = 42              # master RNG seed
-    DEVICE: str = "cuda"         # "cuda" | "gpu" | "cpu"
-    # ────────────────────────────────────────────────────────────────────────
-    # Filesystem layout  – adjust to your environment / Kaggle dataset mount
-    # ────────────────────────────────────────────────────────────────────────
-    DATA_ROOT: Path = Path("/data/birdclef")
 
-    TRAIN_AUDIO_DIR: Path = DATA_ROOT / "train_audio"
-    TRAIN_SOUNDSCAPE_DIR: Path = DATA_ROOT / "train_soundscapes"
-    TRAIN_CSV: Path = DATA_ROOT / "train.csv"
-    TAXONOMY_CSV: Path = DATA_ROOT / "taxonomy.csv"
-    TEST_DIR: Path = DATA_ROOT / "test_soundscapes/"
-    SAMPLE_SUBMISSION: Path = DATA_ROOT / "sample_submission.csv"
+#### config/process.yaml
+# Configuration for data processing (audio cleaning, chunking, dedup, mel extraction)
+paths:
+  data_root: "/data/birdclef"               # root directory for BirdCLEF data
+  train_csv: "/data/birdclef/train.csv"     # metadata of training audio recordings
+  taxonomy_csv: "/data/birdclef/taxonomy.csv"  # (optional) taxonomy with all species codes
+  audio_dir: "/data/birdclef/train_audio"   # directory containing raw training audio (subfolders per species)
+  processed_dir: "/data/birdclef/processed" # directory to save processed chunks (mel and label files)
+  train_metadata: "/data/birdclef/processed/train_metadata.csv"  # output CSV with training chunk metadata
+  synthetic_dir: "/data/birdclef/synthetic"   # directory with synthetic audio files (if any, organized by species)
+audio:
+  sample_rate: 32000        # target sample rate for audio
+  trim_top_db: 20           # dB threshold for trimming silence from ends
+  min_duration: 5.0         # minimum duration (seconds) to keep a recording (shorter will be padded to this)
+  min_rating: 1             # minimum rating to consider for inclusion
+chunking:
+  train_chunk_duration: 10.0    # chunk length for training data (seconds)
+  train_chunk_hop: 5.0          # hop length for overlapping chunks (seconds)
+  eval_segment_duration: 5.0    # duration of evaluation segments (seconds, for inference segmentation)
+mel:
+  n_fft: 1024             # FFT window size
+  hop_length: 500         # hop length for STFT (in samples)
+  n_mels: 128             # number of mel filter banks
+  fmin: 40                # min frequency for mel
+  fmax: 15000             # max frequency for mel
+  power: 2.0              # power for magnitude (2.0 for power spectrogram)
+  target_shape: [256, 256]  # target (height, width) of spectrogram after resizing
+deduplication:
+  enabled: true           # whether to remove duplicate audio files
+  method: "hash"          # deduplication method (hash identical content)
+selection:
+  golden_rating: 5            # rating threshold for golden set (5-star recordings)
+  require_single_label: true  # if true, only include recordings with no secondary species in golden set
+  rare_species_threshold: 20  # total recordings below this count are considered rare
+  synthetic_target_count: 10  # if real recordings < 10 for a species, synthetic augmentation is used
+  pseudo_confidence_threshold: 0.5  # confidence threshold to accept pseudo-labeled chunks
+labeling:
+  use_soft_labels: true          # use soft label vectors for multi-label and pseudo-label data
+  primary_label_weight: 0.7      # weight for primary species in multi-label recordings
+  secondary_label_weight: 0.3    # total weight to distribute among all secondary species in a recording
+  pseudo_label_weight: 0.5       # base weight for pseudo-labeled samples (lower than true labels)
+  rare_label_weight: 1.0         # weight for rare-class samples (set to 1.0 so that golden/minority have full weight)
 
-    # Pre‑processing outputs
-    PROCESSED_DIR: Path = DATA_ROOT / "processed"  # mels with labels for training data
 
-    # Model checkpoints
-    MODELS_DIR: Path = DATA_ROOT / "models"
+#### config/train.yaml
+# Training configuration for full retraining with pseudo-labeled and synthetic data
+dataset:
+  train_metadata: "/data/birdclef/processed/train_metadata.csv"
+  include_pseudo: true         # include pseudo-labeled samples in training
+  include_synthetic: true      # include synthetic samples in training
+model:
+  architectures:
+    - name: "efficientnet_b0"
+      num_models: 3
+      pretrained: true
+      init_checkpoint: "/data/birdclef/models/efficientnet_b0_initial"  # base checkpoint name (will load each model)
+    - name: "regnety_008"
+      num_models: 3
+      pretrained: true
+      init_checkpoint: "/data/birdclef/models/regnety_008_initial"
+training:
+  epochs: 10
+  batch_size: 32
+  num_workers: 4
+  seed: 42                     # seed (can use same as initial since different data)
+optimizer:
+  type: "AdamW"
+  lr: 0.001                    # lower LR for fine-tuning on expanded data
+  weight_decay: 0.0001
+loss: "BCEWithLogitsLoss"
+scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 10
+  eta_min: 1e-6
 
-    # Inference artifact
-    SUBMISSION_OUT: Path = DATA_ROOT / "submission.csv"
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Audio / spectrogram params – **keep consistent across modules**
-    # ────────────────────────────────────────────────────────────────────────
-    SAMPLE_RATE: int = 32_000
-    N_FFT: int = 1024
-    HOP_LENGTH: int = 500
-    N_MELS: int = 128
-    FMIN: int = 40
-    FMAX: int = 15_000
-    POWER: float = 2.0
+#### scripts/run_infer.sh
 
-    TARGET_SHAPE: tuple[int, int] = (256, 256)  # resize for CNN
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Chunking strategy
-    # ────────────────────────────────────────────────────────────────────────
-    TRAIN_CHUNK_SEC: int = 10
-    TRAIN_CHUNK_HOP_SEC: int = 5
-    SC_SEG_SEC: int = 5  # evaluation granularity
-    FOLD0_RATIO: float = 0.80  # % of cleanest clips used for training
+#### scripts/run_preprocess.sh
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Pre‑processing heuristics
-    # ────────────────────────────────────────────────────────────────────────
-    TRIM_TOP_DB: int = 20
-    RMS_THRESHOLD: float = 0.01
-    MIN_RATING: int = 1
-    PSEUDO_THRESHOLD: float = 0.50
 
-    USE_SOFT_LABELS: bool = True
-    LABEL_WEIGHT_PRIMARY: float = 0.7
-    LABEL_WEIGHT_SECONDARY: float = 0.2
-    LABEL_WEIGHT_BENCH: float = 0.1
+#### scripts/run_train.sh
 
-    RARE_COUNT_THRESHOLD: int = 20
-    RARE_WEIGHT: float = 2.0
-    PSEUDO_WEIGHT: float = 0.5
 
-    MEL_CACHE_SIZE: int = 2048
+#### src/__init__.py
 
-    # ────────────────────────────────────────────────────────────────────────
-    # Data‑augmentation
-    # ────────────────────────────────────────────────────────────────────────
-    SPEC_AUG_FREQ_MASK_PARAM: int = 10
-    SPEC_AUG_TIME_MASK_PARAM: int = 50
-    SPEC_AUG_NUM_MASKS: int = 2
-    CUTMIX_PROB: float = 0.5
 
-    # ────────────────────────────────────────────────────────────────────────
-    # EfficientNet‑B0
-    # ────────────────────────────────────────────────────────────────────────
-    EFF_NUM_MODELS: int = 2
-    EFF_BATCH_SIZE: int = 32
-    EFF_EPOCHS: int = 10
-    EFF_LR: float = 2e-3
-    EFF_WEIGHT_DECAY: float = 1e-4
-    EFF_NUM_WORKERS: int = 4
-
-    # ────────────────────────────────────────────────────────────────────────
-    # RegNetY‑0.8GF
-    # ────────────────────────────────────────────────────────────────────────
-    REG_NUM_MODELS: int = 2
-    REG_BATCH_SIZE: int = 32
-    REG_EPOCHS: int = 10
-    REG_LR: float = 2e-3
-    REG_WEIGHT_DECAY: float = 1e-4
-    REG_NUM_WORKERS: int = 4
-
-    # ────────────────────────────────────────────────────────────────────────
-    # DiffWave minority‑class synthesis
-    # ────────────────────────────────────────────────────────────────────────
-    DIFF_RARE_THRESHOLD: int = 10  # if real recordings < 10 ⇒ target for synth
-
-    # ────────────────────────────────────────────────────────────────────────
-    # Inference / ensemble parameters
-    # ────────────────────────────────────────────────────────────────────────
-    INF_BATCH_SIZE: int = 16
-    INF_NUM_WORKERS: int = 4
-    INF_SMOOTH_NEIGHBORS: int = 2  # ±2 × 5 s segments
-
-    # ────────────────────────────────────────────────────────────────────────
-    # CPU optimisation (OpenVINO / ONNX)
-    # ────────────────────────────────────────────────────────────────────────
-    USE_OPENVINO: bool = True
-    OV_NUM_THREADS: int | None = None
-
-    # ────────────────────────────────────────────────────────────────────────
-    # Class mapping
-    # ────────────────────────────────────────────────────────────────────────
-    SPECIES: Dict[int, str] = {
-        0: '1139490',
-        1: '1192948',
-        2: '1194042',
-        3: '126247',
-        4: '1346504',
-        5: '134933',
-        6: '135045',
-        7: '1462711',
-        8: '1462737',
-        9: '1564122',
-        10: '21038',
-        11: '21116',
-        12: '21211',
-        13: '22333',
-        14: '22973',
-        15: '22976',
-        16: '24272',
-        17: '24292',
-        18: '24322',
-        19: '41663',
-        20: '41778',
-        21: '41970',
-        22: '42007',
-        23: '42087',
-        24: '42113',
-        25: '46010',
-        26: '47067',
-        27: '476537',
-        28: '476538',
-        29: '48124',
-        30: '50186',
-        31: '517119',
-        32: '523060',
-        33: '528041',
-        34: '52884',
-        35: '548639',
-        36: '555086',
-        37: '555142',
-        38: '566513',
-        39: '64862',
-        40: '65336',
-        41: '65344',
-        42: '65349',
-        43: '65373',
-        44: '65419',
-        45: '65448',
-        46: '65547',
-        47: '65962',
-        48: '66016',
-        49: '66531',
-        50: '66578',
-        51: '66893',
-        52: '67082',
-        53: '67252',
-        54: '714022',
-        55: '715170',
-        56: '787625',
-        57: '81930',
-        58: '868458',
-        59: '963335',
-        60: 'amakin1',
-        61: 'amekes',
-        62: 'ampkin1',
-        63: 'anhing',
-        64: 'babwar',
-        65: 'bafibi1',
-        66: 'banana',
-        67: 'baymac',
-        68: 'bbwduc',
-        69: 'bicwre1',
-        70: 'bkcdon',
-        71: 'bkmtou1',
-        72: 'blbgra1',
-        73: 'blbwre1',
-        74: 'blcant4',
-        75: 'blchaw1',
-        76: 'blcjay1',
-        77: 'blctit1',
-        78: 'blhpar1',
-        79: 'blkvul',
-        80: 'bobfly1',
-        81: 'bobher1',
-        82: 'brtpar1',
-        83: 'bubcur1',
-        84: 'bubwre1',
-        85: 'bucmot3',
-        86: 'bugtan',
-        87: 'butsal1',
-        88: 'cargra1',
-        89: 'cattyr',
-        90: 'chbant1',
-        91: 'chfmac1',
-        92: 'cinbec1',
-        93: 'cocher1',
-        94: 'cocwoo1',
-        95: 'colara1',
-        96: 'colcha1',
-        97: 'compau',
-        98: 'compot1',
-        99: 'cotfly1',
-        100: 'crbtan1',
-        101: 'crcwoo1',
-        102: 'crebob1',
-        103: 'cregua1',
-        104: 'creoro1',
-        105: 'eardov1',
-        106: 'fotfly',
-        107: 'gohman1',
-        108: 'grasal4',
-        109: 'grbhaw1',
-        110: 'greani1',
-        111: 'greegr',
-        112: 'greibi1',
-        113: 'grekis',
-        114: 'grepot1',
-        115: 'gretin1',
-        116: 'grnkin',
-        117: 'grysee1',
-        118: 'gybmar',
-        119: 'gycwor1',
-        120: 'labter1',
-        121: 'laufal1',
-        122: 'leagre',
-        123: 'linwoo1',
-        124: 'littin1',
-        125: 'mastit1',
-        126: 'neocor',
-        127: 'norscr1',
-        128: 'olipic1',
-        129: 'orcpar',
-        130: 'palhor2',
-        131: 'paltan1',
-        132: 'pavpig2',
-        133: 'piepuf1',
-        134: 'pirfly1',
-        135: 'piwtyr1',
-        136: 'plbwoo1',
-        137: 'plctan1',
-        138: 'plukit1',
-        139: 'purgal2',
-        140: 'ragmac1',
-        141: 'rebbla1',
-        142: 'recwoo1',
-        143: 'rinkin1',
-        144: 'roahaw',
-        145: 'rosspo1',
-        146: 'royfly1',
-        147: 'rtlhum',
-        148: 'rubsee1',
-        149: 'rufmot1',
-        150: 'rugdov',
-        151: 'rumfly1',
-        152: 'ruther1',
-        153: 'rutjac1',
-        154: 'rutpuf1',
-        155: 'saffin',
-        156: 'sahpar1',
-        157: 'savhaw1',
-        158: 'secfly1',
-        159: 'shghum1',
-        160: 'shtfly1',
-        161: 'smbani',
-        162: 'snoegr',
-        163: 'sobtyr1',
-        164: 'socfly1',
-        165: 'solsan',
-        166: 'soulap1',
-        167: 'spbwoo1',
-        168: 'speowl1',
-        169: 'spepar1',
-        170: 'srwswa1',
-        171: 'stbwoo2',
-        172: 'strcuc1',
-        173: 'strfly1',
-        174: 'strher',
-        175: 'strowl1',
-        176: 'tbsfin1',
-        177: 'thbeup1',
-        178: 'thlsch3',
-        179: 'trokin',
-        180: 'tropar',
-        181: 'trsowl',
-        182: 'turvul',
-        183: 'verfly',
-        184: 'watjac1',
-        185: 'wbwwre1',
-        186: 'whbant1',
-        187: 'whbman1',
-        188: 'whfant1',
-        189: 'whmtyr1',
-        190: 'whtdov',
-        191: 'whttro1',
-        192: 'whwswa1',
-        193: 'woosto',
-        194: 'y00678',
-        195: 'yebela1',
-        196: 'yebfly1',
-        197: 'yebsee1',
-        198: 'yecspi2',
-        199: 'yectyr1',
-        200: 'yehbla2',
-        201: 'yehcar1',
-        202: 'yelori1',
-        203: 'yeofly1',
-        204: 'yercac1',
-        205: 'ywcpar'}
-
-# EOF
-
-#### data_utils.py
-#!/usr/bin/env python
-"""data_utils.py – shared utility layer for the **BirdCLEF 2025** solution
-====================================================================
-This module centralises *all* common data-handling functionality so that the
-rest of the pipeline (``process.py``, ``efficientnet.py``, ``regnety.py``,
-``diffwave.py``) can remain lean.  Key capabilities:
-
-* Audio I/O with deterministic resampling (+ optional WebRTC VAD removal)
-* Mel-spectrogram extraction via librosa
-* SpecAugment + CutMix implementations fully driven by ``configure.CFG``
-* Soft-label aware `torch.utils.data.Dataset` (`MelDataset`)
-* One-chunk-per-file sampling (`FileWiseSampler`) to match training recipe
-* LRU-cached on-disk mel loader to save repeated numpy I/O
-* Noise metric helper used by ``process.py`` for fold-0 split
-
-The API surface is intentionally minimal – *import and call what you need*.
-"""
-from __future__ import annotations
-
-import json
+#### src/automl_pipeline.py
+# automl_pipeline.py
 import os
-import random
-from functools import lru_cache
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Union, Optional
-import webrtcvad
-
-import cv2
-import librosa
-import numpy as np
+import yaml
 import pandas as pd
-import torch
-from torch.utils.data import Dataset, Sampler
+import numpy as np
+import subprocess
+from infer_utils import load_model, predict_chunks, smooth_predictions, ensemble_predictions
+from metrics import create_pseudo_labels
 
-from configure import CFG
-
-__all__ = [
-    "seed_everything",
-    "compute_noise_metric",
-    "load_audio",
-    "trim_silence",
-    "load_vad",
-    "remove_speech",
-    "compute_mel",
-    "segment_audio",
-    "spec_augment",
-    "cutmix",
-    "MelDataset",
-]
-
-# ────────────────────────────────────────────────────────────────────────
-# Reproducibility helpers
-# ────────────────────────────────────────────────────────────────────────
-
-def seed_everything(seed: int = 42) -> None:
-    """Seed every RNG we know about for deterministic runs."""
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-# ────────────────────────────────────────────────────────────────────────
-# Augmentations – SpecAugment & CutMix
-# ────────────────────────────────────────────────────────────────────────
-
-def spec_augment(
-    mel: np.ndarray,
-    *,
-    freq_mask_param: Optional[int] = None,
-    time_mask_param: Optional[int] = None,
-    num_masks: Optional[int] = None,
-) -> np.ndarray:
-    """Apply SpecAugment (frequency & time masking) on a mel spectrogram."""
-    fmp = freq_mask_param if freq_mask_param is not None else CFG.SPEC_AUG_FREQ_MASK_PARAM
-    tmp = time_mask_param if time_mask_param is not None else CFG.SPEC_AUG_TIME_MASK_PARAM
-    nmk = num_masks if num_masks is not None else CFG.SPEC_AUG_NUM_MASKS
-
-    H, W = mel.shape
-    out = mel.copy()
-    for _ in range(nmk):
-        if fmp > 0:
-            fh = np.random.randint(0, fmp + 1)
-            f0 = np.random.randint(0, max(1, H - fh)) if fh else 0
-            out[f0 : f0 + fh, :] = 0.0
-        if tmp > 0:
-            th = np.random.randint(0, tmp + 1)
-            t0 = np.random.randint(0, max(1, W - th)) if th else 0
-            out[:, t0 : t0 + th] = 0.0
-    return out
-
-
-def cutmix(
-    m1: np.ndarray,
-    l1: torch.Tensor,
-    m2: np.ndarray,
-    l2: torch.Tensor,
-) -> Tuple[np.ndarray, torch.Tensor]:
-    """Horizontal CutMix for mels; label = length-weighted interpolation."""
-    W = m1.shape[1]
-    if W < 2:
-        return m1, l1
-    cut = np.random.randint(1, W)
-    mixed = np.concatenate([m1[:, :cut], m2[:, cut:]], axis=1)
-    alpha = cut / W
-    label = l1 * alpha + l2 * (1.0 - alpha)
-    return mixed, label
-
-# ────────────────────────────────────────────────────────────────────────
-# Audio helpers (load / trim / VAD)
-# ────────────────────────────────────────────────────────────────────────
-
-def load_audio(
-    fp: Union[Path, str],
-    sample_rate: Optional[int] = None,
-    *,
-    return_sr: bool = False,
-) -> Union[np.ndarray, Tuple[np.ndarray, int]]:
-    """Load **mono** audio as 32-bit float @ ``sample_rate`` (default CFG)."""
-    sr = sample_rate or CFG.SAMPLE_RATE
-    y, _ = librosa.load(str(fp), sr=sr, mono=True)
-    y = y.astype(np.float32)
-    return (y, sr) if return_sr else y
-
-
-def trim_silence(y: np.ndarray) -> np.ndarray:
-    """Energy-based leading / trailing trim."""
-    y_trim, _ = librosa.effects.trim(y, top_db=CFG.TRIM_TOP_DB)
-    return y_trim
-
-
-def compute_noise_metric(y: np.ndarray) -> float:
-    """Composite "noise" metric – smaller ⇒ cleaner recording."""
-    return float(y.std() + y.var() + np.sqrt((y ** 2).mean()) + (y ** 2).sum())
-
-
-def load_vad():
-    """Return a *WebRTC VAD* instance & helper TS-function or ``(None, None)``."""
-    vad = webrtcvad.Vad(3)
-    def _iter_frames(wav: np.ndarray, sr: int, frame_ms: int = 30):
-        flen = int(sr * frame_ms / 1000)
-        for i in range(0, len(wav) - flen, flen):
-            yield wav[i : i + flen]
-    def _get_ts(wav: np.ndarray, sr: int):
-        voiced: List[Tuple[int, int]] = []
-        flen = int(sr * 0.03)
-        in_voiced = False
-        start = 0
-        for idx, frame in enumerate(_iter_frames(wav, sr)):
-            speech = vad.is_speech((frame * 32768).astype("int16").tobytes(), sr)
-            if speech and not in_voiced:
-                start = idx * flen
-                in_voiced = True
-            elif not speech and in_voiced:
-                voiced.append((start, idx * flen))
-                in_voiced = False
-        if in_voiced:
-            voiced.append((start, len(wav)))
-        return voiced
-    return vad, _get_ts
-
-def remove_speech(y: np.ndarray, vad_model, get_ts):
-    """Zero-out VAD-detected speech regions (if VAD available)."""
-    if vad_model is None:
-        return y
-    mask = np.ones_like(y, dtype=bool)
-    for s, e in get_ts(y, CFG.SAMPLE_RATE):
-        mask[s:e] = False
-    return y[mask]
-
-# ────────────────────────────────────────────────────────────────────────
-# Mel-spectrogram extraction via Librosa only
-# ────────────────────────────────────────────────────────────────────────
-
-def compute_mel(y: np.ndarray, *, to_db: bool = True) -> np.ndarray:
-    """Return *N_MELS × T* mel spectrogram in linear or dB scale using Librosa."""
-    mel = librosa.feature.melspectrogram(
-        y=y,
-        sr=CFG.SAMPLE_RATE,
-        n_fft=CFG.N_FFT,
-        hop_length=CFG.HOP_LENGTH,
-        n_mels=CFG.N_MELS,
-        fmin=CFG.FMIN,
-        fmax=CFG.FMAX,
-        power=CFG.POWER,
-    )
-    if to_db:
-        mel = librosa.power_to_db(mel, ref=np.max)
-    return mel.astype(np.float32)
-
-# ────────────────────────────────────────────────────────────────────────
-# Segmentation helper – yields fixed-length chunks (wrap-pad)
-# ────────────────────────────────────────────────────────────────────────
-
-def segment_audio(
-    y: np.ndarray,
-    *,
-    chunk_sec: Optional[float] = None,
-    hop_sec: Optional[float] = None,
-    sr: Optional[int] = None,
-) -> Iterable[Tuple[float, np.ndarray]]:
-    chunk_sec = chunk_sec if chunk_sec is not None else CFG.TRAIN_CHUNK_SEC
-    hop_sec = hop_sec if hop_sec is not None else CFG.TRAIN_CHUNK_HOP_SEC
-    sr = sr if sr is not None else CFG.SAMPLE_RATE
-    chunk_len = int(chunk_sec * sr)
-    hop_len = int(hop_sec * sr)
-    n = len(y)
-    for start in range(0, n, hop_len):
-        chunk = y[start : start + chunk_len]
-        if len(chunk) < chunk_len:
-            chunk = np.pad(chunk, (0, chunk_len - len(chunk)), mode="wrap")
-        yield start / sr, chunk
-
-# ────────────────────────────────────────────────────────────────────────
-# Dataset + Sampler for training
-# ────────────────────────────────────────────────────────────────────────
-
-class #SOME SAMPLER HERE#(Sampler[int]):
-
-
-class MelDataset(Dataset):
-    def __init__(
-        self,
-        cls_ind: Dict = CFG.SPECIES,
-        *,
-        augment: bool = False,
-        labeled: bool = False,
-        pseudo_label: bool = False,
-    ):
-        self.cls_ind = cls_ind
-        self.augment = augment
-        self.labeled = labeled
-        self.pseudo_label = pseudo_label
-
-    def _load_norm(self, rel: str) -> np.ndarray:
-        full = CFG.PROCESSED_DIR / rel
-        mel = np.load(full).astype(np.float32)
-        mel = (mel - mel.min()) / (mel.max() - mel.min() + 1e-6)
-        return cv2.resize(mel, CFG.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
-
-    def _json_to_vec(self, js: str) -> torch.Tensor:
-        vec = np.zeros(len(self.s2i), dtype=np.float32)
-        for sp, w in json.loads(js).items():
-            idx = self.s2i.get(sp)
-            if idx is not None:
-                vec[idx] = w
-        return torch.from_numpy(vec)
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        mel = self._load_norm(row["mel_path"])
-        if self.augment:
-            mel = spec_augment(mel)
-        if self.labeled and not self.pseudo_label:
-            if row.get("label_path", "").endswith(".npy"):
-                vec = np.load(CFG.PROCESSED_DIR / row["label_path"], allow_pickle=False)
-                label_vec = torch.from_numpy(vec.astype(np.float32))
+if __name__ == "__main__":
+    # Load configs
+    with open("config/train.yaml", 'r') as f:
+        train_config = yaml.safe_load(f)
+    with open("config/inference.yaml", 'r') as f:
+        infer_config = yaml.safe_load(f)
+    data_root = os.path.dirname(train_config['dataset']['train_metadata'])
+    # 1. Pre-processing: ensure processed data exists
+    train_meta_path = train_config['dataset']['train_metadata']
+    if not os.path.exists(train_meta_path):
+        raise RuntimeError("Processed training metadata not found. Please run data preprocessing before pipeline.")
+    # (Optional: call a preprocessing script here if needed, e.g., process.py to generate train_metadata.csv)
+    # 2. Initial training (with no pseudo, maybe no synthetic)
+    # Override config flags for initial run
+    train_config['dataset']['include_pseudo'] = False
+    train_config['dataset']['include_synthetic'] = False
+    # Also possibly use a different learning rate or epochs for initial stage if desired
+    initial_train_config_path = "config/_initial_train_tmp.yaml"
+    with open(initial_train_config_path, 'w') as f:
+        yaml.safe_dump(train_config, f)
+    print("Starting initial training...")
+    subprocess.run(["python", "train_efficientnet.py"], check=True)
+    subprocess.run(["python", "train_regnety.py"], check=True)
+    print("Initial training completed.")
+    # After initial training, copy the best model weights as "initial" checkpoints for next loop (for fine-tuning).
+    models_dir = infer_config['paths']['models_dir']
+    eff_dir = os.path.join(models_dir, "efficientnet_b0")
+    reg_dir = os.path.join(models_dir, "regnety_008")
+    # Identify best checkpoints for each run (assuming train scripts print them or we pick last epoch of each run).
+    # Here, for simplicity, assume the highest epoch files for run1, run2, run3 in each arch are best.
+    initial_eff_ckpts = []
+    initial_reg_ckpts = []
+    for run in range(1, train_config['model']['architectures'][0]['num_models']+1):
+        # EfficientNet
+        ckpt_files = [f for f in os.listdir(eff_dir) if f.startswith("efficientnet_b0_run%d" % run)]
+        if not ckpt_files:
+            continue
+        best_ckpt = sorted(ckpt_files, key=lambda x: int(x.split('_epoch')[-1].split('.pth')[0]))[-1]  # highest epoch
+        src = os.path.join(eff_dir, best_ckpt)
+        dst = os.path.join(eff_dir, f"efficientnet_b0_initial_{run}.pth")
+        os.replace(src, dst)
+        initial_eff_ckpts.append(dst)
+        # RegNet
+        ckpt_files = [f for f in os.listdir(reg_dir) if f.startswith("regnety_008_run%d" % run)]
+        if not ckpt_files:
+            continue
+        best_ckpt = sorted(ckpt_files, key=lambda x: int(x.split('_epoch')[-1].split('.pth')[0]))[-1]
+        src = os.path.join(reg_dir, best_ckpt)
+        dst = os.path.join(reg_dir, f"regnety_008_initial_{run}.pth")
+        os.replace(src, dst)
+        initial_reg_ckpts.append(dst)
+    # Update config to use these as init_checkpoint for fine-tuning
+    for arch in train_config['model']['architectures']:
+        if arch['name'].startswith("efficientnet"):
+            arch['init_checkpoint'] = os.path.join(models_dir, "efficientnet_b0", "efficientnet_b0_initial")
+        elif arch['name'].startswith("regnety"):
+            arch['init_checkpoint'] = os.path.join(models_dir, "regnety_008", "regnety_008_initial")
+    train_config['dataset']['include_pseudo'] = True
+    train_config['dataset']['include_synthetic'] = True  # now include synthetic as well
+    # Save updated config for retraining
+    retrain_config_path = "config/_retrain_tmp.yaml"
+    with open(retrain_config_path, 'w') as f:
+        yaml.safe_dump(train_config, f)
+    # 3. Iterative training loops with pseudo-label refinement
+    max_loops = train_config.get('automl_loops', 5)
+    for loop in range(1, max_loops):
+        print(f"Starting training loop {loop} with pseudo-labels...")
+        # Train models (fine-tune from initial weights including pseudo and synthetic)
+        subprocess.run(["python", "train_efficientnet.py"], check=True)
+        subprocess.run(["python", "train_regnety.py"], check=True)
+        print(f"Loop {loop} training completed. Generating pseudo-labels for next loop...")
+        # 4. Inference on training soundscapes to update pseudo-labels
+        # Load the newly trained ensemble (all 6 models) for inference on unlabeled data
+        ensemble_ckpts = infer_config['ensemble']['checkpoints']  # expecting final names (which we might not have yet)
+        # If not explicitly set, we can derive from last training run outputs.
+        # For simplicity, use initial checkpoint names (which now hold updated weights after fine-tuning)
+        ensemble_ckpts = []
+        for run in range(1, train_config['model']['architectures'][0]['num_models']+1):
+            ensemble_ckpts.append(f"efficientnet_b0_initial_{run}.pth")
+        for run in range(1, train_config['model']['architectures'][1]['num_models']+1):
+            ensemble_ckpts.append(f"regnety_008_initial_{run}.pth")
+        # Load models
+        models = []
+        for ckpt_name in ensemble_ckpts:
+            if ckpt_name.startswith("efficientnet"):
+                arch = "efficientnet_b0"
             else:
-                label_vec = self._json_to_vec(row["label_json"])
-        elif self.labeled and self.pseudo_label:
-            raise NotImplementedError("Cannot pseudo label already labeled data")
-        elif not self.labeled and self.pseudo_label:
-
-
-        mel_tensor = torch.tensor(mel).unsqueeze(0)
-        if self.augment and random.random() < CFG.CUTMIX_PROB and len(self.df) > 1:
-            j = random.randrange(len(self.df))
-            if j == idx:
-                j = (j + 1) % len(self.df)
-            row2 = self.df.iloc[j]
-            mel2 = spec_augment(self._load_norm(row2["mel_path"])) if self.augment else self._load_norm(row2["mel_path"])
-            mel_mix, label_vec = cutmix(mel_tensor.squeeze(0).numpy(), label_vec, mel2, label_vec2)
-            mel_tensor = torch.tensor(mel_mix).unsqueeze(0)
-        weight = float(row.get("weight", 1.0))
-        return mel_tensor, label_vec, weight
-
-
-#### diffwave.py
-#!/usr/bin/env python3
-"""
-diffwave.py – generate synthetic audio for BirdCLEF 2025
-======================================================
-
-Uses a pretrained SpeechBrain DiffWave vocoder to convert precomputed
-mel-spectrogram chunks into synthetic .ogg clips for rare species.
-Also supports cleanup of synthetic files and patching train.csv.
-
-Usage:
-  python diffwave.py generate [--species S1,S2]
-  python diffwave.py remove
-"""
-from __future__ import annotations
-import argparse
-from pathlib import Path
-from typing import Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
-import torch
-import soundfile as sf
-from speechbrain.inference.vocoders import DiffWaveVocoder
-from configure import CFG
-
-# ────────────────────────────────────────────────────────────
-# Config & Hyperparameters
-# ────────────────────────────────────────────────────────────
-SAMPLE_RATE = CFG.SAMPLE_RATE  # 32000
-# Thresholds for deciding generation plan
-THRESH_LOW, THRESH_HIGH = 20, 50
-TARGET_LOW, TARGET_MID = 20, 5
-
-# ────────────────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────────────────
-
-def compute_plan(csv_path: Path) -> Dict[str, int]:
-    """Decide how many synthetic clips per species based on counts."""
-    df = pd.read_csv(csv_path)
-    counts = df["primary_label"].value_counts()
-    plan: Dict[str, int] = {}
-    for sp, cnt in counts.items():
-        # cast to string key for paths
-        sp_key = str(sp)
-        if cnt < THRESH_LOW:
-            plan[sp_key] = max(0, TARGET_LOW - int(cnt))
-        elif cnt < THRESH_HIGH:
-            plan[sp_key] = TARGET_MID
+                arch = "regnety_008"
+            ckpt_path = os.path.join(models_dir, arch, ckpt_name)
+            model, species_map = load_model(arch, len(species_map) if species_map else len(class_map), ckpt_path, torch.device("cpu"))
+            models.append(model)
+        # Run inference on unlabeled soundscapes (assuming they are in data_root/train_soundscapes)
+        unlabeled_dir = os.path.join(data_root, "train_soundscapes")
+        if not os.path.isdir(unlabeled_dir):
+            print("No unlabeled soundscapes directory found; skipping pseudo-label generation.")
+            break
+        pseudo_entries = []
+        for fname in os.listdir(unlabeled_dir):
+            if not fname.lower().endswith(('.wav', '.ogg', '.mp3')):
+                continue
+            file_path = os.path.join(unlabeled_dir, fname)
+            y, sr = librosa.load(file_path, sr=None)
+            # Obtain ensemble predictions for this file's 5s chunks
+            all_preds = []
+            for model in models:
+                preds = predict_chunks(model, y, sr, chunk_duration=5.0)
+                all_preds.append(preds)
+            # Smooth and ensemble
+            for m in range(len(all_preds)):
+                all_preds[m] = smooth_predictions(all_preds[m], smoothing_window=5)
+            combined = ensemble_predictions(all_preds, strategy='min_then_avg')
+            # Generate pseudo-label dictionary for each chunk above threshold
+            species_list = sorted(species_map.keys()) if species_map else sorted(class_map.keys())
+            pseudo_labels = create_pseudo_labels(combined, species_list, threshold=presence_threshold)
+            # Build DataFrame rows for these pseudo-labels
+            file_id = os.path.splitext(fname)[0]
+            for i, label_dict in enumerate(pseudo_labels):
+                if not label_dict:
+                    # If no species above threshold in this chunk, we can optionally include it as all-negative example
+                    # but we might skip adding it to avoid overwhelming with negatives.
+                    continue
+                row = {
+                    "filename": file_id,
+                    "label_json": json.dumps(label_dict),
+                    "weight": 0.5  # pseudo-label weight
+                }
+                pseudo_entries.append(row)
+        # Save pseudo labels to CSV
+        if pseudo_entries:
+            pseudo_df = pd.DataFrame(pseudo_entries)
+            pseudo_csv_path = os.path.join(data_root, "processed", "soundscape_metadata.csv")
+            pseudo_df.to_csv(pseudo_csv_path, index=False)
+            print(f"Pseudo-labels updated: {len(pseudo_entries)} chunks labeled and saved to {pseudo_csv_path}")
         else:
-            plan[sp_key] = 0
-    return plan
+            print("No pseudo-labels generated in this iteration.")
+    # 5. Final inference on test soundscapes
+    print("Final training complete. Running inference on test set...")
+    subprocess.run(["python", "inference.py"], check=True)
+    print("AutoML pipeline finished. Submission file is ready.")
 
 
-def patch_train_csv(rows: List[Tuple[str, str]]) -> None:
-    """Append new synthetic entries to train.csv, avoiding duplicates."""
-    df = pd.read_csv(CFG.TRAIN_CSV)
-    exist = set(zip(df["primary_label"], df["filename"]))
-    new = [r for r in rows if r not in exist]
-    if not new:
-        return
-    extra = pd.DataFrame(new, columns=["primary_label", "filename"])
-    for col in df.columns:
-        if col not in extra.columns:
-            extra[col] = pd.NA
-    out = pd.concat([df, extra[df.columns]], ignore_index=True)
-    out.to_csv(CFG.TRAIN_CSV, index=False)
-    print(f"Appended {len(new)} synthetic entries to {CFG.TRAIN_CSV}")
+#### src/infer_utils.py
+# infer_utils.py
+import numpy as np
+import torch
+from torch import nn
+import librosa
 
-
-def generate(args: argparse.Namespace) -> None:
-    """Generate synthetic .ogg files from mel-spectrogram arrays."""
-    device = "cuda" if CFG.use_cuda() else "cpu"
-    vb = DiffWaveVocoder.from_hparams(
-        source="speechbrain/tts-diffwave-ljspeech",
-        savedir=CFG.DIFFWAVE_MODEL_DIR / "vocoder",
-        run_opts={"device": device},
-    )
-    plan = compute_plan(CFG.TRAIN_CSV)
-    rows: List[Tuple[str, str]] = []
-    base = CFG.PROCESSED_DIR / "mels" / "train"
-
-    for sp, n in plan.items():
-        if n <= 0 or (args.species and sp not in args.species):
-            continue
-        # ensure species as string for path operations
-        sp_str = str(sp)
-        sp_dir = base / sp_str
-        if not sp_dir.exists():
-            continue
-        mel_files = sorted(sp_dir.glob("*.npy"))
-        count = 0
-        for mel_fp in mel_files:
-            if count >= n:
-                break
-            mel_np = np.load(mel_fp)
-            mel_tensor = torch.from_numpy(mel_np).unsqueeze(0).to(device)
-            wav = vb.decode_spectrogram(
-                mel_tensor,
-                hop_length=CFG.HOP_LENGTH,
-                fast_sampling=True,
-                fast_sampling_noise_schedule=[0.0001, 0.001, 0.01, 0.05, 0.2, 0.5],
-            )  # [1, time_steps]
-            out_fn = f"synthetic_{count:03d}.ogg"
-            out_fp = CFG.TRAIN_AUDIO_DIR / sp / out_fn
-            out_fp.parent.mkdir(parents=True, exist_ok=True)
-            # create an empty placeholder file instead of encoding
-            out_fp.write_bytes(b"")
-            rows.append((sp, out_fn))
-            count += 1
-
-    if rows:
-        patch_train_csv(rows)
+def load_model(arch_name: str, num_classes: int, checkpoint_path: str, device: torch.device):
+    """Load a model architecture (EfficientNet or RegNetY) and weights from checkpoint."""
+    # Create model architecture (with 1 input channel since we used mel as 1-channel expanded to 3 in data)
+    if arch_name.startswith('efficientnet'):
+        # EfficientNet-B0
+        from torchvision import models
+        model = models.efficientnet_b0(weights=None)  # no default weights, we'll load our own
+        # Adjust input conv if needed (if model was trained with 3-channel input, we assume weights reflect that)
+        # Our training duplicated mel to 3 channels, so model expects 3 channels.
+        num_features = model.classifier[1].in_features  # EfficientNet-B0 classifier: [Dropout, Linear]
+        model.classifier = nn.Linear(num_features, num_classes)
+    elif arch_name.startswith('regnet'):
+        from torchvision import models
+        # RegNetY-800MF
+        model = models.regnet_y_800mf(weights=None)
+        num_features = model.fc.in_features
+        model.fc = nn.Linear(num_features, num_classes)
     else:
-        print("No synthetic clips generated.")
-
-
-def remove(args: argparse.Namespace) -> None:
-    """Delete all synthetic .ogg files."""
-    for sp_dir in CFG.TRAIN_AUDIO_DIR.iterdir():
-        if sp_dir.is_dir():
-            for f in sp_dir.glob("synthetic_*.ogg"):
-                f.unlink(missing_ok=True)
-    print("Removed all synthetic audio files.")
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="diffwave.py")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    gen = sub.add_parser("generate", help="Generate synthetic audio from mel files")
-    gen.add_argument(
-        "--species", type=lambda s: s.split(","),
-        help="Comma-separated list of species to target",
-    )
-
-    sub.add_parser("remove", help="Remove synthetic audio files")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    if args.cmd == "generate":
-        generate(args)
-    elif args.cmd == "remove":
-        remove(args)
-
-if __name__ == "__main__":
-    main()
-
-
-#### efficientnet.py
-#!/usr/bin/env python3
-"""
-efficientnet.py – EfficientNet‑B0 ensemble trainer for **BirdCLEF 2025**
-=====================================================================
-Trains *CFG.EFF_NUM_MODELS* EfficientNet‑B0 classifiers on the mel‑spectrogram
-chunks produced by ``process.py``.  The script follows the 2024 winning recipe
-and the workflow requested by the user:
-
-* Cross‑entropy with **soft‑label** support
-* One‑chunk‑per‑file sampling via ``FileWiseSampler``
-* SpecAugment + CutMix enabled through *data_utils*
-* Cosine‑annealing LR schedule & mixed‑precision (AMP)
-* Optional device override via ``--device`` (auto / cpu / gpu)
-* Reproducible ensemble – each run uses a different seed offset
-* Checkpoints saved under ``CFG.EFF_MODEL_DIR`` as
-  ``efficientnet_b0_run{RUN}.pth`` (state + species mapping)
-
-Usage
------
-```bash
-# train two models on GPU (default)
-python efficientnet.py              #   → models/efficientnet/*.pth
-
-# force CPU training & 5 epochs only (quick test)
-python efficientnet.py --device cpu --epochs 5
-```
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import logging
-from pathlib import Path
-from typing import Dict, List
-
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn.functional as F
-import timm
-from torch import optim
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
-
-from configure import CFG
-from data_utils import FileWiseSampler, MelDataset, seed_everything
-
-# ───────────────────────── logging ──────────────────────────
-
-def _logger() -> logging.Logger:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler()],
-    )
-    return logging.getLogger("efficientnet")
-
-
-# ──────────────────── soft‑label CE helper ───────────────────
-
-def _soft_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Cross‑entropy that supports *either* hard indices *or* soft vectors."""
-    if targets.dtype == torch.long:
-        return F.cross_entropy(logits, targets, reduction="none")
-    logp = torch.log_softmax(logits, dim=1)
-    return -(targets * logp).sum(dim=1)
-
-
-# ───────────────────────── trainer ───────────────────────────
-
-class _Trainer:
-    """Encapsulates one EfficientNet run (different seed / init)."""
-
-    def __init__(self, run_id: int, classes: List[str], log: logging.Logger):
-        self.run_id, self.log = run_id, log
-        self.device = torch.device("cuda" if CFG.use_cuda() else "cpu")
-        self.classes = classes
-
-        # model – EfficientNet‑B0  (1‑channel input)
-        self.model = timm.create_model(
-            "efficientnet_b0",
-            pretrained=True,
-            in_chans=1,
-            num_classes=len(classes),
-        ).to(self.device)
-
-        self.opt = optim.AdamW(
-            self.model.parameters(),
-            lr=CFG.EFF_LR,
-            weight_decay=CFG.EFF_WEIGHT_DECAY,
-        )
-        self.sched = optim.lr_scheduler.CosineAnnealingLR(
-            self.opt, T_max=CFG.EFF_EPOCHS
-        )
-        self.scaler = GradScaler(enabled=CFG.use_cuda())
-
-    # ‑‑ one optimisation step ‑─────────────────────────────
-    def _step(self, batch):
-        x, y, w = (t.to(self.device, non_blocking=True) for t in batch)
-        self.opt.zero_grad(set_to_none=True)
-        with autocast(enabled=CFG.use_cuda()):
-            logits = self.model(x)
-            loss = (_soft_ce(logits, y) * w).mean()
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.opt)
-        self.scaler.update()
-        return float(loss.detach())
-
-    # ‑‑ epoch loop ‑─────────────────────────────────────────
-    def fit(self, loader: DataLoader) -> None:
-        for ep in range(1, self._epochs + 1):
-            self.model.train(); run_loss = 0.0
-            for batch in loader:
-                run_loss += self._step(batch) * batch[0].size(0)
-            self.sched.step()
-            self.log.info(
-                "run=%d  epoch=%d/%d  loss=%.5f  lr=%.2e",
-                self.run_id,
-                ep,
-                self._epochs,
-                run_loss / len(loader.dataset),
-                self.sched.get_last_lr()[0],
-            )
-
-    # property wrapper to cope with CLI‑overridden epochs
-    @property
-    def _epochs(self) -> int:
-        return getattr(CFG, "EFF_EPOCHS", 10)
-
-    # ‑‑ save checkpoint ‑────────────────────────────────────
-    def save(self, out_dir: Path) -> None:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        ckpt = {
-            "arch": "efficientnet_b0",
-            "model": self.model.state_dict(),
-            "species2idx": {s: i for i, s in enumerate(self.classes)},
-        }
-        fp = out_dir / f"efficientnet_b0_run{self.run_id}.pth"
-        torch.save(ckpt, fp)
-        self.log.info("✔ saved checkpoint → %s", fp.name)
-
-
-# ─────────────────── metadata & DataLoader ───────────────────
-
-def _load_meta() -> pd.DataFrame:
-    df = pd.read_csv(CFG.PROCESSED_DIR / "train_metadata.csv")
-    sc = CFG.PROCESSED_DIR / "soundscape_metadata.csv"
-    if sc.exists():
-        df = pd.concat([df, pd.read_csv(sc)], ignore_index=True)
-    return df
-
-
-# ─────────────────────────── main ────────────────────────────
-
-def main() -> None:  # noqa: D401
-    cli = argparse.ArgumentParser(description="Train EfficientNet‑B0 ensemble")
-    cli.add_argument("--device", choices=["auto", "cpu", "gpu", "cuda"], default="auto")
-    cli.add_argument("--epochs", type=int, default=None, help="override CFG.EFF_EPOCHS")
-    args = cli.parse_args()
-
-    # runtime config overrides – device & epochs
-    if args.device != "auto":
-        CFG.DEVICE = args.device  # type: ignore[attr-defined]
-    if args.epochs is not None:
-        CFG.EFF_EPOCHS = args.epochs  # type: ignore[attr-defined]
-
-    seed_everything(CFG.SEED)
-    log = _logger()
-    log.info("Device: %s", CFG.DEVICE)
-
-    df = _load_meta()
-    if df.empty:
-        log.error("No metadata found – run process.py first."); return
-
-    # Determine full class list from metadata (robust to pruning)
-    cls_set = {k for js in df["label_json"] for k in json.loads(js)}
-    classes = sorted(cls_set)
-    s2i = {s: i for i, s in enumerate(classes)}
-    log.info("Classes: %d", len(classes))
-
-    # DataLoader – one random 10‑s chunk per source file each epoch
-    dataset = MelDataset(df, s2i, augment=True)
-    df["_src"] = df["mel_path"].str.extract(r"([^/]+)_\d+s.npy$", expand=False)
-    loader = DataLoader(
-        dataset,
-        batch_size=CFG.EFF_BATCH_SIZE,
-        sampler=FileWiseSampler(df, "_src"),
-        num_workers=CFG.EFF_NUM_WORKERS,
-        pin_memory=CFG.use_cuda(),
-        drop_last=True,
-    )
-
-    # Ensemble training loop -------------------------------------------------
-    for run in range(1, CFG.EFF_NUM_MODELS + 1):
-        seed_everything(CFG.SEED + run)  # new seed each run
-        trainer = _Trainer(run, classes, log)
-        trainer.fit(loader)
-        trainer.save(CFG.EFF_MODEL_DIR)
-        del trainer; torch.cuda.empty_cache()
-
-    log.info("🏁 Finished – checkpoints in %s", CFG.EFF_MODEL_DIR)
-
-
-if __name__ == "__main__":
-    main()
-
-
-#### pretrained_models/diffwave-ljspeech/hyperparams.yaml
-# ################################################
-# Basic parameters for a diffwave vocoder
-#
-# Author:
-#  * Yingzhi Wang 2022
-# ################################################
-
-train_timesteps: 50
-beta_start: 0.0001
-beta_end: 0.05
-
-residual_layers: 30
-residual_channels: 64
-dilation_cycle_length: 10
-
-unconditional: False
-
-spec_n_mels: 80
-spec_hop_length: 256
-
-diffwave: !new:speechbrain.lobes.models.DiffWave.DiffWave
-    input_channels: !ref <spec_n_mels>
-    residual_layers: !ref <residual_layers>
-    residual_channels: !ref <residual_channels>
-    dilation_cycle_length: !ref <dilation_cycle_length>
-    total_steps: !ref <train_timesteps>
-    unconditional: !ref <unconditional>
-
-noise: !new:speechbrain.nnet.diffusion.GaussianNoise
-
-diffusion: !new:speechbrain.lobes.models.DiffWave.DiffWaveDiffusion
-    model: !ref <diffwave>
-    beta_start: !ref <beta_start>
-    beta_end: !ref <beta_end>
-    timesteps: !ref <train_timesteps>
-    noise: !ref <noise>
-
-modules:
-    diffwave: !ref <diffwave>
-    diffusion: !ref <diffusion>
-
-pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
-    loadables:
-        diffwave: !ref <diffwave>
-
-
-#### process.py
-#!/usr/bin/env python
-"""
-process.py – BirdCLEF 2025 preprocessing pipeline (updated)
-============================================================
-Cleans raw *train_audio* / *train_soundscape* audio, applies Voice‑Activity
-Detection (VAD), deduplicates, builds **10‑second mel‑spectrogram chunks** with
-*soft labels* and sample weighting, then saves:
-
-* `mels/<split>/.../*.npy` – normalized mel spectrogram arrays
-* `labels/<split>/.../*.label.npy` – soft‑label vectors
-* `<split>_metadata.csv` – one row per chunk
-
-Idempotent: safe to rerun after adding/updating raw data or CFG.
-Includes file logging to `process.log` in the processed directory.
-"""
-from __future__ import annotations
-
-import argparse
-import hashlib
-import json
-import logging
-from collections import Counter, defaultdict
-from pathlib import Path
-from typing import Dict, List, Optional, Sequence
-
-import numpy as np
-import pandas as pd
-import torch
-import timm
-
-from configure import CFG
-from data_utils import (
-    compute_mel,
-    compute_noise_metric,
-    load_audio,
-    load_vad,
-    remove_speech,
-    seed_everything,
-    segment_audio,
-    trim_silence,
-)
-
-
-#──────────────────────────────────────────────────────────────────────────────
-# Global constants
-#──────────────────────────────────────────────────────────────────────────────
-LABEL_W_PRIMARY      = getattr(CFG, "LABEL_WEIGHT_PRIMARY", 0.7)
-LABEL_W_SECONDARY      = getattr(CFG, "LABEL_WEIGHT_SECONDARY", 0.2)
-LABEL_W_BENCH        = getattr(CFG, "LABEL_WEIGHT_BENCH",    0.1)
-RARE_COUNT_THRESHOLD = getattr(CFG, "RARE_COUNT_THRESHOLD", 20)
-PSEUDO_WEIGHT        = getattr(CFG, "PSEUDO_WEIGHT",        0.5)
-
-
-#──────────────────────────────────────────────────────────────────────────────
-# Class discovery & benchmark loader (fix state extraction)
-#──────────────────────────────────────────────────────────────────────────────
-
-def _discover_classes() -> List[str]:
-    if CFG.CLASSES:
-        return list(CFG.CLASSES)
-    if CFG.TAXONOMY_CSV.exists():
-        df = pd.read_csv(CFG.TAXONOMY_CSV)
-        if "primary_label" in df:
-            return sorted(df["primary_label"].unique())
-    if CFG.TRAIN_CSV.exists():
-        df = pd.read_csv(CFG.TRAIN_CSV)
-        if "primary_label" in df:
-            return sorted(df["primary_label"].unique())
-    raise RuntimeError("Cannot infer species list; set CFG.CLASSES explicitly")
-
-
-ALL_CLASSES = _discover_classes()
-CLASS2IDX   = {s: i for i, s in enumerate(ALL_CLASSES)}
-
-
-class BenchmarkModel(torch.nn.Module):
-    """Load single trained model for soft-labeling.
-    Use the model from the benchmark directory
-    directory is: /data/birdclef/models/benchmark/model_fold0.pth
-
-    I used the following code to train the model. Write down the code for loading the model.
-    #!/usr/bin/env python
-BirdCLEF 2025 Training Pipeline
-
-This script implements the training pipeline for BirdCLEF 2025.
-It includes data cleaning (with voice removal), data augmentation,
-mel spectrogram extraction, and training of a CNN model (an EfficientNet-B0 sample).
-
-Usage:
-  python train_birdclef2025.py train   # to train the model
-
-IMPORTANT:
-To ensure training continues after disconnecting from the server, run this script 
-within a persistent session such as tmux, screen, or using nohup. For example:
-
-    tmux new -s birdclef_training
-    python train_birdclef2025.py train
-
-or
-
-    nohup python train_birdclef2025.py train &
-
+        raise ValueError(f"Unsupported architecture: {arch_name}")
+    model = model.to(device)
+    # Load weights
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    # Also return the species index mapping if needed
+    species_map = checkpoint.get('species2idx', None)
+    return model, species_map
+
+def predict_chunks(model: nn.Module, audio, sr, chunk_duration=5.0):
+    """Split audio into consecutive chunks of length chunk_duration (seconds), and return model predictions for each chunk."""
+    model.eval()
+    chunk_size = int(chunk_duration * sr)
+    # Pad audio to have full chunks
+    pad_len = (-len(audio)) % chunk_size
+    if pad_len > 0:
+        audio = np.concatenate([audio, np.zeros(pad_len, dtype=audio.dtype)])
+    num_chunks = len(audio) // chunk_size
+    preds = []
+    with torch.no_grad():
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = start + chunk_size
+            y_chunk = audio[start:end]
+            # Compute mel spectrogram for this chunk (same parameters as training)
+            mel = librosa.feature.melspectrogram(y_chunk, sr=sr, n_fft=1024, hop_length=500, n_mels=128, fmin=40, fmax=15000)
+            mel = librosa.power_to_db(mel, ref=np.max)
+            # Resize mel to 128x256 if needed (assuming we want the same shape used in training)
+            mel_resized = cv2.resize(mel, (256, 128))
+            # Convert to 3-channel tensor
+            mel_tensor = torch.from_numpy(mel_resized).float().unsqueeze(0)  # shape [1, 128, 256]
+            mel_tensor = mel_tensor.unsqueeze(0)  # add channel dim -> [1, 1, 128, 256]
+            mel_tensor = mel_tensor.repeat(1, 3, 1, 1)  # [1, 3, 128, 256]
+            mel_tensor = mel_tensor.to(next(model.parameters()).device)
+            # Forward pass
+            logits = model(mel_tensor)
+            prob = torch.sigmoid(logits).cpu().numpy()[0]  # probabilities for each class
+            preds.append(prob)
+    preds = np.array(preds)  # shape: (num_chunks, num_classes)
+    return preds
+
+def smooth_predictions(chunk_probs: np.ndarray, smoothing_window=5):
+    """Apply temporal smoothing by averaging over a sliding window of `smoothing_window` consecutive chunks (centered)."""
+    if smoothing_window < 2:
+        return chunk_probs  # no smoothing
+    half_win = smoothing_window // 2
+    num_chunks, num_classes = chunk_probs.shape
+    smoothed = np.zeros_like(chunk_probs)
+    for t in range(num_chunks):
+        # Determine window bounds
+        start = max(0, t - half_win)
+        end = min(num_chunks, t + half_win + 1)
+        window_probs = chunk_probs[start:end]
+        smoothed[t] = window_probs.mean(axis=0)
+    return smoothed
+
+def ensemble_predictions(preds_list: list, strategy: str = 'min_then_avg'):
+    """
+    Ensemble predictions from multiple models.
+    `preds_list` is a list of numpy arrays (num_chunks x num_classes) from different models.
+    strategy:
+      - 'min_then_avg': take elementwise min across models of same architecture (if preds_list grouped by arch), then average between groups.
+      - 'average': simple mean of all model predictions.
+    """
+    if strategy == 'average':
+        # Simple average of all predictions
+        combined = np.mean(np.stack(preds_list, axis=0), axis=0)
+        return combined
+    elif strategy == 'min_then_avg':
+        # Assume preds_list contains groups of models from two architectures (e.g., first N from arch1, next M from arch2)
+        # For robustness, we'll infer grouping by array shapes or lengths of list (if known how many per arch).
+        # Here we'll assume first half of list is arch1, second half is arch2.
+        k = len(preds_list) // 2
+        arch1_preds = preds_list[:k]
+        arch2_preds = preds_list[k:]
+        # Elementwise min across models in each group
+        arch1_min = np.minimum.reduce(arch1_preds)  # shape (num_chunks, num_classes)
+        arch2_min = np.minimum.reduce(arch2_preds)
+        # Now average the two architecture outputs
+        combined = (arch1_min + arch2_min) / 2.0
+        return combined
+    else:
+        raise ValueError(f"Unknown ensemble strategy: {strategy}")
+
+
+#### src/inference.py
+# inference.py
+import yaml
 import os
-import sys
-import glob
-import random
-import time
 import numpy as np
 import pandas as pd
 import librosa
 import cv2
 import torch
-import torch.nn as nn
-import timm
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
-import logging
-import warnings
-warnings.filterwarnings("ignore")
+from infer_utils import load_model, predict_chunks, smooth_predictions, ensemble_predictions
 
-# Set up logging to both console and a log file.
-logging.basicConfig(level=logging.INFO,
-    format='%(asctime)s %(levelname)s:%(message)s',
-    handlers=[logging.StreamHandler(),
-              logging.FileHandler("training_log.txt", mode='a')])
-logger = logging.getLogger()
-
-# -------------------------------
-# CONFIGURATION
-# -------------------------------
-class CFG:
-    DATA_DIR = '/data/birdclef'
-    TRAIN_AUDIO_DIR = os.path.join(DATA_DIR, 'train_audio')
-    TRAIN_CSV = os.path.join(DATA_DIR, 'train.csv')
-    TAXONOMY_CSV = os.path.join(DATA_DIR, 'taxonomy.csv')
-    # Although inference paths exist in the full pipeline, they are not used here.
-
-    SAMPLE_RATE = 32000
-    WINDOW_SIZE_SEC = 5           # For inference windows; training uses 10 sec.
-    TRAIN_WINDOW_SEC = 10         # Use 10-second chunks for training.
-    N_FFT = 1024
-    HOP_LENGTH = 512
-    N_MELS = 128
-    FMIN = 50
-    FMAX = 14000
-    TARGET_IMG_SIZE = (256, 256)
-    
-    BATCH_SIZE = 32
-    NUM_EPOCHS = 12
-    LR = 1e-3
-    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    NUM_CLASSES = 206  # This will be updated based on the taxonomy.
-    
-    SEED = 42
-    DEBUG = False
-    
-    # Inference parameters are not used in training.
-    use_tta = False  
-    tta_count = 3
-    threshold = 0.7
-    
-    use_latent = True  # Latent predictions are typically used only during inference.
-
-CFG = CFG()
-
-def seed_everything(seed=CFG.SEED):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-seed_everything()
-
-# -------------------------------
-# DATA LOADING & PREPROCESSING FUNCTIONS
-# -------------------------------
-def load_audio(path, sr=CFG.SAMPLE_RATE):
-    audio, _ = librosa.load(path, sr=sr)
-    return audio
-
-def compute_mel_spectrogram(audio, sr=CFG.SAMPLE_RATE):
-    mel_spec = librosa.feature.melspectrogram(
-        y=audio,
-        sr=sr,
-        n_fft=CFG.N_FFT,
-        hop_length=CFG.HOP_LENGTH,
-        n_mels=CFG.N_MELS,
-        fmin=CFG.FMIN,
-        fmax=CFG.FMAX,
-        power=2.0)
-    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-    mel_norm = (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min() + 1e-8)
-    return mel_norm
-
-def resize_spectrogram(melspec, target_size=CFG.TARGET_IMG_SIZE):
-    melspec_img = cv2.resize(melspec, target_size, interpolation=cv2.INTER_LINEAR)
-    return melspec_img.astype(np.float32)
-
-# -------------------------------
-# Voice Activity Detection (VAD)
-# -------------------------------
-def apply_vad(audio, sr=CFG.SAMPLE_RATE):
-    try:
-        vad_model, utils = torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True)
-        get_speech_timestamps = utils[0]
-    except Exception as e:
-        logger.error(f"Error loading Silero VAD: {e}")
-        return audio
-    audio_tensor = torch.tensor(audio, dtype=torch.float32)
-    # Pass vad_model as required by the API
-    speech_ts = get_speech_timestamps(audio_tensor, vad_model, sampling_rate=sr)
-    mask = np.ones(len(audio))
-    for seg in speech_ts:
-        mask[seg['start']:seg['end']] = 0
-    cleaned = audio * mask
-    return cleaned
-
-# -------------------------------
-# Augmentation Functions
-# -------------------------------
-def augment_noise_injection(audio, sr=CFG.SAMPLE_RATE, noise_level=(0, 0.5)):
-    noise = np.random.randn(len(audio))
-    level = np.random.uniform(*noise_level)
-    return audio + level * noise
-
-def augment_time_shift(audio, sr=CFG.SAMPLE_RATE, shift_max_sec=2):
-    shift = np.random.randint(sr * shift_max_sec)
-    direction = np.random.choice([1, -1])
-    shifted = np.roll(audio, direction * shift)
-    if direction == 1:
-        shifted[:shift] = 0
+if __name__ == "__main__":
+    # Load inference config
+    with open("config/inference.yaml", 'r') as f:
+        config = yaml.safe_load(f)
+    audio_dir = config['paths']['test_audio_dir']
+    models_dir = config['paths']['models_dir']
+    output_file = config['paths']['output_file']
+    taxonomy_path = config['paths'].get('taxonomy_csv', None)
+    chunk_duration = config['inference']['chunk_duration']  # e.g., 10.0 (but competition evaluation is 5s, we'll handle splitting)
+    chunk_hop = config['inference']['chunk_hop']           # e.g., 5.0
+    smoothing_neighbors = config['inference'].get('smoothing_neighbors', 2)
+    presence_threshold = config['inference'].get('presence_threshold', 0.5)
+    ensemble_ckpts = config['ensemble']['checkpoints']
+    ensemble_strategy = config['ensemble'].get('strategy', 'average')
+    # Determine species list from taxonomy (for output columns)
+    if taxonomy_path and os.path.exists(taxonomy_path):
+        taxo_df = pd.read_csv(taxonomy_path)
+        # assuming taxonomy_csv has a column 'primary_label' with species codes
+        species_list = list(taxo_df['primary_label'])
     else:
-        shifted[-shift:] = 0
-    return shifted
+        raise ValueError("Taxonomy file not found. Required to determine output classes.")
+    num_classes = len(species_list)
+    # Load all models
+    models = []
+    model_archs = []
+    for ckpt_name in ensemble_ckpts:
+        # Determine architecture name from checkpoint naming convention
+        if ckpt_name.startswith("efficientnet"):
+            arch = "efficientnet_b0"
+        elif ckpt_name.startswith("regnety"):
+            arch = "regnety_008"
+        else:
+            raise ValueError(f"Unknown model type in checkpoint name: {ckpt_name}")
+        ckpt_path = os.path.join(models_dir, arch, ckpt_name)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+        model, species_map = load_model(arch, num_classes, ckpt_path, torch.device("cpu"))
+        models.append(model)
+        model_archs.append(arch)
+    # Iterate over each test audio file
+    results = []  # to accumulate output rows
+    for filename in sorted(os.listdir(audio_dir)):
+        if not filename.lower().endswith(('.wav', '.ogg', '.mp3')):
+            continue
+        file_path = os.path.join(audio_dir, filename)
+        print(f"Processing {filename}...")
+        # Load full audio (assuming reasonably short soundscapes or streaming if very long)
+        y, sr = librosa.load(file_path, sr=None)
+        # We will perform inference on 5-second chunks (as evaluation is per 5s)
+        # If chunk_duration is 10 (like training chunks), we still need 5s resolution output.
+        # So we can slide a 10s window with hop=5s to get overlapping predictions, then smooth.
+        # Alternatively, use the 5s base segmentation directly with our models.
+        # We'll do overlapping predictions: 10s window every 5s, then combine.
+        base_hop = int(5.0 * sr)
+        base_chunk = int(5.0 * sr)
+        # Pad audio to multiple of 5 seconds
+        pad_len = (-len(y)) % base_chunk
+        if pad_len > 0:
+            y = np.concatenate([y, np.zeros(pad_len, dtype=y.dtype)])
+        n_segments = len(y) // base_chunk
+        # Ensemble predictions: we will compute using our loaded models
+        # For each model, produce predictions for each 5s segment
+        all_model_preds = []
+        for model, arch in zip(models, model_archs):
+            # If model was trained on 10s chunks, we might do a 10s sliding window:
+            # But simpler: just predict on each 5s as independent (the model might generalize to 5s though trained on 10s).
+            # Alternatively, if needed, we could feed two consecutive 5s together to model (as it expects 10s).
+            # However, for ensemble, using overlapping windows and smoothing achieves similar effect.
+            preds = predict_chunks(model, y, sr, chunk_duration=5.0)
+            all_model_preds.append(preds)
+        # all_model_preds is list of arrays of shape (n_segments, num_classes)
+        # Ensure all predictions align in segment indexing
+        # Smooth each model's predictions over time neighbors (if configured)
+        if smoothing_neighbors > 0:
+            for m in range(len(all_model_preds)):
+                all_model_preds[m] = smooth_predictions(all_model_preds[m], smoothing_window=(2 * smoothing_neighbors + 1))
+        # Apply ensemble strategy
+        combined_preds = ensemble_predictions(all_model_preds, strategy=ensemble_strategy)
+        # Apply chunk-level threshold to decide presence (if needed for output as binary)
+        binary_preds = (combined_preds >= presence_threshold).astype(np.int_)
+        # Prepare output for each 5s interval
+        file_id = os.path.splitext(filename)[0]
+        for i in range(n_segments):
+            row_id = f"{file_id}_{i*5}"  # assuming each segment indexed by start time in seconds
+            prob_row = combined_preds[i]
+            # We will output probabilities for submission (the evaluation expects probabilities for each species)
+            # If binary presence is needed instead, one could output binary_preds.
+            result = {"row_id": row_id}
+            for j, species in enumerate(species_list):
+                result[species] = prob_row[j]
+            results.append(result)
+    # Save results to CSV
+    output_df = pd.DataFrame(results)
+    # Ensure columns order: row_id first, then species columns in alphabetical (or taxonomy) order
+    cols = ["row_id"] + species_list
+    output_df = output_df[cols]
+    output_df.to_csv(output_file, index=False)
+    print(f"Saved inference results to {output_file}")
 
-def augment_pitch_shift(audio, sr=CFG.SAMPLE_RATE, n_steps_range=(-2, 2)):
-    n_steps = np.random.uniform(*n_steps_range)
-    return librosa.effects.pitch_shift(y=audio, sr=sr, n_steps=n_steps)
 
-def augment_time_stretch(audio, sr=CFG.SAMPLE_RATE, rate_range=(0.8, 1.2)):
-    rate = np.random.uniform(*rate_range)
-    return librosa.effects.time_stretch(y=audio, rate=rate)
+#### src/metrics.py
+# metrics.py
+import numpy as np
+from sklearn.metrics import roc_auc_score
 
-def random_augmentation(audio, sr=CFG.SAMPLE_RATE):
-    funcs = [augment_noise_injection, augment_time_shift, augment_pitch_shift, augment_time_stretch]
-    func = random.choice(funcs)
-    return func(audio, sr)
+def macro_auc_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Macro-averaged ROC-AUC, skipping classes with no true positives."""
+    num_classes = y_true.shape[1]
+    aucs = []
+    for i in range(num_classes):
+        if np.sum(y_true[:, i] == 1) == 0:
+            continue  # skip classes with no positives in truth
+        try:
+            auc = roc_auc_score(y_true[:, i], y_pred[:, i])
+            aucs.append(auc)
+        except ValueError:
+            continue
+    return float(np.mean(aucs)) if aucs else 0.0
 
-# -------------------------------
-# Dataset Class
-# -------------------------------
+def macro_precision_score(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.5) -> float:
+    """Macro-average precision at given threshold (skip classes with no predictions and no truths)."""
+    num_classes = y_true.shape[1]
+    precisions = []
+    for i in range(num_classes):
+        pred_pos = y_pred[:, i] >= threshold
+        true_pos = y_true[:, i] == 1
+        if pred_pos.sum() == 0:
+            if true_pos.sum() == 0:
+                continue
+            else:
+                precisions.append(0.0)
+        else:
+            prec_i = np.sum(true_pos & pred_pos) / max(1, pred_pos.sum())
+            precisions.append(prec_i)
+    return float(np.mean(precisions)) if precisions else 0.0
+
+def create_pseudo_labels(chunk_probs: np.ndarray, species_list: list, threshold: float = 0.5) -> list:
+    """
+    Given chunk-level probabilities (num_chunks x num_classes) and species list mapping indices to species codes,
+    return a list of pseudo-label dicts for each chunk where probabilities exceed threshold.
+    Each dict maps species code -> 1.0 for high-confidence presence.
+    """
+    num_chunks, num_classes = chunk_probs.shape
+    pseudo_labels = []
+    for t in range(num_chunks):
+        label_dict = {}
+        for j in range(num_classes):
+            if chunk_probs[t, j] >= threshold:
+                # Assign a soft label of 1.0 (presence) for that species in this chunk
+                label_dict[species_list[j]] = 1.0
+        pseudo_labels.append(label_dict)
+    return pseudo_labels
+
+
+#### src/process_gold.py
+#!/usr/bin/env python3
+"""
+process_gold.py – Create golden training set from 5-star single-label recordings.
+
+Filters the master training CSV for high-quality recordings (rating >= 5 with no secondary species),
+then for each selected recording:
+ - Loads audio, trims silence, deduplicates identical audio,
+ - Splits into chunks of fixed duration (with overlap), padding if needed for short audio,
+ - Extracts mel spectrogram for each chunk and saves it,
+ - Creates one-hot label vector for the primary species,
+ - Records metadata for each chunk in train_metadata.csv (weight=1, pseudo=0).
+
+Run this script before initial training.
+"""
+import os, ast, hashlib, logging
+from pathlib import Path
+import yaml
+import librosa
+import numpy as np
+import pandas as pd
+from PIL import Image
+import utils  # import shared utility functions
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("process_gold")
+
+# Load configuration
+with open("process.yaml", "r") as f:
+    config = yaml.safe_load(f)
+paths_cfg = config["paths"]
+audio_cfg = config["audio"]
+chunk_cfg = config["chunking"]
+mel_cfg = config["mel"]
+sel_cfg = config["selection"]
+label_cfg = config["labeling"]
+# Define important parameters
+DATA_ROOT = Path(paths_cfg["data_root"])
+AUDIO_DIR = Path(paths_cfg["audio_dir"])
+PROCESSED_DIR = Path(paths_cfg["processed_dir"])
+TRAIN_CSV = Path(paths_cfg["train_csv"])
+METADATA_CSV = Path(paths_cfg["train_metadata"])
+DEDUP_ENABLED = config["deduplication"]["enabled"]
+# Create output directories
+mel_dir = PROCESSED_DIR / "mels"
+label_dir = PROCESSED_DIR / "labels"
+mel_dir.mkdir(parents=True, exist_ok=True)
+label_dir.mkdir(parents=True, exist_ok=True)
+
+# Load taxonomy to get class index mapping
+class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), TRAIN_CSV)
+num_classes = len(class_list)
+logger.info(f"Loaded {num_classes} target classes.")
+
+# Prepare to track duplicates
+seen_hashes = set()
+hash_file = PROCESSED_DIR / "audio_hashes.txt"
+if hash_file.exists():
+    # Load existing hashes (if any previous processing was done)
+    with open(hash_file, 'r') as hf:
+        for line in hf:
+            seen_hashes.add(line.strip())
+
+# Read training metadata CSV
+train_df = pd.read_csv(TRAIN_CSV)
+logger.info(f"Total recordings in train.csv: {len(train_df)}")
+# Filter for golden criteria
+golden_df = train_df[ (train_df["rating"] >= sel_cfg["golden_rating"]) ]
+if sel_cfg.get("require_single_label", True):
+    # Exclude any recording that has secondary labels listed
+    if "secondary_labels" in golden_df.columns:
+        # Some secondary_labels might be NaN or empty string if none
+        golden_df = golden_df[golden_df["secondary_labels"].isna() | (golden_df["secondary_labels"] == "[]")]
+logger.info(f"Golden set candidate recordings: {len(golden_df)}")
+
+metadata_entries = []  # will collect rows for train_metadata
+for _, row in golden_df.iterrows():
+    file_id = row.get("filename") or row.get("file") or row.get("recording_id")
+    primary_label = row["primary_label"]
+    rating = row.get("rating", 5)
+    # Only proceed if meets minimum rating (should already, but just in case)
+    if rating < sel_cfg["golden_rating"]:
+        continue
+    # Build audio file path
+    audio_path = AUDIO_DIR / primary_label / str(file_id)
+    if not audio_path.exists():
+        # Try adding extension if missing
+        # Common extensions in dataset might be .ogg or .mp3
+        if not str(audio_path).endswith(('.wav','.ogg','.mp3')):
+            for ext in [".ogg", ".mp3", ".wav"]:
+                if (AUDIO_DIR / primary_label / f"{file_id}{ext}").exists():
+                    audio_path = AUDIO_DIR / primary_label / f"{file_id}{ext}"
+                    break
+    if not audio_path.exists():
+        logger.warning(f"Audio file not found: {audio_path}")
+        continue
+
+    # Deduplication: check audio hash to skip identical files
+    y, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"], mono=True)
+    # Compute a hash of raw audio data (after resample) for dedup
+    audio_hash = hashlib.md5(y.tobytes()).hexdigest()
+    if DEDUP_ENABLED and audio_hash in seen_hashes:
+        logger.info(f"Skipping duplicate audio: {file_id} ({primary_label})")
+        continue
+    seen_hashes.add(audio_hash)
+
+    # Trim leading/trailing silence
+    if audio_cfg["trim_top_db"] is not None:
+        y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
+    # Ensure minimum duration by padding or looping
+    chunk_dur = int(chunk_cfg["train_chunk_duration"] * audio_cfg["sample_rate"])
+    if len(y) == 0:
+        continue  # skip if completely silent
+    if len(y) < int(audio_cfg["min_duration"] * audio_cfg["sample_rate"]):
+        # If shorter than minimum duration, loop it to reach that length
+        repeat_count = int(np.ceil((audio_cfg["min_duration"] * audio_cfg["sample_rate"]) / len(y)))
+        y = np.tile(y, repeat_count)[:int(audio_cfg["min_duration"] * audio_cfg["sample_rate"])]
+
+    # Segment into overlapping chunks
+    hop_samples = int(chunk_cfg["train_chunk_hop"] * audio_cfg["sample_rate"])
+    total_samples = len(y)
+    start = 0
+    while start < total_samples:
+        end = start + chunk_dur
+        if end > total_samples:
+            # If this is the last segment and shorter than chunk_dur, decide whether to include
+            if start == 0:
+                # If the whole recording is shorter than chunk duration, pad it cyclically
+                if len(y) < chunk_dur:
+                    repeats = (chunk_dur // len(y)) + 1
+                    y_pad = np.tile(y, repeats)[:chunk_dur]
+                else:
+                    y_pad = y
+                segment = y_pad
+            else:
+                # Break out if last segment would be incomplete (already covered in previous segment overlap)
+                break
+        else:
+            segment = y[start:end]
+        # Calculate chunk start time in seconds
+        start_sec = start / audio_cfg["sample_rate"]
+        # Compute mel spectrogram
+        mel_spec = librosa.feature.melspectrogram(segment, sr=audio_cfg["sample_rate"],
+                                                 n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
+                                                 n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"], power=mel_cfg["power"])
+        mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+        # Resize mel spectrogram to target shape
+        mel_height, mel_width = mel_db.shape
+        target_h, target_w = mel_cfg["target_shape"]
+        if (mel_height, mel_width) != (target_h, target_w):
+            # Normalize mel values to [0,255] for image resizing
+            mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-6)
+            mel_img = (mel_norm * 255).astype(np.uint8)
+            mel_img = Image.fromarray(mel_img)
+            mel_img = mel_img.resize((target_w, target_h), Image.BILINEAR)
+            mel_resized = np.array(mel_img).astype(np.float32) / 255.0
+            # Convert back to dB scale range
+            mel_resized = mel_resized * (mel_db.max() - mel_db.min() + 1e-6) + mel_db.min()
+            mel_db = mel_resized
+        # Save mel spectrogram array
+        chunk_id = utils.hash_chunk_id(str(file_id), start_sec)
+        mel_path = mel_dir / f"{chunk_id}.npy"
+        label_path = label_dir / f"{chunk_id}.npy"
+        np.save(mel_path, mel_db.astype(np.float32))
+        # Create label vector (one-hot since no secondary labels)
+        label_vec = np.zeros(num_classes, dtype=np.float32)
+        label_index = class_map.get(primary_label)
+        if label_index is None:
+            # If species not in our class map (should not happen if taxonomy covers all)
+            logger.warning(f"Species {primary_label} not in class map, skipping chunk.")
+            start += hop_samples
+            continue
+        label_vec[label_index] = 1.0  # one-hot for primary species
+        np.save(label_path, label_vec)
+        # Add metadata entry
+        metadata_entries.append({
+            "filename": str(file_id),
+            "start_sec": round(start_sec, 3),
+            "mel_path": str(mel_path),
+            "label_path": str(label_path),
+            "weight": 1.0,            # golden samples weight=1
+            "pseudo": 0               # human-labeled
+        })
+        start += hop_samples
+    logger.info(f"Processed golden file: {file_id} ({primary_label})")
+
+# Save metadata to CSV
+md_df = pd.DataFrame(metadata_entries, columns=["filename","start_sec","mel_path","label_path","weight","pseudo"])
+md_df.to_csv(METADATA_CSV, index=False)
+logger.info(f"Golden set processing complete. Chunks saved: {len(md_df)}. Metadata written to {METADATA_CSV}")
+
+# Save updated hash list for deduplication reference
+if DEDUP_ENABLED:
+    with open(hash_file, 'w') as hf:
+        for h in seen_hashes:
+            hf.write(f"{h}\n")
+
+
+#### src/process_pseudo.py
+#!/usr/bin/env python3
+"""
+process_pseudo.py – Generate pseudo-labels for remaining unlabeled recordings.
+
+Uses the initially trained models to predict labels for all recordings not already in the training set.
+For each recording not in train_metadata (i.e., not processed in golden or rare stages):
+ - Splits the recording into chunks (with overlap) for inference,
+ - Averages predictions from all available models (ensemble),
+ - For each chunk where the top prediction confidence >= threshold, saves that chunk with the model-provided label probabilities as soft labels,
+ - Marks these chunks as pseudo-labeled with a lower weight,
+ - Appends the new entries to train_metadata.csv.
+
+Run after initial model training to expand the training dataset with pseudo-labeled data.
+"""
+import os, hashlib, logging
+from pathlib import Path
+import yaml
+import librosa
+import numpy as np
+import pandas as pd
+import torch
+import utils
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("process_pseudo")
+
+# Load config
+with open("process.yaml", "r") as f:
+    config = yaml.safe_load(f)
+paths_cfg = config["paths"]
+audio_cfg = config["audio"]
+chunk_cfg = config["chunking"]
+mel_cfg = config["mel"]
+sel_cfg = config["selection"]
+label_cfg = config["labeling"]
+DATA_ROOT = Path(paths_cfg["data_root"])
+AUDIO_DIR = Path(paths_cfg["audio_dir"])
+PROCESSED_DIR = Path(paths_cfg["processed_dir"])
+TRAIN_CSV = Path(paths_cfg["train_csv"])
+METADATA_CSV = Path(paths_cfg["train_metadata"])
+models_dir = Path("/data/birdclef/models")  # directory where initial models are stored (from initial_train stage)
+
+# Load class map and list
+class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), TRAIN_CSV)
+num_classes = len(class_list)
+
+# Load train_metadata to find used files
+if METADATA_CSV.exists():
+    used_files = set(pd.read_csv(METADATA_CSV)["filename"].astype(str).unique())
+else:
+    used_files = set()
+
+# Prepare models for inference (load all initial trained model checkpoints)
+# We assume initial models are saved with a known naming scheme (as per initial_train.yaml config)
+ensemble_models = []
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Model architecture definitions (match those in initial_train.yaml)
+initial_archs = [("efficientnet_b0", 3), ("regnety_008", 3)]
+for arch_name, count in initial_archs:
+    for i in range(1, count+1):
+        ckpt_path = models_dir / f"{arch_name}_initial_{i}.pth"
+        if not ckpt_path.exists():
+            logger.warning(f"Model checkpoint not found: {ckpt_path}")
+            continue
+        # Load model (assuming torchscript or state dict saved)
+        try:
+            model = torch.jit.load(str(ckpt_path)) if ckpt_path.suffix == ".pt" else None
+        except Exception:
+            model = None
+        if model is None:
+            # If saved as state dict, you'd need model class definitions to load. 
+            # Here we assume model was saved as torchscript or entire model.
+            logger.warning(f"Unable to load model (requires definition): {ckpt_path.name}")
+            continue
+        model.eval().to(device)
+        ensemble_models.append(model)
+logger.info(f"Loaded {len(ensemble_models)} models for pseudo-label inference.")
+
+if not ensemble_models:
+    logger.error("No models loaded for inference. Aborting pseudo-labeling.")
+    exit(1)
+
+# Deduplication: prepare seen hashes set including all already used files
+seen_hashes = set()
+hash_file = PROCESSED_DIR / "audio_hashes.txt"
+if hash_file.exists():
+    with open(hash_file, 'r') as hf:
+        for line in hf:
+            seen_hashes.add(line.strip())
+
+new_entries = []
+# Iterate over all recordings in train.csv that were not used in training
+train_df = pd.read_csv(TRAIN_CSV)
+for _, row in train_df.iterrows():
+    file_id = str(row.get("filename") or row.get("file") or row.get("recording_id"))
+    primary_label = row["primary_label"]
+    if file_id in used_files:
+        continue
+    audio_path = AUDIO_DIR / primary_label / file_id
+    if not audio_path.exists():
+        # try with extension
+        found = False
+        for ext in [".ogg", ".mp3", ".wav"]:
+            if (AUDIO_DIR / primary_label / f"{file_id}{ext}").exists():
+                audio_path = AUDIO_DIR / primary_label / f"{file_id}{ext}"
+                found = True
+                break
+        if not found:
+            logger.warning(f"File not found for pseudo-labeling: {file_id}")
+            continue
+
+    # Dedup check
+    y, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"], mono=True)
+    audio_hash = hashlib.md5(y.tobytes()).hexdigest()
+    if config["deduplication"]["enabled"] and audio_hash in seen_hashes:
+        logger.info(f"Skipping duplicate (unlabeled) audio: {file_id}")
+        continue
+    seen_hashes.add(audio_hash)
+
+    # Trim ends silence
+    if audio_cfg["trim_top_db"] is not None:
+        y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
+    if len(y) == 0:
+        continue
+
+    # Chunk for inference (use same chunk length and hop as training)
+    chunk_samples = int(chunk_cfg["train_chunk_duration"] * audio_cfg["sample_rate"])
+    hop_samples = int(chunk_cfg["train_chunk_hop"] * audio_cfg["sample_rate"])
+    total_samples = len(y)
+    # Pad the audio at end to cover last segment fully
+    if total_samples < chunk_samples:
+        # pad with silence to one chunk length
+        pad = chunk_samples - total_samples
+        y = np.concatenate([y, np.zeros(pad, dtype=y.dtype)])
+        total_samples = len(y)
+    elif total_samples % hop_samples != 0:
+        # pad so that the last start index aligns to cover end
+        pad = hop_samples - (total_samples % hop_samples)
+        y = np.concatenate([y, np.zeros(pad, dtype=y.dtype)])
+        total_samples = len(y)
+
+    # Slide through audio
+    start = 0
+    while start < total_samples:
+        end = start + chunk_samples
+        if end > total_samples:
+            segment = y[start:total_samples]
+            # pad this last segment to full length
+            segment = np.pad(segment, (0, end - total_samples), mode='constant')
+        else:
+            segment = y[start:end]
+        start_sec = start / audio_cfg["sample_rate"]
+        # Compute mel spectrogram for the segment
+        mel_spec = librosa.feature.melspectrogram(segment, sr=audio_cfg["sample_rate"],
+                                                 n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
+                                                 n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"], power=mel_cfg["power"])
+        mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+        # Resize mel to target shape
+        h, w = mel_db.shape
+        target_h, target_w = mel_cfg["target_shape"]
+        if (h, w) != (target_h, target_w):
+            mel_db = utils.resize_mel(mel_db, target_h, target_w)
+        # Convert mel to torch tensor and predict with ensemble
+        mel_tensor = torch.from_numpy(mel_db).unsqueeze(0).unsqueeze(0).to(device)  # shape (1,1,H,W)
+        # If model expects 3-channel input, we would stack mel 3 times here. Assume our models were adapted to 1-channel.
+        avg_pred = np.zeros(num_classes, dtype=np.float32)
+        with torch.no_grad():
+            for model in ensemble_models:
+                # Each model should output a tensor of shape (1, num_classes) logits
+                logits = model(mel_tensor)
+                probs = torch.sigmoid(logits).cpu().numpy().flatten()  # convert to probabilities
+                avg_pred += probs.astype(np.float32)
+        avg_pred /= len(ensemble_models)
+        # Determine if this chunk has a confident prediction
+        top_prob = float(np.max(avg_pred))
+        if top_prob >= sel_cfg["pseudo_confidence_threshold"]:
+            # Save chunk and pseudo label
+            chunk_id = utils.hash_chunk_id(file_id, start_sec)
+            mel_path = PROCESSED_DIR / "mels" / f"{chunk_id}.npy"
+            label_path = PROCESSED_DIR / "labels" / f"{chunk_id}.npy"
+            np.save(mel_path, mel_db.astype(np.float32))
+            # Save soft label vector (predicted probabilities)
+            label_vec = avg_pred  # already numpy array of float32
+            np.save(label_path, label_vec.astype(np.float32))
+            # Assign weight (pseudo labels have lower weight)
+            w = label_cfg["pseudo_label_weight"]
+            # Optionally scale weight by confidence (not explicitly configured, so skipping)
+            new_entries.append({
+                "filename": file_id,
+                "start_sec": round(start_sec, 3),
+                "mel_path": str(mel_path),
+                "label_path": str(label_path),
+                "weight": float(w),
+                "pseudo": 1
+            })
+        start += hop_samples
+    logger.info(f"Inferred pseudo-labels for file: {file_id}")
+
+# Append pseudo-labeled entries to metadata
+if new_entries:
+    md_df = pd.DataFrame(new_entries, columns=["filename","start_sec","mel_path","label_path","weight","pseudo"])
+    md_df.to_csv(METADATA_CSV, mode='a', index=False, header=False)
+    logger.info(f"Appended {len(md_df)} pseudo-labeled chunks to train_metadata.csv.")
+else:
+    logger.info("No pseudo-labeled chunks added (no confident predictions).")
+
+# Update dedup hash record
+if config["deduplication"]["enabled"]:
+    with open(PROCESSED_DIR / "audio_hashes.txt", 'w') as hf:
+        for h in seen_hashes:
+            hf.write(f"{h}\n")
+
+
+#### src/process_rare.py
+#!/usr/bin/env python3
+"""
+process_rare.py – Add rare classes to training set by including lower-rated recordings.
+
+Identifies bird species with few available recordings (based on train.csv and a threshold).
+For each rare species, includes all recordings of that species (down to min_rating) that were not in the golden set.
+Processes each new recording similar to process_gold (trimming, chunking, mel extraction).
+Also incorporates synthetic audio for those species if available (from synthetic_dir).
+Appends the new chunks to the existing train_metadata.csv with appropriate labels and weights.
+Run this after process_gold (and initial training, if desired) to enrich the training data with minority classes.
+"""
+import os, ast, hashlib, logging
+from pathlib import Path
+import yaml
+import librosa
+import numpy as np
+import pandas as pd
+from PIL import Image
+import utils
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("process_rare")
+
+# Load configuration
+with open("process.yaml", "r") as f:
+    config = yaml.safe_load(f)
+paths_cfg = config["paths"]
+audio_cfg = config["audio"]
+chunk_cfg = config["chunking"]
+mel_cfg = config["mel"]
+sel_cfg = config["selection"]
+label_cfg = config["labeling"]
+DATA_ROOT = Path(paths_cfg["data_root"])
+AUDIO_DIR = Path(paths_cfg["audio_dir"])
+SYN_DIR = Path(paths_cfg.get("synthetic_dir", ""))
+PROCESSED_DIR = Path(paths_cfg["processed_dir"])
+TRAIN_CSV = Path(paths_cfg["train_csv"])
+METADATA_CSV = Path(paths_cfg["train_metadata"])
+DEDUP_ENABLED = config["deduplication"]["enabled"]
+
+mel_dir = PROCESSED_DIR / "mels"
+label_dir = PROCESSED_DIR / "labels"
+mel_dir.mkdir(parents=True, exist_ok=True)
+label_dir.mkdir(parents=True, exist_ok=True)
+
+# Load class mapping
+class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), TRAIN_CSV)
+num_classes = len(class_list)
+
+# Prepare deduplication set
+seen_hashes = set()
+hash_file = PROCESSED_DIR / "audio_hashes.txt"
+if hash_file.exists():
+    with open(hash_file, 'r') as hf:
+        for line in hf:
+            seen_hashes.add(line.strip())
+
+# Determine rare species based on occurrence counts
+train_df = pd.read_csv(TRAIN_CSV)
+# Count total recordings per species (all ratings)
+species_counts = train_df.groupby("primary_label")["filename"].count().to_dict()
+rare_species = [sp for sp, count in species_counts.items() if count < sel_cfg["rare_species_threshold"]]
+logger.info(f"Identified {len(rare_species)} rare species with < {sel_cfg['rare_species_threshold']} recordings.")
+
+# Also ensure we only add species that were not fully covered in golden
+# Actually, if a rare species had some golden entries, we may still add more of its recordings
+# So no need to exclude those, we will skip duplicates by file name or hash anyway.
+# Load existing train_metadata to skip files already processed
+existing_md = pd.read_csv(METADATA_CSV)
+used_files = set(existing_md["filename"].astype(str).unique())
+
+new_entries = []
+# Process real recordings for rare species
+for species in rare_species:
+    # Find all recordings of this species in train_df
+    species_df = train_df[train_df["primary_label"] == species]
+    if species_df.empty:
+        continue
+    for _, row in species_df.iterrows():
+        file_id = row.get("filename") or row.get("file") or row.get("recording_id")
+        if str(file_id) in used_files:
+            # Already included in golden set
+            continue
+        rating = row.get("rating", 0)
+        if rating < audio_cfg["min_rating"]:
+            continue
+        secondary_labels = []
+        if "secondary_labels" in row and isinstance(row["secondary_labels"], str) and row["secondary_labels"].strip():
+            # Parse secondary labels list from string
+            try:
+                secondary_labels = ast.literal_eval(row["secondary_labels"])
+            except Exception:
+                secondary_labels = []
+        audio_path = AUDIO_DIR / species / str(file_id)
+        if not audio_path.exists():
+            if not str(audio_path).endswith(('.wav','.ogg','.mp3')):
+                for ext in [".ogg", ".mp3", ".wav"]:
+                    if (AUDIO_DIR / species / f"{file_id}{ext}").exists():
+                        audio_path = AUDIO_DIR / species / f"{file_id}{ext}"
+                        break
+        if not audio_path.exists():
+            logger.warning(f"Audio file not found: {audio_path}")
+            continue
+
+        # Deduplication check
+        y, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"], mono=True)
+        audio_hash = hashlib.md5(y.tobytes()).hexdigest()
+        if DEDUP_ENABLED and audio_hash in seen_hashes:
+            logger.info(f"Skipping duplicate audio: {file_id} ({species})")
+            continue
+        seen_hashes.add(audio_hash)
+
+        # Trim silence from ends
+        if audio_cfg["trim_top_db"] is not None:
+            y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
+        if len(y) == 0:
+            continue
+        # Pad short recordings to min_duration if needed
+        if len(y) < int(audio_cfg["min_duration"] * audio_cfg["sample_rate"]):
+            repeats = int(np.ceil((audio_cfg["min_duration"] * audio_cfg["sample_rate"]) / len(y)))
+            y = np.tile(y, repeats)[:int(audio_cfg["min_duration"] * audio_cfg["sample_rate"])]
+
+        # Chunk into segments
+        chunk_samples = int(chunk_cfg["train_chunk_duration"] * audio_cfg["sample_rate"])
+        hop_samples = int(chunk_cfg["train_chunk_hop"] * audio_cfg["sample_rate"])
+        total_samples = len(y)
+        start = 0
+        while start < total_samples:
+            end = start + chunk_samples
+            if end > total_samples:
+                if start == 0:
+                    # file shorter than one chunk
+                    if len(y) < chunk_samples:
+                        repeats = (chunk_samples // len(y)) + 1
+                        seg = np.tile(y, repeats)[:chunk_samples]
+                    else:
+                        seg = y
+                else:
+                    break
+            else:
+                seg = y[start:end]
+            start_sec = start / audio_cfg["sample_rate"]
+            # Compute mel spectrogram
+            mel_spec = librosa.feature.melspectrogram(seg, sr=audio_cfg["sample_rate"],
+                                                     n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
+                                                     n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"], power=mel_cfg["power"])
+            mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+            # Resize mel to target shape
+            mel_height, mel_width = mel_db.shape
+            target_h, target_w = mel_cfg["target_shape"]
+            if (mel_height, mel_width) != (target_h, target_w):
+                mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-6)
+                mel_img = Image.fromarray((mel_norm*255).astype(np.uint8))
+                mel_img = mel_img.resize((target_w, target_h), Image.BILINEAR)
+                mel_resized = np.array(mel_img).astype(np.float32) / 255.0
+                mel_resized = mel_resized * (mel_db.max() - mel_db.min() + 1e-6) + mel_db.min()
+                mel_db = mel_resized
+            # Save mel
+            chunk_id = utils.hash_chunk_id(str(file_id), start_sec)
+            mel_path = mel_dir / f"{chunk_id}.npy"
+            label_path = label_dir / f"{chunk_id}.npy"
+            np.save(mel_path, mel_db.astype(np.float32))
+            # Create label vector (may be multi-label if secondary species present)
+            prim_label = species
+            sec_labels = secondary_labels if label_cfg["use_soft_labels"] and secondary_labels else []
+            label_vec = utils.create_label_vector(prim_label, sec_labels, class_map,
+                                                  primary_weight=label_cfg["primary_label_weight"],
+                                                  secondary_weight=label_cfg["secondary_label_weight"],
+                                                  use_soft=label_cfg["use_soft_labels"])
+            np.save(label_path, label_vec.astype(np.float32))
+            # weight for rare class sample
+            w = label_cfg.get("rare_label_weight", 1.0)
+            new_entries.append({
+                "filename": str(file_id),
+                "start_sec": round(start_sec, 3),
+                "mel_path": str(mel_path),
+                "label_path": str(label_path),
+                "weight": float(w),
+                "pseudo": 0
+            })
+            start += hop_samples
+        logger.info(f"Processed rare file: {file_id} (species {species})")
+
+# Process synthetic audio for rare species (if any synthetic files exist)
+if SYN_DIR and Path(SYN_DIR).exists():
+    syn_files = list(Path(SYN_DIR).rglob("*.*"))
+    logger.info(f"Found {len(syn_files)} synthetic audio files.")
+    for syn_path in syn_files:
+        species = syn_path.parent.name  # assuming synthetic files are in subdirectories named by species
+        if species not in rare_species:
+            # Only include synthetic for species truly rare or needed
+            # (Optionally could include synthetic for others if provided, but skip if not rare)
+            continue
+        file_id = syn_path.stem
+        # Dedup check: synthetic likely unique, but check to avoid duplicates among synthetic
+        y, sr = librosa.load(syn_path, sr=audio_cfg["sample_rate"], mono=True)
+        audio_hash = hashlib.md5(y.tobytes()).hexdigest()
+        if DEDUP_ENABLED and audio_hash in seen_hashes:
+            logger.info(f"Skipping duplicate synthetic audio: {syn_path.name}")
+            continue
+        seen_hashes.add(audio_hash)
+        # Trim silence (if any) and pad if needed
+        if audio_cfg["trim_top_db"] is not None:
+            y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
+        if len(y) == 0:
+            continue
+        if len(y) < int(audio_cfg["min_duration"] * audio_cfg["sample_rate"]):
+            repeats = int(np.ceil((audio_cfg["min_duration"] * audio_cfg["sample_rate"]) / len(y)))
+            y = np.tile(y, repeats)[:int(audio_cfg["min_duration"] * audio_cfg["sample_rate"])]
+
+        # For synthetic, many are short single calls; we'll create at least one chunk (pad to full chunk_dur)
+        chunk_samples = int(chunk_cfg["train_chunk_duration"] * audio_cfg["sample_rate"])
+        if len(y) < chunk_samples:
+            repeats = (chunk_samples // len(y)) + 1
+            y = np.tile(y, repeats)[:chunk_samples]
+        total_samples = len(y)
+        start = 0
+        while start < total_samples:
+            end = start + chunk_samples
+            if end > total_samples:
+                segment = y[start:]  # last segment (should not happen if we padded to chunk length)
+            else:
+                segment = y[start:end]
+            start_sec = start / audio_cfg["sample_rate"]
+            mel_spec = librosa.feature.melspectrogram(segment, sr=audio_cfg["sample_rate"],
+                                                     n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
+                                                     n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"], power=mel_cfg["power"])
+            mel_db = librosa.power_to_db(mel_spec, ref=np.max)
+            mel_height, mel_width = mel_db.shape
+            target_h, target_w = mel_cfg["target_shape"]
+            if (mel_height, mel_width) != (target_h, target_w):
+                mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-6)
+                mel_img = Image.fromarray((mel_norm*255).astype(np.uint8))
+                mel_img = mel_img.resize((target_w, target_h), Image.BILINEAR)
+                mel_resized = np.array(mel_img).astype(np.float32) / 255.0
+                mel_resized = mel_resized * (mel_db.max() - mel_db.min() + 1e-6) + mel_db.min()
+                mel_db = mel_resized
+            chunk_id = utils.hash_chunk_id(syn_path.stem, start_sec)
+            mel_path = mel_dir / f"{chunk_id}.npy"
+            label_path = label_dir / f"{chunk_id}.npy"
+            np.save(mel_path, mel_db.astype(np.float32))
+            # Label: one-hot for synthetic (single target species)
+            label_vec = np.zeros(num_classes, dtype=np.float32)
+            if species in class_map:
+                label_vec[class_map[species]] = 1.0
+            else:
+                logger.warning(f"Synthetic species {species} not in class map, skipping.")
+                start += chunk_samples
+                continue
+            np.save(label_path, label_vec)
+            w = label_cfg.get("rare_label_weight", 1.0)  # treat synthetic similar to rare real
+            new_entries.append({
+                "filename": syn_path.name,
+                "start_sec": round(start_sec, 3),
+                "mel_path": str(mel_path),
+                "label_path": str(label_path),
+                "weight": float(w),
+                "pseudo": 0
+            })
+            start += chunk_samples
+        logger.info(f"Processed synthetic file: {syn_path.name} (species {species})")
+
+# Append new entries to train_metadata.csv
+if new_entries:
+    md_df = pd.DataFrame(new_entries, columns=["filename","start_sec","mel_path","label_path","weight","pseudo"])
+    md_df.to_csv(METADATA_CSV, mode='a', index=False, header=False)
+    logger.info(f"Added {len(md_df)} new entries to train_metadata.csv for rare species.")
+else:
+    logger.info("No new entries added for rare species.")
+# Update hash file
+if DEDUP_ENABLED:
+    with open(hash_file, 'w') as hf:
+        for h in seen_hashes:
+            hf.write(f"{h}\n")
+
+
+#### src/train_efficientnet.py
+# train_efficientnet.py
+import yaml
+import json
+import torch
+from train_utils import BirdClefDataset, create_dataloader, train_model
+
+if __name__ == "__main__":
+    # Load training config
+    with open("config/train.yaml", 'r') as f:
+        config = yaml.safe_load(f)
+    # Identify EfficientNet config
+    arch_config = None
+    for arch in config['model']['architectures']:
+        if arch['name'].startswith("efficientnet"):
+            arch_config = arch
+            break
+    if arch_config is None:
+        raise ValueError("EfficientNet configuration not found in train.yaml")
+    model_name = arch_config['name']
+    num_models = arch_config.get('num_models', 1)
+    pretrained = arch_config.get('pretrained', True)
+    # Load training metadata
+    train_meta_path = config['dataset']['train_metadata']
+    df = pd.read_csv(train_meta_path)
+    # If pseudo-labeled samples should be included and exist, append them
+    if config['dataset'].get('include_pseudo', False):
+        pseudo_meta_path = os.path.join(os.path.dirname(train_meta_path), "soundscape_metadata.csv")
+        if os.path.exists(pseudo_meta_path):
+            df_pseudo = pd.read_csv(pseudo_meta_path)
+            # We assume pseudo metadata already in same format (including label_json and weight)
+            df = pd.concat([df, df_pseudo], ignore_index=True)
+    # If synthetic samples should be included, they are assumed to be already in train_metadata or processed.
+    # (If synthetic are separate, one could similarly read and append them here.)
+    # Create class map (species to index)
+    if 'label_json' in df.columns:
+        # Build class set from all labels present
+        species_set = {sp for js in df['label_json'] for sp in json.loads(js).keys()}
+    else:
+        # If no label_json, assume a 'primary_label' column exists
+        species_set = set(df['primary_label'].unique())
+        # Also include any secondary labels if provided
+        if 'secondary_labels' in df.columns:
+            for sec_list in df['secondary_labels']:
+                if isinstance(sec_list, str):
+                    for sp in sec_list.split():
+                        species_set.add(sp)
+    species_list = sorted(species_set)
+    class_map = {sp: idx for idx, sp in enumerate(species_list)}
+    num_classes = len(class_map)
+    # Split train/val (for simplicity, use a small percentage as validation)
+    val_frac = config['training'].get('val_fraction', 0.1)
+    df_val = df.sample(frac=val_frac, random_state=42)
+    df_train = df.drop(df_val.index).reset_index(drop=True)
+    df_val = df_val.reset_index(drop=True)
+    # Create datasets
+    train_dataset = BirdClefDataset(df_train, class_map, mel_shape=(128, 256), augment=True)
+    val_dataset = BirdClefDataset(df_val, class_map, mel_shape=(128, 256), augment=False)
+    train_loader = create_dataloader(train_dataset, batch_size=config['training']['batch_size'], shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4)
+    # Set device (use GPU if available)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Train specified number of models (e.g., 3 seeds for ensemble)
+    saved_checkpoints = []
+    base_seed = config['training'].get('seed', 42)
+    for run in range(1, num_models+1):
+        # Set reproducibility seed
+        torch.manual_seed(base_seed + run)
+        np.random.seed(base_seed + run)
+        # Initialize model
+        from torchvision import models
+        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
+        # Adjust final layer for num_classes
+        num_feats = model.classifier[1].in_features
+        model.classifier = torch.nn.Linear(num_feats, num_classes)
+        model = model.to(device)
+        # If fine-tuning from a provided initial checkpoint (for pseudo label iterations)
+        init_ckpt_base = arch_config.get('init_checkpoint', None)
+        if init_ckpt_base:
+            ckpt_path = f"{init_ckpt_base}_{run}.pth"
+            if os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location=device)
+                model.load_state_dict(ckpt['model_state_dict'])
+                print(f"Loaded initial checkpoint for {model_name} run{run} from {ckpt_path}")
+        # Prepare config for train_model
+        run_config = config.copy()
+        run_config['current_arch'] = model_name
+        run_config['current_run'] = run
+        run_config['class_map'] = class_map
+        run_config['paths'] = {
+            'models_dir': os.path.join("models", model_name)  # save in models/<architecture> folder
+        }
+        os.makedirs(run_config['paths']['models_dir'], exist_ok=True)
+        # Train model
+        best_ckpts = train_model(model, train_loader, val_loader, run_config, device)
+        saved_checkpoints.extend(best_ckpts)
+    # After training, output the list of saved checkpoint paths
+    print("Training complete. Saved model checkpoints:")
+    for ckpt in saved_checkpoints:
+        print(" -", ckpt)
+
+
+#### src/train_regnety.py
+# train_regnety.py
+import yaml
+import json
+import torch
+import numpy as np
+import pandas as pd
+import os
+from train_utils import BirdClefDataset, create_dataloader, train_model
+
+if __name__ == "__main__":
+    # Load training config
+    with open("config/train.yaml", 'r') as f:
+        config = yaml.safe_load(f)
+    # Identify RegNet config
+    arch_config = None
+    for arch in config['model']['architectures']:
+        if arch['name'].startswith("regnet"):
+            arch_config = arch
+            break
+    if arch_config is None:
+        raise ValueError("RegNetY configuration not found in train.yaml")
+    model_name = arch_config['name']
+    num_models = arch_config.get('num_models', 1)
+    pretrained = arch_config.get('pretrained', True)
+    # Load training metadata (same process as in train_efficientnet.py)
+    train_meta_path = config['dataset']['train_metadata']
+    df = pd.read_csv(train_meta_path)
+    if config['dataset'].get('include_pseudo', False):
+        pseudo_meta_path = os.path.join(os.path.dirname(train_meta_path), "soundscape_metadata.csv")
+        if os.path.exists(pseudo_meta_path):
+            df_pseudo = pd.read_csv(pseudo_meta_path)
+            df = pd.concat([df, df_pseudo], ignore_index=True)
+    # (Assume synthetic already in df if include_synthetic true)
+    # Create class map
+    if 'label_json' in df.columns:
+        species_set = {sp for js in df['label_json'] for sp in json.loads(js).keys()}
+    else:
+        species_set = set(df['primary_label'].unique())
+        if 'secondary_labels' in df.columns:
+            for sec_list in df['secondary_labels']:
+                if isinstance(sec_list, str):
+                    for sp in sec_list.split():
+                        species_set.add(sp)
+    species_list = sorted(species_set)
+    class_map = {sp: idx for idx, sp in enumerate(species_list)}
+    num_classes = len(class_map)
+    # Train/val split
+    val_frac = config['training'].get('val_fraction', 0.1)
+    df_val = df.sample(frac=val_frac, random_state=42)
+    df_train = df.drop(df_val.index).reset_index(drop=True)
+    df_val = df_val.reset_index(drop=True)
+    # Datasets and loaders
+    train_dataset = BirdClefDataset(df_train, class_map, mel_shape=(128, 256), augment=True)
+    val_dataset = BirdClefDataset(df_val, class_map, mel_shape=(128, 256), augment=False)
+    train_loader = create_dataloader(train_dataset, batch_size=config['training']['batch_size'], shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    saved_checkpoints = []
+    base_seed = config['training'].get('seed', 42)
+    for run in range(1, num_models+1):
+        torch.manual_seed(base_seed + run)
+        np.random.seed(base_seed + run)
+        from torchvision import models
+        model = models.regnet_y_800mf(weights=models.RegNet_Y_800MF_Weights.DEFAULT if pretrained else None)
+        num_feats = model.fc.in_features
+        model.fc = torch.nn.Linear(num_feats, num_classes)
+        model = model.to(device)
+        init_ckpt_base = arch_config.get('init_checkpoint', None)
+        if init_ckpt_base:
+            ckpt_path = f"{init_ckpt_base}_{run}.pth"
+            if os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location=device)
+                model.load_state_dict(ckpt['model_state_dict'])
+                print(f"Loaded initial checkpoint for {model_name} run{run} from {ckpt_path}")
+        run_config = config.copy()
+        run_config['current_arch'] = model_name
+        run_config['current_run'] = run
+        run_config['class_map'] = class_map
+        run_config['paths'] = {'models_dir': os.path.join("models", model_name)}
+        os.makedirs(run_config['paths']['models_dir'], exist_ok=True)
+        best_ckpts = train_model(model, train_loader, val_loader, run_config, device)
+        saved_checkpoints.extend(best_ckpts)
+    print("Training complete. Saved model checkpoints:")
+    for ckpt in saved_checkpoints:
+        print(" -", ckpt)
+
+
+#### src/train_utils.py
+# train_utils.py
+import os
+import yaml
+import math
+import numpy as np
+import pandas as pd
+import librosa
+import cv2
+import torch
+from torch import nn, optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score
+
+# --- Dataset definition ---
 class BirdClefDataset(Dataset):
-    def __init__(self, df, audio_dir, species2idx, mode='train', augment=False, use_vad=True, segment_sec=CFG.TRAIN_WINDOW_SEC):
-        self.df = df.copy().reset_index(drop=True)
-        self.audio_dir = audio_dir
-        self.species2idx = species2idx  # mapping from species id (string) to index
-        self.mode = mode
+    """Dataset for BirdCLEF audio chunks with mel spectrograms and soft labels."""
+    def __init__(self, metadata_df: pd.DataFrame, class_map: dict, 
+                 mel_shape=(128, 640), augment=False):
+        """
+        metadata_df: DataFrame with columns: mel_path (or audio_path), label_json (or labels), weight, etc.
+        class_map: dict mapping species code -> class index.
+        mel_shape: expected shape (mel_bins, time_steps) of spectrogram (before channel expansion).
+        augment: whether to apply data augmentation to mel spectrograms.
+        """
+        self.df = metadata_df.reset_index(drop=True)
+        self.class_map = class_map
+        self.num_classes = len(class_map)
+        self.mel_shape = mel_shape
         self.augment = augment
-        self.use_vad = use_vad
-        self.segment_sec = segment_sec
-        self.sr = CFG.SAMPLE_RATE
-        
+
+        # Pre-extract label vectors and weights for speed
+        self.labels = []
+        self.sample_weights = []
+        for _, row in self.df.iterrows():
+            # If labels are stored as JSON string (e.g., {"sp1":0.7,"sp2":0.3}), parse it
+            if 'label_json' in row and isinstance(row['label_json'], str):
+                label_dict = json.loads(row['label_json'])
+            else:
+                # Otherwise, assume there's a column 'labels' as dict or similar
+                label_dict = row.get('labels', {})
+            # Initialize zero vector and fill in any present species
+            label_vec = np.zeros(self.num_classes, dtype=np.float32)
+            for sp, val in label_dict.items():
+                if sp in self.class_map:  # only use species known in class_map
+                    label_vec[self.class_map[sp]] = float(val)
+            self.labels.append(label_vec)
+            # Sample weight (for loss/sampling) - use 'weight' column if present, else default 1.0
+            w = row.get('weight', 1.0)
+            self.sample_weights.append(float(w))
+        self.labels = np.array(self.labels, dtype=np.float32)
+        self.sample_weights = np.array(self.sample_weights, dtype=np.float32)
+
     def __len__(self):
         return len(self.df)
-    
+
     def __getitem__(self, idx):
+        # Load precomputed mel spectrogram if available, otherwise compute from audio
         row = self.df.iloc[idx]
-        file_path = os.path.join(self.audio_dir, row['filename'])
-        try:
-            audio = load_audio(file_path, sr=self.sr)
-        except Exception as e:
-            logger.error(f"Error loading {file_path}: {e}")
-            audio = np.zeros(int(self.sr * self.segment_sec))
-        if self.use_vad and 'Fabio A. Sarria-S' in str(row.get('author', '')):
-            audio = apply_vad(audio, sr=self.sr)
-        if self.mode == 'train' and self.augment:
-            audio = random_augmentation(audio, sr=self.sr)
-        required_length = int(self.sr * self.segment_sec)
-        if len(audio) < required_length:
-            audio = np.pad(audio, (0, required_length - len(audio)), mode='wrap')
+        # Determine source path
+        if 'mel_path' in row and pd.notna(row['mel_path']):
+            mel_path = row['mel_path']
+            mel = np.load(mel_path)  # expecting shape (mel_bins, time_steps)
         else:
-            audio = audio[:required_length]
-        melspec = compute_mel_spectrogram(audio, sr=self.sr)
-        melspec = resize_spectrogram(melspec, target_size=CFG.TARGET_IMG_SIZE)
-        melspec = np.expand_dims(melspec, axis=0)
-        
-        label = np.zeros(CFG.NUM_CLASSES, dtype=np.float32)
-        if 'label' in row and pd.notnull(row['label']):
-            sp = str(row['label']).strip()
-            if sp in self.species2idx:
-                label[self.species2idx[sp]] = 1.0
+            # Compute mel from audio file path
+            audio_path = row['audio_path'] if 'audio_path' in row else None
+            if audio_path is None or not os.path.exists(audio_path):
+                raise FileNotFoundError(f"No audio or mel file for index {idx}")
+            # Load audio (mono) and compute mel spectrogram
+            y, sr = librosa.load(audio_path, sr=self.sr)  # self.sr could be set from config, e.g., 32000
+            # Pad or truncate to desired chunk duration
+            target_len = int(self.chunk_duration * sr)
+            if len(y) < target_len:
+                # pad with silence (wrap around if needed for cyclic padding)
+                pad_len = target_len - len(y)
+                y = np.concatenate([y, np.zeros(pad_len, dtype=y.dtype)])
             else:
-                logger.error(f"Label {sp} not found in mapping!")
-        elif 'secondary_labels' in row and pd.notnull(row['secondary_labels']):
-            parts = str(row['secondary_labels']).strip("[]").replace("'", "").split(',')
-            for part in parts:
-                sp = part.strip()
-                if not sp:
-                    continue
-                if sp in self.species2idx:
-                    label[self.species2idx[sp]] = 1.0
-                else:
-                    logger.error(f"Secondary label {sp} not found in mapping!")
-        return torch.tensor(melspec, dtype=torch.float32), torch.tensor(label, dtype=torch.float32)
+                y = y[:target_len]
+            # Compute mel spectrogram
+            mel = librosa.feature.melspectrogram(y, sr=sr, n_fft=self.n_fft, hop_length=self.hop_length, 
+                                                n_mels=self.mel_shape[0], fmin=self.fmin, fmax=self.fmax)
+            mel = librosa.power_to_db(mel, ref=np.max)  # convert to log-mel
+            # Normalize mel (if desired), e.g., 0-1 scaling or standardization (not strictly necessary if model can learn scale)
+            # mel = (mel - mel.mean()) / (mel.std() + 1e-6)
+        # Ensure mel shape matches expected, resize if needed
+        if mel.shape != tuple(self.mel_shape):
+            # Resize spectrogram to target shape (e.g., 256x256) using interpolation
+            mel = cv2.resize(mel, (self.mel_shape[1], self.mel_shape[0]))
+        # Data augmentation on mel spectrogram (time/freq masking)
+        if self.augment:
+            mel = self._augment_mel(mel)
+        # Convert to tensor and expand to 3-channel (for CNN input)
+        mel_tensor = torch.from_numpy(mel).float()
+        # Channel-first format for CNN (1 x H x W), then repeat to 3 x H x W to simulate RGB
+        mel_tensor = mel_tensor.unsqueeze(0)  # shape: [1, H, W]
+        mel_tensor = mel_tensor.repeat(3, 1, 1)  # shape: [3, H, W]
+        # Prepare label and weight
+        label_vec = torch.from_numpy(self.labels[idx])
+        sample_w = torch.tensor(self.sample_weights[idx], dtype=torch.float32)
+        return mel_tensor, label_vec, sample_w
 
-# -------------------------------
-# Model Definition
-# -------------------------------
-class BirdCLEFModel(nn.Module):
-    def __init__(self, cfg, num_classes=CFG.NUM_CLASSES, backbone_name='efficientnet_b0', in_channels=1):
-        super(BirdCLEFModel, self).__init__()
-        self.cfg = cfg
-        self.backbone = timm.create_model(backbone_name, pretrained=True, in_chans=in_channels,
-                                          drop_rate=0.0, drop_path_rate=0.0)
-        if hasattr(self.backbone, 'classifier'):
-            backbone_out = self.backbone.classifier.in_features
-            self.backbone.classifier = nn.Identity()
-        elif hasattr(self.backbone, 'fc'):
-            backbone_out = self.backbone.fc.in_features
-            self.backbone.fc = nn.Identity()
-        else:
-            backbone_out = self.backbone.get_classifier().in_features
-            self.backbone.reset_classifier(0, '')
-        self.pooling = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Linear(backbone_out, num_classes)
-        
-    def forward(self, x):
-        feat = self.backbone(x)
-        if len(feat.shape) == 4:
-            feat = self.pooling(feat)
-            feat = feat.view(feat.size(0), -1)
-        logits = self.classifier(feat)
-        return logits
+    def _augment_mel(self, mel):
+        """Apply in-place random time-frequency masking to the mel spectrogram (numpy array)."""
+        H, W = mel.shape
+        # Random frequency mask
+        num_masks = np.random.randint(1, 3)  # e.g., 1 or 2 freq masks
+        for _ in range(num_masks):
+            f0 = np.random.randint(0, H)
+            f_len = np.random.randint(5, H // 8)  # mask up to H/8 mel bins
+            mel[f0:f0+f_len, :] = mel.mean()  # fill with mean or 0
+        # Random time mask
+        num_time_masks = np.random.randint(1, 3)
+        for _ in range(num_time_masks):
+            t0 = np.random.randint(0, W)
+            t_len = np.random.randint(5, W // 8)  # mask up to W/8 time frames
+            mel[:, t0:t0+t_len] = mel.mean()
+        # (Additional augmentation like adding background noise, random shifts, mixup could be included as needed)
+        return mel
 
-# -------------------------------
-# Training & Validation Functions
-# -------------------------------
-def train_one_epoch(model, loader, optimizer, criterion, device=CFG.DEVICE):
-    model.train()
-    losses = []
-    for inputs, targets in tqdm(loader, desc='Training', leave=False):
-        inputs, targets = inputs.to(device), targets.to(device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
-    return np.mean(losses)
-
-def validate_epoch(model, loader, criterion, device=CFG.DEVICE):
-    model.eval()
-    losses = []
-    with torch.no_grad():
-        for inputs, targets in tqdm(loader, desc='Validation', leave=False):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            losses.append(loss.item())
-    return np.mean(losses)
-
-# -------------------------------
-# MAIN: Training Entry Point
-# -------------------------------
-def main():
-    # We only focus on training in this script.
-    logger.info("Loading training CSV...")
-    df_train = pd.read_csv(CFG.TRAIN_CSV)
-    df_train = df_train.drop_duplicates(subset='filename').reset_index(drop=True)
-    
-    # Build species mapping using taxonomy CSV (fallback to submission header if taxonomy not available).
-    try:
-        taxonomy_df = pd.read_csv(CFG.TAXONOMY_CSV)
-        species_ids = taxonomy_df['primary_label'].astype(str).tolist()
-    except Exception as e:
-        logger.error("Error reading taxonomy CSV; falling back to sample submission header.")
-        sample_sub = pd.read_csv(CFG.SUBMISSION_CSV)
-        species_ids = list(sample_sub.columns)[1:]
-    
-    species2idx = {sp: idx for idx, sp in enumerate(species_ids)}
-    CFG.NUM_CLASSES = len(species_ids)
-    logger.info(f"Number of classes (after mapping): {CFG.NUM_CLASSES}")
-    
-    dataset = BirdClefDataset(df_train, CFG.TRAIN_AUDIO_DIR, species2idx, mode='train', augment=True, use_vad=True)
-    loader = DataLoader(dataset, batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=4)
-    
-    device = CFG.DEVICE
-    model = BirdCLEFModel(CFG, backbone_name='efficientnet_b0').to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.LR)
-    criterion = nn.BCEWithLogitsLoss()
-    best_loss = np.inf
-    
-    total_start = time.time()
-    for epoch in range(1, CFG.NUM_EPOCHS + 1):
-        logger.info(f"\nEpoch {epoch}/{CFG.NUM_EPOCHS}")
-        epoch_start = time.time()
-        
-        train_loss = train_one_epoch(model, loader, optimizer, criterion, device=device)
-        logger.info(f"Train Loss: {train_loss:.4f}")
-        
-        val_loss = validate_epoch(model, loader, criterion, device=device)
-        logger.info(f"Validation Loss: {val_loss:.4f}")
-        
-        epoch_duration = time.time() - epoch_start
-        remaining_time = (CFG.NUM_EPOCHS - epoch) * epoch_duration
-        logger.info(f"Epoch duration: {epoch_duration:.2f} sec, Estimated remaining time: {remaining_time/60:.2f} min")
-        
-        if val_loss < best_loss:
-            best_loss = val_loss
-            torch.save({'model_state_dict': model.state_dict()}, 'best_model.pth')
-            logger.info("Saved Best Model.")
-            
-    total_duration = time.time() - total_start
-    logger.info(f"\nTraining completed in {total_duration/60:.2f} minutes.")
-
-if __name__ == '__main__':
-    main()
-
-    """
-
-#──────────────────────────────────────────────────────────────────────────────
-# Utils: dedupe, hashing, save
-#──────────────────────────────────────────────────────────────────────────────
-
-def _md5(fp: Path) -> str:
-    h = hashlib.md5()
-    with fp.open("rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _deduplicate(paths: Sequence[Path]) -> List[Path]:
-    seen, unique = set(), []
-    for p in paths:
-        try:
-            sig = _md5(p)
-        except Exception:
-            unique.append(p)
-            continue
-        if sig not in seen:
-            seen.add(sig)
-            unique.append(p)
-    return unique
-
-
-def _np_save(fp: Path, arr: np.ndarray) -> None:
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    np.save(fp, arr.astype(np.float32), allow_pickle=False)
-
-
-#──────────────────────────────────────────────────────────────────────────────
-# Soft-label builder
-#──────────────────────────────────────────────────────────────────────────────
-
-def _secondary_list(raw) -> List[str]:
-    if isinstance(raw, str) and raw:
-        return [s for s in raw.split(";") if s]
-    return []
-
-
-def build_soft_label(
-    primary: str,
-    secondary: str,
-    bench_model: Optional[torch.nn.Module] = None,
-    wav: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
-    label = defaultdict(float)
-    rem = 1.0 - LABEL_W_BENCH
-    if secondaries:
-        share = (rem - LABEL_W_PRIMARY) / len(secondaries)
-        for s in secondaries:
-            label[s] += share
-        label[primary] += LABEL_W_PRIMARY
+# --- Sampler and DataLoader utility ---
+def create_dataloader(dataset: BirdClefDataset, batch_size: int, shuffle: bool = False) -> DataLoader:
+    """Create DataLoader for the given dataset, using weighted sampling if sample weights are provided."""
+    if hasattr(dataset, 'sample_weights') and dataset.sample_weights is not None:
+        # Use WeightedRandomSampler to sample each batch according to sample_weights
+        sampler = WeightedRandomSampler(weights=dataset.sample_weights, num_samples=len(dataset), replacement=True)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler, 
+                          num_workers=0 if os.name == 'nt' else 4, pin_memory=True)
     else:
-        label[primary] += rem
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, 
+                          num_workers=0 if os.name == 'nt' else 4, pin_memory=True)
 
-    if bench_model and wav is not None:
-        mel = compute_mel(wav)
-        x = torch.from_numpy(mel).unsqueeze(0).unsqueeze(0)
+# --- Training loop with validation ---
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, 
+                config: dict, device: torch.device):
+    """
+    Train the model for the specified number of epochs, evaluate on validation set, 
+    and save checkpoints for top-3 validation scores.
+    """
+    epochs = config['training']['epochs']
+    lr = config['optimizer']['lr']
+    weight_decay = config['optimizer'].get('weight_decay', 0.0)
+    optimizer_type = config['optimizer'].get('type', 'Adam')
+    scheduler_cfg = config.get('scheduler', None)
+    # Initialize optimizer (AdamW by default for better regularization)
+    if optimizer_type.lower() == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Initialize LR scheduler if specified
+    scheduler = None
+    if scheduler_cfg:
+        if scheduler_cfg['type'] == 'CosineAnnealingLR':
+            t_max = scheduler_cfg.get('T_max', epochs)
+            eta_min = scheduler_cfg.get('eta_min', 1e-6)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+        elif scheduler_cfg['type'] == 'StepLR':
+            step_size = scheduler_cfg.get('step_size', 5)
+            gamma = scheduler_cfg.get('gamma', 0.1)
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+        # (Add other schedulers as needed)
+    # Loss function: binary cross-entropy with logits (for multi-label classification)
+    criterion = nn.BCEWithLogitsLoss(reduction='none')  # we'll handle reduction manually for weighting
+    best_scores = []  # keep track of top validation scores (for model saving)
+    best_checkpoints = []  # store corresponding state dicts or file paths
+
+    for epoch in range(1, epochs+1):
+        model.train()
+        running_loss = 0.0
+        for batch in train_loader:
+            inputs, targets, sample_w = batch
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            sample_w = sample_w.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            # Forward pass
+            logits = model(inputs)
+            # Compute BCE loss per sample (and per class), then weight each sample's loss
+            # criterion returns shape [batch, num_classes] since reduction='none'
+            loss_matrix = criterion(logits, targets)
+            # Average loss over classes for each sample, then apply sample weight
+            # (target may be multi-label soft, but BCE is applied elementwise)
+            loss_per_sample = loss_matrix.mean(dim=1)  # mean over classes
+            weighted_loss = (loss_per_sample * sample_w)
+            loss = weighted_loss.mean()  # average over batch
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
+        if scheduler:
+            scheduler.step()
+        avg_train_loss = running_loss / len(train_loader.dataset)
+
+        # Validation phase at epoch end
+        model.eval()
+        all_preds = []
+        all_targets = []
         with torch.no_grad():
-            logits = bench_model(x)
-            probs = torch.sigmoid(logits)[0].cpu().numpy()
-        for i, p in enumerate(probs):
-            if p > 0:
-                label[ALL_CLASSES[i]] += LABEL_W_BENCH * p
+            for batch in val_loader:
+                inputs, targets, _ = batch  # no sample weight needed for evaluation
+                inputs = inputs.to(device)
+                targets = targets.to(device)
+                logits = model(inputs)
+                preds = torch.sigmoid(logits)  # convert to probabilities
+                all_preds.append(preds.cpu().numpy())
+                all_targets.append(targets.cpu().numpy())
+        all_preds = np.vstack(all_preds)
+        all_targets = np.vstack(all_targets)
+        # Compute validation score (macro-AUC skipping classes with no positives)
+        val_score = macro_auc_score(all_targets, all_preds)
+        # (Optionally compute other metrics like macro-precision for monitoring)
+        val_precision = macro_precision_score(all_targets, all_preds, threshold=0.5)
+        print(f"Epoch {epoch}/{epochs} - Train Loss: {avg_train_loss:.4f} - Val AUC: {val_score:.4f} - Val Prec@0.5: {val_precision:.4f}")
 
-    total = sum(label.values()) or 1.0
-    return {k: v / total for k, v in label.items()}
-
-
-#──────────────────────────────────────────────────────────────────────────────
-# Train-audio processing
-#──────────────────────────────────────────────────────────────────────────────
-
-def _process_recordings() -> None:
-    log = logging.getLogger()
-    log.info("Processing labeled recordings…")
-
-    df = pd.read_csv(CFG.TRAIN_CSV)
-    if CFG.MIN_RATING > 0 and "rating" in df:
-        df = df[df["rating"] >= CFG.MIN_RATING]
-
-    recs = []
-    for r in df.itertuples(index=False):
-        fp = CFG.TRAIN_AUDIO_DIR / r.filename
-        if not fp.exists():
-            log.warning("Missing %s", fp)
-            continue
-        rec = r._asdict()
-        rec["filepath"] = fp
-        recs.append(rec)
-    df = pd.DataFrame(recs)
-    if df.empty:
-        log.warning("No recordings found – aborting train stage")
-        return
-
-    df = df[df["filepath"].isin(_deduplicate(df["filepath"].tolist()))].reset_index(drop=True)
-    df["noise_score"] = [compute_noise_metric(load_audio(fp)) for fp in df["filepath"]]
-    ratio = CFG.FOLD0_RATIO
-    if 0 < ratio < 1.0:
-        thresh = np.quantile(df["noise_score"], ratio)
-        df = df[df["noise_score"] <= thresh].reset_index(drop=True)
-        log.info("Selected %d clean recordings (%.0f%%)", len(df), 100 * ratio)
-
-    bench = _load_benchmark()
-    if bench:
-        log.info("Benchmark model loaded for smoothing and swap logic.")
-    vad_model, vad_ts = load_vad()
-
-    mel_root = CFG.PROCESSED_DIR / "mels" / "train"
-    lbl_root = CFG.PROCESSED_DIR / "labels" / "train"
-
-    rows = []
-    for rec in df.itertuples(index=False):
-        y = load_audio(rec.filepath)
-        y = trim_silence(y)
-        y = remove_speech(y, vad_model, vad_ts)
-        if np.sqrt((y**2).mean()) < CFG.RMS_THRESHOLD:
-            continue
-
-        segments = list(segment_audio(y))
-        secondaries = _secondary_list(getattr(rec, "secondary_labels", ""))
-        primary_lbl = rec.primary_label
-
-        if bench:
-            mel_full = compute_mel(y)
-            x_full = torch.from_numpy(mel_full).unsqueeze(0).unsqueeze(0)
-            with torch.no_grad():
-                logits_full = bench(x_full)
-                probs_full = torch.sigmoid(logits_full)[0].cpu().numpy()
-            top_lbl = ALL_CLASSES[int(probs_full.argmax())]
-            if top_lbl != primary_lbl:
-                if top_lbl in secondaries:
-                    log.info("Swapping primary %s -> %s", primary_lbl, top_lbl)
-                    primary_lbl = top_lbl
-                else:
-                    continue
-
-        for start_sec, chunk in segments:
-            L = CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE
-            if len(chunk) < L:
-                chunk = np.pad(chunk, (0, L - len(chunk)), mode="wrap")
-            mel_chunk = compute_mel(chunk)
-            soft = build_soft_label(primary_lbl, secondaries, bench, chunk)
-
-            stem = f"{rec.filepath.stem}_{int(start_sec)}s"
-            species_str = str(primary_lbl)
-            mp = mel_root / species_str / f"{stem}.npy"
-            lp = lbl_root / species_str / f"{stern}.label.npy"
-            _np_save(mp, mel_chunk)
-            vec = np.array([soft.get(c, 0.0) for c in ALL_CLASSES], dtype=np.float32)
-            _np_save(lp, vec)
-
-            rows.append({
-                "mel_path": str(mp.relative_to(CFG.PROCESSED_DIR)),
-                "label_path": str(lp.relative_to(CFG.PROCESSED_DIR)),
-                "label_json": json.dumps(soft, separators=(",",":")),
-                "duration": CFG.TRAIN_CHUNK_SEC,
-                "noise_score": rec.noise_score,
-                "weight": 1.0,
-            })
-
-    out_csv = CFG.PROCESSED_DIR / "train_metadata.csv"
-    pd.DataFrame(rows).to_csv(out_csv, index=False)
-    log.info("Saved %d mel chunks -> %s", len(rows), out_csv.name)
-
-
-#──────────────────────────────────────────────────────────────────────────────
-# Soundscape pseudo-labelling
-#──────────────────────────────────────────────────────────────────────────────
-def _process_soundscapes() -> None:
-    log = logging.getLogger()
-    if not CFG.TRAIN_SOUNDSCAPE_DIR.exists():
-        log.info("No soundscape directory – skipping pseudo-labelling stage")
-        return
-
-    bench = _load_benchmark()
-    if bench is None:
-        log.warning("Benchmark unavailable – using uniform pseudo-labels")
-
-    vad_model, vad_ts = load_vad()
-    mel_root = CFG.PROCESSED_DIR / "mels" / "soundscape"
-    lbl_root = CFG.PROCESSED_DIR / "labels" / "soundscape"
-
-    rows = []
-    for fp in sorted(CFG.TRAIN_SOUNDSCAPE_DIR.glob("*.ogg")):
-        y = load_audio(fp)
-        y = trim_silence(y)
-        y = remove_speech(y, vad_model, vad_ts)
-
-        for start_sec, seg in segment_audio(y):
-            L = CFG.TRAIN_CHUNK_SEC * CFG.SAMPLE_RATE
-            if len(seg) < L:
-                seg = np.pad(seg, (0, L - len(seg)), mode="wrap")
-            mel_seg = compute_mel(seg)
-            if bench:
-                x = torch.from_numpy(mel_seg).unsqueeze(0).unsqueeze(0)
-                with torch.no_grad():
-                    probs = torch.sigmoid(bench(x))[0].cpu().numpy()
+        # Save checkpoint if among top-3
+        save_path = None
+        if len(best_scores) < 3 or val_score > min(best_scores):
+            # Save model state dict
+            os.makedirs(config['paths']['models_dir'], exist_ok=True)
+            arch_name = config['current_arch']  # set by training script
+            run_id = config.get('current_run', 1)
+            # Determine checkpoint file name
+            ckpt_name = f"{arch_name}_run{run_id}_epoch{epoch}.pth"
+            save_path = os.path.join(config['paths']['models_dir'], ckpt_name)
+            torch.save({'model_state_dict': model.state_dict(), 
+                        'species2idx': config['class_map']}, save_path)
+            # Update best scores list
+            if len(best_scores) < 3:
+                best_scores.append(val_score)
+                best_checkpoints.append(save_path)
             else:
-                probs = np.ones(len(ALL_CLASSES), dtype=np.float32)
+                # replace worst of the top-3
+                min_idx = np.argmin(best_scores)
+                # Remove old worst checkpoint file if exists
+                old_ckpt = best_checkpoints[min_idx]
+                try:
+                    os.remove(old_ckpt)
+                except FileNotFoundError:
+                    pass
+                best_scores[min_idx] = val_score
+                best_checkpoints[min_idx] = save_path
+            print(f"Saved checkpoint: {save_path}")
+    # End of training epochs
+    # Return paths of best checkpoints
+    # (Sorting by score so that best_scores[0] is highest)
+    sorted_indices = np.argsort(best_scores)[::-1]
+    best_checkpoints = [best_checkpoints[i] for i in sorted_indices]
+    return best_checkpoints
 
-            if float(probs.max()) < CFG.PSEUDO_THRESHOLD:
-                continue
-
-            stem = f"{fp.stem}_{int(start_sec)}s"
-            mp = mel_root / f"{stem}.npy"
-            lp = lbl_root / f"{stem}.label.npy"
-            _np_save(mp, mel_seg)
-            _np_save(lp, probs)
-
-            soft = {ALL_CLASSES[i]: float(v) for i, v in enumerate(probs) if v > 0}
-            rows.append({
-                "mel_path": str(mp.relative_to(CFG.PROCESSED_DIR)),
-                "label_path": str(lp.relative_to(CFG.PROCESSED_DIR)),
-                "label_json": json.dumps(soft, separators=(",",":")),
-                "duration": CFG.TRAIN_CHUNK_SEC,
-                "noise_score": compute_noise_metric(seg),
-                "weight": PSEUDO_WEIGHT,
-            })
-
-    if rows:
-        out_csv = CFG.PROCESSED_DIR / "soundscape_metadata.csv"
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
-        log.info("Saved %d pseudo-labelled chunks -> %s", len(rows), out_csv.name)
-
-
-#──────────────────────────────────────────────────────────────────────────────
-# Rare-species weighting
-#──────────────────────────────────────────────────────────────────────────────
-def _apply_rare_weighting() -> None:
-    files = [
-        CFG.PROCESSED_DIR / "train_metadata.csv",
-        CFG.PROCESSED_DIR / "soundscape_metadata.csv",
-    ]
-    dfs = [pd.read_csv(f) for f in files if f.exists()]
-    if not dfs:
-        return
-    all_df = pd.concat(dfs, ignore_index=True)
-    counts = Counter(
-        max(json.loads(js), key=json.loads(js).get)
-        for js in all_df["label_json"]
-    )
-    rare_species = {s for s, c in counts.items() if c < RARE_COUNT_THRESHOLD}
-
-    for f in files:
-        if not f.exists():
+# --- Evaluation metrics in training context (using functions from metrics.py, defined later) ---
+def macro_auc_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute macro-averaged ROC-AUC, skipping classes with no positive true labels."""
+    num_classes = y_true.shape[1]
+    aucs = []
+    for i in range(num_classes):
+        # Only compute AUC if class has at least one positive in ground truth
+        if np.sum(y_true[:, i]) == 0:
             continue
-        df = pd.read_csv(f)
-        df["weight"] = [
-            CFG.RARE_WEIGHT if max(json.loads(js), key=json.loads(js).get) in rare_species else 1.0
-            for js in df["label_json"]
-        ]
-        df.to_csv(f, index=False)
-    logging.getLogger().info(
-        "Applied rare-species weighting (x%.1f) to %d species",
-        CFG.RARE_WEIGHT,
-        len(rare_species),
-    )
+        try:
+            auc = roc_auc_score(y_true[:, i], y_pred[:, i])
+            aucs.append(auc)
+        except ValueError:
+            # This class might have all negatives in truth or constant predictions; skip it
+            continue
+    if len(aucs) == 0:
+        return 0.0
+    return float(np.mean(aucs))
+
+def macro_precision_score(y_true: np.ndarray, y_pred: np.ndarray, threshold: float = 0.5) -> float:
+    """Compute macro-averaged precision at the given threshold."""
+    num_classes = y_true.shape[1]
+    precisions = []
+    for i in range(num_classes):
+        # Skip classes with no positive predictions and no positives in truth
+        pred_positive = y_pred[:, i] >= threshold
+        true_positive = y_true[:, i] == 1
+        if pred_positive.sum() == 0:
+            # If model predicts none for this class:
+            if true_positive.sum() == 0:
+                continue  # no instances of this class at all
+            else:
+                precisions.append(0.0)
+                continue
+        precision_i = np.sum(true_positive & pred_positive) / pred_positive.sum()
+        precisions.append(precision_i)
+    if len(precisions) == 0:
+        return 0.0
+    return float(np.mean(precisions))
 
 
-#──────────────────────────────────────────────────────────────────────────────
-# Entrypoint with file logging
-#──────────────────────────────────────────────────────────────────────────────
-def main() -> None:
-    p = argparse.ArgumentParser(description="Preprocess BirdCLEF 2025 audio")
-    p.add_argument(
-        "--verbose", action="store_true", help="debug logging"
-    )
-    args = p.parse_args()
-    lvl = logging.DEBUG if args.verbose else logging.INFO
-
-    # Ensure processed directory exists (for data and logs)
-    CFG.PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Configure logging to console and file
-    log_file = CFG.PROCESSED_DIR / "process.log"
-    handlers = [logging.StreamHandler(), logging.FileHandler(log_file, mode='a', encoding='utf-8')]
-    logging.basicConfig(
-        level=lvl,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=handlers,
-    )
-
-    seed_everything(CFG.SEED)
-    logging.getLogger().info("Starting preprocessing; logs writing to %s", log_file)
-
-    _process_recordings()
-    _process_soundscapes()
-    _apply_rare_weighting()
-
-    logging.getLogger().info("✅ Preprocessing finished – data saved to %s", CFG.PROCESSED_DIR)
-
-if __name__ == "__main__":
-    main()
-
-
-#### regnety.py
-#!/usr/bin/env python
+#### src/utils.py
+#!/usr/bin/env python3
 """
-regnety.py – BirdCLEF 2025 trainer (fixed)
-========================================
-Trains **CFG.REG_NUM_MODELS** class‑conditional RegNetY‑0.8GF models on the
-pre‑processed mel‑spectrogram chunks.  This revision fixes the CSV‑loading
-bugs flagged in the review:
-
-* **Uses `pd.read_csv` / `pd.concat`** instead of the erroneous
-  `Path.read_csv()` call.
-* Adds the missing **`import pandas as pd`** statement.
-* Keeps all earlier improvements (model‑name guard, CUDA pin‑memory toggle,
-  checkpoint arch string, seed offset, CLI alias, etc.).
+utils.py – Shared utility functions for the BirdCLEF 2025 pipeline.
+Includes:
+- Taxonomy loading and class mapping,
+- Label vector creation for multi-label and pseudo-label samples,
+- Chunk ID hashing for unique file naming,
+- Mel spectrogram resizing.
 """
-from __future__ import annotations
-
-import argparse
-import json
-import logging
-from pathlib import Path
-from typing import Dict, List
-
-import pandas as pd  # <‑‑‑ FIXED: explicit pandas import
-import torch
-import torch.nn.functional as F
-import timm
-from torch import optim
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
-
-from configure import CFG
-from data_utils import FileWiseSampler, MelDataset, seed_everything
-
-# ────────────────────────────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────────────────────────────
-
-def _get_model_name() -> str:
-    for name in ("regnety_008", "regnety_008gf"):
-        if name in timm.list_models():
-            return name
-    raise RuntimeError("RegNetY‑0.8GF backbone missing in timm build.")
-
-
-def _soft_ce(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    if targets.dtype == torch.long:
-        return F.cross_entropy(logits, targets, reduction="none")
-    return -(targets * torch.log_softmax(logits, dim=1)).sum(1)
-
-
-def _logger() -> logging.Logger:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
-    return logging.getLogger("regnety")
-
-# ────────────────────────────────────────────────────────────────────────
-# Trainer
-# ────────────────────────────────────────────────────────────────────────
-
-class _Trainer:
-    def __init__(self, rid: int, n_cls: int, arch: str, log: logging.Logger):
-        self.rid, self.log = rid, log
-        self.device = torch.device("cuda" if CFG.use_cuda() else "cpu")
-        self.model = timm.create_model(arch, pretrained=True, in_chans=1,
-                                       num_classes=n_cls).to(self.device)
-        self.opt = optim.AdamW(self.model.parameters(), lr=CFG.REG_LR,
-                               weight_decay=CFG.REG_WEIGHT_DECAY)
-        self.sched = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=CFG.REG_EPOCHS)
-        self.scaler = GradScaler(enabled=CFG.use_cuda())
-
-    def _step(self, batch):
-        x, y, w = (t.to(self.device, non_blocking=True) for t in batch)
-        self.opt.zero_grad(set_to_none=True)
-        with autocast(enabled=CFG.use_cuda()):
-            loss = (_soft_ce(self.model(x), y) * w).mean()
-        self.scaler.scale(loss).backward(); self.scaler.step(self.opt); self.scaler.update()
-        return float(loss.detach())
-
-    def fit(self, loader: DataLoader):
-        for ep in range(1, CFG.REG_EPOCHS + 1):
-            self.model.train(); run = 0.0
-            for batch in loader:
-                run += self._step(batch) * batch[0].size(0)
-            self.sched.step()
-            self.log.info("run=%d ep=%d/%d loss=%.5f lr=%.2e", self.rid, ep,
-                          CFG.REG_EPOCHS, run / len(loader.dataset), self.sched.get_last_lr()[0])
-
-    def save(self, out: Path, arch: str, s2i: Dict[str, int]):
-        out.mkdir(parents=True, exist_ok=True)
-        torch.save({"arch": arch, "model": self.model.state_dict(), "species2idx": s2i},
-                   out / f"{arch}_run{self.rid}.pth")
-        self.log.info("✔ saved checkpoint run%d", self.rid)
-
-# ────────────────────────────────────────────────────────────────────────
-# Data helpers
-# ────────────────────────────────────────────────────────────────────────
-
-def _load_meta() -> pd.DataFrame:  # <‑‑‑ FIXED: correct pandas usage
-    df = pd.read_csv(CFG.PROCESSED_DIR / "train_metadata.csv")
-    sc = CFG.PROCESSED_DIR / "soundscape_metadata.csv"
-    if sc.exists():
-        df = pd.concat([df, pd.read_csv(sc)], ignore_index=True)
-    return df
-
-# ────────────────────────────────────────────────────────────────────────
-# Main
-# ────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    cli = argparse.ArgumentParser(description="Train RegNetY‑0.8GF ensemble")
-    cli.add_argument("--device", choices=["auto", "cpu", "gpu", "cuda"], default="auto")
-    args = cli.parse_args()
-    if args.device != "auto":
-        CFG.DEVICE = args.device  # type: ignore[attr-defined]
-
-    seed_everything(CFG.SEED)
-    log = _logger()
-    log.info("Device: %s", CFG.DEVICE)
-
-    df = _load_meta()
-    if df.empty:
-        log.error("No metadata – run process.py first."); return
-
-    cls_set = {k for js in df["label_json"] for k in json.loads(js)}
-    classes = sorted(cls_set); s2i = {s: i for i, s in enumerate(classes)}
-    log.info("Classes: %d", len(classes))
-
-    data = MelDataset(df, s2i, augment=True)
-    df["_src"] = df["mel_path"].str.extract(r"([^/]+)_\d+s.npy$", expand=False)
-    loader = DataLoader(data, batch_size=CFG.REG_BATCH_SIZE,
-                        sampler=FileWiseSampler(df, "_src"),
-                        num_workers=CFG.REG_NUM_WORKERS,
-                        pin_memory=CFG.use_cuda(), drop_last=True)
-
-    arch = _get_model_name()
-    for run in range(1, CFG.REG_NUM_MODELS + 1):
-        seed_everything(CFG.SEED + 1000 + run)
-        t = _Trainer(run, len(classes), arch, log); t.fit(loader); t.save(CFG.REG_MODEL_DIR, arch, s2i)
-        del t; torch.cuda.empty_cache()
-
-    log.info("🏁 Finished – checkpoints in %s", CFG.REG_MODEL_DIR)
-
-
-if __name__ == "__main__":
-    main()
-
-
-#### test/test_datautils.py
-import sys
-from pathlib import Path
-import json
-import random
+import ast
+import hashlib
 import numpy as np
-import torch
-import pandas as pd
-import pytest
-
-# ensure project root is importable
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import configure
-import data_utils as du
-
-@pytest.fixture(autouse=True)
-def deterministic_seed():
-    # Ensure reproducible randomness
-    du.seed_everything(123)
-    return None
-
-def test_seed_everything():
-    # Test that random, numpy, and torch seeds are consistent
-    du.seed_everything(42)
-    a = random.random()
-    b = np.random.rand()
-    c = torch.rand(1).item()
-
-    du.seed_everything(42)
-    assert random.random() == pytest.approx(a)
-    assert np.random.rand() == pytest.approx(b)
-    assert torch.rand(1).item() == pytest.approx(c)
-
-def test_compute_noise_metric():
-    # Create a known array
-    y = np.array([1.0, -1.0, 2.0], dtype=np.float32)
-    # compute std, var, rms, sum
-    expected = float(y.std() + y.var() + np.sqrt((y**2).mean()) + (y**2).sum())
-    assert du.compute_noise_metric(y) == pytest.approx(expected)
-
-def test_spec_augment_and_cutmix():
-    # Create dummy mel array
-    mel = np.ones((10, 20), dtype=np.float32)
-    # Spec augment should maintain shape
-    mel_aug = du.spec_augment(mel, freq_mask_param=2, time_mask_param=3, num_masks=1)
-    assert mel_aug.shape == mel.shape
-    # At least some zeros appear in augmented mel
-    assert np.any(mel_aug == 0.0)
-
-    # Test cutmix merges two arrays
-    m1 = np.ones((5, 10), dtype=np.float32)
-    l1 = torch.tensor([1.0, 0.0])
-    m2 = np.zeros((5, 10), dtype=np.float32)
-    l2 = torch.tensor([0.5, 0.5])
-    mixed, label = du.cutmix(m1, l1, m2, l2)
-    assert mixed.shape == m1.shape
-    assert isinstance(label, torch.Tensor)
-
-def test_segment_audio():
-    # Create an array of length 2 seconds at 10 Hz sample
-    sr = 10
-    y = np.arange(sr * 2).astype(np.float32)
-    # override CFG for chunk/hop secs
-    configure.CFG.TRAIN_CHUNK_SEC = 1
-    configure.CFG.TRAIN_CHUNK_HOP_SEC = 1
-    configure.CFG.SAMPLE_RATE = sr
-    segments = list(du.segment_audio(y, sr=sr))
-    assert len(segments) == 2
-    for start_sec, chunk in segments:
-        assert len(chunk) == sr * 1
-
-def test_load_and_trim_audio(monkeypatch):
-    # Stub librosa.load and trim functions
-    called = {}
-
-    def fake_load(fp, sr, mono=True):
-        called['load'] = (fp, sr, mono)
-        return np.array([0.1, -0.1], dtype=np.float32), sr
-    monkeypatch.setattr(du.librosa, 'load', fake_load)
-
-    def fake_trim(y, top_db):
-        called['trim'] = (y.tolist(), top_db)
-        return y[:1], (0,)
-    monkeypatch.setattr(du.librosa.effects, 'trim', fake_trim)
-
-    y = du.load_audio('dummy.wav', sample_rate=16000)
-    assert isinstance(y, np.ndarray)
-    y_trim = du.trim_silence(y)
-    assert isinstance(y_trim, np.ndarray)
-    assert 'load' in called and 'trim' in called
-
-def test_compute_mel_cpu(monkeypatch):
-    # Stub librosa.feature and power_to_db
-    mel_out = np.ones((4, 5), dtype=np.float32)
-    monkeypatch.setattr(du.librosa.feature, 'melspectrogram', lambda **kw: mel_out)
-    monkeypatch.setattr(du.librosa, 'power_to_db', lambda m, ref: m)
-    # Override CFG params
-    configure.CFG.SAMPLE_RATE = 16000
-    configure.CFG.HOP_LENGTH = 128
-    configure.CFG.N_FFT = 512
-    configure.CFG.N_MELS = 4
-    configure.CFG.FMIN = 0
-    configure.CFG.FMAX = 8000
-    configure.CFG.POWER = 2.0
-    y = np.random.randn(100).astype(np.float32)
-    mel = du.compute_mel(y, to_db=True)
-    assert np.allclose(mel, mel_out)
-
-def test_FileWiseSampler():
-    df = pd.DataFrame({'filepath': ['a.wav', 'a.wav', 'b.wav']})
-    sampler = du.FileWiseSampler(df, 'filepath')
-    indices = list(iter(sampler))
-    assert len(indices) == 2
-    assert set(indices).issubset({0, 1, 2})
-
-def test_MelDataset(monkeypatch, tmp_path):
-    # Prepare fake processed directory
-    processed = tmp_path / 'processed'
-    processed.mkdir()
-    # Create dummy mel and label files
-    mel_dir = processed / 'mels' / 'train' / 'sp'
-    label_dir = processed / 'labels' / 'train' / 'sp'
-    mel_dir.mkdir(parents=True)
-    label_dir.mkdir(parents=True)
-    mel_arr = np.ones((2, 2), dtype=np.float32)
-    np.save(mel_dir / 'p1.npy', mel_arr)
-    label_vec = np.array([1.0], dtype=np.float32)
-    np.save(label_dir / 'p1.label.npy', label_vec)
-
-    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed)
-    monkeypatch.setattr(configure.CFG, 'TARGET_SHAPE', (2, 2))
-    configure.CFG.USE_SOFT_LABELS = True
-
-    # cv2.resize identity stub
-    monkeypatch.setattr(du.cv2, 'resize', lambda img, shape, interpolation: img)
-
-    df = pd.DataFrame({
-        'mel_path': ['mels/train/sp/p1.npy'],
-        'label_path': ['labels/train/sp/p1.label.npy'],
-    })
-    ds = du.MelDataset(df, {'sp': 0}, augment=False)
-    mel_tensor, label, weight = ds[0]
-    assert isinstance(mel_tensor, torch.Tensor)
-    assert mel_tensor.shape[1:] == mel_arr.shape
-    assert isinstance(label, torch.Tensor)
-    assert weight == 1.0
-
-
-#### test/test_diffwave.py
-import sys
-from pathlib import Path
-import pytest
-import numpy as np
-import torch
+from PIL import Image
 import pandas as pd
 
-# Ensure project root is on path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import configure
-import diffwave
+def load_taxonomy(taxonomy_csv_path: str, train_csv_path: str):
+    """
+    Load species list and mapping from taxonomy or train data.
+    Returns (class_list, class_map) where class_list is a list of species codes and 
+    class_map is a dict mapping species code to index.
+    """
+    class_list = []
+    if taxonomy_csv_path and pd.io.common.file_exists(taxonomy_csv_path):
+        # If a taxonomy CSV is provided, use it to get the list of classes (species)
+        tax_df = pd.read_csv(taxonomy_csv_path)
+        # Assume there's a column with species code (could be 'ebird_code' or 'species_code' or similar)
+        for col in ["ebird_code", "species_code", "primary_label"]:
+            if col in tax_df.columns:
+                class_list = list(pd.unique(tax_df[col]))
+                break
+    if not class_list:
+        # Fallback: derive class list from training data
+        train_df = pd.read_csv(train_csv_path)
+        class_list = sorted(pd.unique(train_df["primary_label"]))
+    # Ensure consistent ordering
+    class_list = sorted(class_list)
+    class_map = {species: idx for idx, species in enumerate(class_list)}
+    return class_list, class_map
 
+def create_label_vector(primary_label: str, secondary_labels: list, class_map: dict,
+                        primary_weight: float = 0.7, secondary_weight: float = 0.3,
+                        use_soft: bool = True) -> np.ndarray:
+    """
+    Create a label vector for a training chunk.
+    - If use_soft is True and secondary_labels is non-empty, assign primary_label a weight (primary_weight)
+      and distribute secondary_weight among secondary_labels (evenly if multiple).
+    - If use_soft is False or there are no secondary labels, returns a one-hot vector for primary and any secondaries (multi-hot if multiple and not soft).
+    """
+    num_classes = len(class_map)
+    label_vec = np.zeros(num_classes, dtype=np.float32)
+    if not secondary_labels or not use_soft:
+        # No secondaries or we want hard labels
+        # Mark primary as 1
+        if primary_label in class_map:
+            label_vec[class_map[primary_label]] = 1.0
+        # If there are secondary labels but no soft labeling, mark them as well (multi-hot)
+        if secondary_labels and not use_soft:
+            for sec in secondary_labels:
+                if sec in class_map:
+                    label_vec[class_map[sec]] = 1.0
+    else:
+        # Soft label distribution: primary and secondaries
+        if primary_label in class_map:
+            label_vec[class_map[primary_label]] = primary_weight
+        if secondary_labels:
+            # distribute secondary_weight among all secondary labels
+            share = secondary_weight
+            sec_count = len(secondary_labels)
+            if sec_count > 0:
+                per_sec = share / sec_count
+            else:
+                per_sec = 0.0
+            for sec in secondary_labels:
+                if sec in class_map:
+                    label_vec[class_map[sec]] = per_sec
+    return label_vec
 
-@pytest.fixture(autouse=True)
-def setup_diffwave_env(tmp_path, monkeypatch):
-    # Create test root and data directories
-    root = tmp_path / 'test'
-    root.mkdir()
+def hash_chunk_id(filename: str, start_sec: float) -> str:
+    """
+    Generate a unique hash ID for a chunk given the source filename and start time.
+    """
+    base = f"{filename}_{start_sec:.3f}"
+    # Use a short hash for uniqueness
+    h = hashlib.sha1(base.encode('utf-8')).hexdigest()
+    return h[:8]  # use first 8 hex digits for brevity
 
-    # Raw audio structure
-    data_dir = root / 'data'
-    audio_dir = data_dir / 'train_audio' / '41970'
-    audio_dir.mkdir(parents=True)
-    # Create placeholder audio file
-    (audio_dir / 'iNat327629.ogg').write_bytes(b'')
-
-    # Create train.csv for plan
-    train_csv = data_dir / 'train.csv'
-    train_csv.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([
-        {'primary_label': '41970', 'filename': 'iNat327629.ogg'}
-    ]).to_csv(train_csv, index=False)
-
-    # Monkey-patch CFG to point at our dirs
-    monkeypatch.setattr(configure.CFG, 'TRAIN_AUDIO_DIR', data_dir / 'train_audio')
-    monkeypatch.setattr(configure.CFG, 'TRAIN_CSV', train_csv)
-    processed_dir = root / 'processed'
-    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed_dir)
-    processed_dir.mkdir()
-
-    # Create dummy mel-spectrograms under processed_dir/mels/train/41970/*
-    mel_dir = processed_dir / 'mels' / 'train' / '41970'
-    mel_dir.mkdir(parents=True, exist_ok=True)
-    dummy_mel = np.random.rand(configure.CFG.N_MELS, 10).astype(np.float32)
-    np.save(mel_dir / 'chunk0.npy', dummy_mel)
-
-    # Stub out the actual DiffWaveVocoder so we don't need real model
-    class DummyVocoder:
-        @classmethod
-        def from_hparams(cls, *args, **kwargs):
-            return cls()
-        def decode_spectrogram(self, mel_tensor, hop_length, fast_sampling, fast_sampling_noise_schedule):
-            # Return a silent waveform whose length matches frames*hop_length
-            frames = mel_tensor.shape[-1]
-            length = frames * hop_length
-            return torch.zeros((1, length), dtype=torch.float32)
-
-    monkeypatch.setattr(diffwave, 'DiffWaveVocoder', DummyVocoder)
-
-    return {
-        'audio_dir': audio_dir,
-        'train_csv': train_csv
-    }
-
-
-def test_diffwave_generate_and_patch(setup_diffwave_env, monkeypatch):
-    ctx = setup_diffwave_env
-
-    # Simulate CLI invocation
-    monkeypatch.setattr(sys, 'argv', ['diffwave.py', 'generate'])
-    diffwave.main()
-
-    # Expect exactly one synthetic file in the species directory
-    out_file = ctx['audio_dir'] / 'synthetic_000.ogg'
-    assert out_file.exists(), f"Expected synthetic file at {out_file}"
-
-    # Check that train.csv has been patched with the new entry
-    df = pd.read_csv(ctx['train_csv'])
-    entries = set(zip(df['primary_label'], df['filename']))
-    assert ('41970', 'synthetic_000.ogg') in entries, \
-        "New synthetic entry not found in train.csv"
-
-
-#### test/test_process.py
-import sys
-import logging
-import shutil
-from pathlib import Path
-
-import pytest
-import pandas as pd
-
-import configure
-import process
-
-# Ensure project root is on sys.path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-@pytest.fixture(autouse=True)
-def setup_test_env(tmp_path, monkeypatch):
-    # Setup temporary data roots
-    root = tmp_path / "test"
-    data_dir = root / "data"
-    audio_dir = data_dir / "train_audio" / "41970"
-    soundscape_dir = data_dir / "train_soundscapes"
-    audio_dir.mkdir(parents=True)
-    soundscape_dir.mkdir(parents=True)
-
-    # Copy sample .ogg files from dataset
-    src_audio = Path("/data/birdclef/train_audio/41970/iNat327629.ogg")
-    src_sc = Path("/data/birdclef/train_soundscapes/H02_20230420_074000.ogg")
-    shutil.copy(src_audio, audio_dir / "iNat327629.ogg")
-    shutil.copy(src_sc, soundscape_dir / "H02_20230420_074000.ogg")
-
-    # Create train.csv and taxonomy.csv
-    train_csv = data_dir / "train.csv"
-    train_csv.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([
-        {"primary_label": "41970", "filename": "41970/iNat327629.ogg"}
-    ]).to_csv(train_csv, index=False)
-    tax_csv = data_dir / "taxonomy.csv"
-    pd.DataFrame([{"primary_label": "41970"}]).to_csv(tax_csv, index=False)
-
-    # Monkeypatch CFG paths
-    monkeypatch.setattr(configure.CFG, 'TRAIN_AUDIO_DIR', data_dir / 'train_audio')
-    monkeypatch.setattr(configure.CFG, 'TRAIN_SOUNDSCAPE_DIR', soundscape_dir)
-    monkeypatch.setattr(configure.CFG, 'TRAIN_CSV', train_csv)
-    monkeypatch.setattr(configure.CFG, 'TAXONOMY_CSV', tax_csv)
-    processed_dir = root / 'processed'
-    monkeypatch.setattr(configure.CFG, 'PROCESSED_DIR', processed_dir)
-    # No benchmark model
-    monkeypatch.setattr(configure.CFG, 'BENCHMARK_MODEL', None)
-
-    return root
-
-
-def test_process_pipeline(setup_test_env, caplog):
-    caplog.set_level(logging.INFO)
-    # Run preprocessing
-    process.main()
-
-    proc = configure.CFG.PROCESSED_DIR
-
-    # Train recordings outputs
-    mel_train = proc / 'mels' / 'train' / '41970'
-    lbl_train = proc / 'labels' / 'train' / '41970'
-    assert mel_train.exists() and any(mel_train.iterdir()), f"No mel files in {mel_train}"
-    assert lbl_train.exists() and any(lbl_train.iterdir()), f"No label files in {lbl_train}"
-
-    # Soundscape outputs
-    mel_sc = proc / 'mels' / 'soundscape'
-    lbl_sc = proc / 'labels' / 'soundscape'
-    assert mel_sc.exists() and any(mel_sc.iterdir()), f"No soundscape mels in {mel_sc}"
-    assert lbl_sc.exists() and any(lbl_sc.iterdir()), f"No soundscape labels in {lbl_sc}"
-
-    # Metadata files
-    meta_train = proc / 'train_metadata.csv'
-    meta_sc = proc / 'soundscape_metadata.csv'
-    assert meta_train.exists(), "train_metadata.csv missing"
-    assert meta_sc.exists(), "soundscape_metadata.csv missing"
-
-    # Log check
-    assert "Processing labelled recordings" in caplog.text
+def resize_mel(mel_db: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """
+    Resize a mel spectrogram (in dB) to the target height and width using bilinear interpolation.
+    Preserves dynamic range by normalizing before resize and re-scaling after.
+    """
+    h, w = mel_db.shape
+    if (h, w) == (target_h, target_w):
+        return mel_db
+    mel_min, mel_max = mel_db.min(), mel_db.max()
+    # Normalize to 0-255
+    mel_norm = (mel_db - mel_min) / (mel_max - mel_min + 1e-6)
+    mel_img = Image.fromarray((mel_norm * 255).astype(np.uint8))
+    mel_img = mel_img.resize((target_w, target_h), Image.BILINEAR)
+    mel_resized = np.array(mel_img).astype(np.float32) / 255.0
+    # Re-scale to original dB range
+    mel_resized = mel_resized * (mel_max - mel_min + 1e-6) + mel_min
+    return mel_resized
 
 

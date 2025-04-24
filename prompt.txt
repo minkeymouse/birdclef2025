@@ -1,10 +1,20 @@
-Based on our discussion so far, here's what I think is proper workflow.
+FYI
 
-1. We read /data/birdclef/train.csv. The file contains columns 'primary_label', 'secondary_labels', 'type', 'filename', 'collection',
+GENERAL FLOW
+
+We read /data/birdclef/train.csv. The file contains columns 'primary_label', 'secondary_labels', 'type', 'filename', 'collection',
        'rating', 'url', 'latitude', 'longitude', 'scientific_name',
        'common_name', 'author', 'license'.
 We will be using 'primary_label', 'secondary_labels', 'type', 'filename', 'rating', 'latitude', 'longitude' For our analysis.
 Observing the data, I found that for the files that has rating of 5 they only had one label each.
+
+Example train.csv from /data/birdclef/train.csv
+primary_label,secondary_labels,type,filename,collection,rating,url,latitude,longitude,scientific_name,common_name,author,license
+1139490,[''],[''],1139490/CSA36385.ogg,CSA,0,http://colecciones.humboldt.org.co/rec/sonidos/IAvH-CSA-36385/IAvH-CSA-36385.mp3,7.3206,-73.7128,Ragoniella pulchella,Ragoniella pulchella,Fabio A. Sarria-S,cc-by-nc-sa 4.0
+1139490,[''],[''],1139490/CSA36389.ogg,CSA,0,http://colecciones.humboldt.org.co/rec/sonidos/IAvH-CSA-36389/IAvH-CSA-36389.mp3,7.3206,-73.7128,Ragoniella pulchella,Ragoniella pulchella,Fabio A. Sarria-S,cc-by-nc-sa 4.0
+1192948,[''],[''],1192948/CSA36358.ogg,CSA,0,http://colecciones.humboldt.org.co/rec/sonidos/IAvH-CSA-36358/IAvH-CSA-36358.mp3,7.3791,-73.7313,Oxyprora surinamensis,Oxyprora surinamensis,Fabio A. Sarria-S,cc-by-nc-sa 4.0
+
+
 We will first construct our 'golden' dataset with these 5 rating one-labeled data. divide them into 10 second chunks and drop bad chunks, drop duplicate, drop human voices.
 Their label tensor will be 206 dimension and only has 1 for 1 corresponding index. class and index mapping is given in CFG. File's directory is given at CFG too.
 After processing the data, we now have 10 seconds chunks mel-spectogram tensor and corresponding label tensor. We need to save the meta data in new train_metadata.csv file in current directory.
@@ -63,5 +73,34 @@ With these additional dataset, we will also train the model again.
 
 Then, we will submit.
 
-What do you think of this plan?
 
+TRAINING DETAILS
+
+More specifically, training and inference will be done with following steps.
+1. Batch of mels and labels will be loaded for training. As we load, some additional processing such as augmentation, masking will be done.
+2. In the training, We will be using 10 seconds chunk and use CE(Cross Entropy, NOT BINARY cross entropy) with 206 labels.
+3. we will use weights of 0.5 of first half and 0.5 of second half for prediction probability. Loss will be calculated based on this procedure.
+4. Then, we will save the best 3 models to the /models/ directory with efficientnet_[current time].pth or regnety_[current time].pth.
+5. Inference will use these average of time chunks from each models to produce prediction probability. For each model, 3 models min will be used as prediction for labeling. Among 2 results from each model, we will again average the probability to produce final prediction for each chunk.
+6. For inference, it is complicated. We will use consecutive 5 chunks (t-2, t-1, t, t+1, t+2) and average the probability. This will yield prob for efficientnet_1.
+7. Among efficientnet_1, efficientnet_2, efficientnet_3 we will use min of these 3 probs for one single prob labels for efficiennet. Among prob from efficientnet and regnety, we will average them.
+8. This will yield one final probability labels for each 5 second chunk. We will now save updated label for each chunk in our training database.
+9. This ends training-inference procedure.
+
+SPECIFIC AUTOML WORKFLOW
+
+Following is how I will run the automl.
+
+1. ssh to my server and move to the project directory.
+2. tmux new -s birdclef
+3. conda activate birdclef
+4. Run automl with initial mode like --initial
+ - This will build 'golden' initial DATABASE with 10 seconds chunks in DATABASE/ directory: DATABASE/mels, DATABASE/labels, DATABASE/train_metadata.csv
+ - After golden database with all 206 classes created, it will train initial 6 models, 3 efficientnet, 3 regnety.
+ - Use these models to do inference and create labels in train_soundscapes data. Read each file in /data/birdclef/train_soundscapes, use our inference logic to label them. Save the mels, labels, and metadata. Create flag for soundscape files in metadata.
+ - No additional inference is run here, prints initialization complete.
+5. Then, I will run automl and it has 3 stages. This will be iterated n times as argument --iterate n or something like this.
+ - 1st stage: Randomly sample 2000 files from train_audio focusing on minority species. Make the copy .ogg files and save the copies in DATABASE/samples directory with names original_name_copied_[time stamp].ogg. Then, Use such copied ogg files to create mels with proper processing such as dropping noise, dropping no sounds removing voices, etc. Then, labels, add lines to train_metadata.csv for mapping.
+ - 2nd stage: Train the model. Apply all necessary augmentations or techniques. Now we have new 6 .pth checkpoints updated and saved.
+ - 3rd stage: Inference and update labels in soundscapes files. For new label vector of each species, p_new = p_old + \sqrt{p(1-p)}/260 is updating rule for probability but you can use better ones.
+6. Lastly, After iterations are complete, save the resulting models, labels. Also save result summary(running time collected, logging, results) in one file as .txt and save it into /output/ directory.
