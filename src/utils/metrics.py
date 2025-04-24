@@ -162,18 +162,15 @@ def create_pseudo_labels(
     threshold: float = 0.5,
 ) -> List[Dict[str, float]]:
     """
-    Convert ``(T, C)`` probability array to a list of ``dict`` suitable for
-    *process_pseudo.py*.
-
-    Each dict maps *species_code* → 1.0 for classes whose probability ≥ threshold
-    in that chunk.  (Weight is applied later in metadata.)
+    Convert ``(T, C)`` probability array to a list of dicts suitable for
+    process_pseudo.py. Each dict maps species codes → 1.0 for classes
+    whose probability ≥ threshold.
     """
-    assert chunk_probs.shape[1] == len(
-        species_list
-    ), "`species_list` length must equal num_classes"
-
+    assert chunk_probs.shape[1] == len(species_list), (
+        "`species_list` length must equal num_classes"
+    )
     out: List[Dict[str, float]] = []
     for probs in chunk_probs:
-        idx = np.where(probs >= threshold)[0]
-        out.append({species_list[i]: 1.0 for i in idx})
+        idxs = np.where(probs >= threshold)[0]
+        out.append({species_list[i]: 1.0 for i in idxs})
     return out

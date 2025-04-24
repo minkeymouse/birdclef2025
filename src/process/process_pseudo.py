@@ -9,18 +9,15 @@ whole *train_audio* archive again and adds chunks **not yet represented** in
 For every unseen recording it:
 1. Runs VAD + silence checks to discard human speech and empty segments.
 2. Splits into the same 10‑s / 5‑s‑hop windows used for training.
-3. Predicts class probabilities with **all** checkpoints in
-   `/data/birdclef/models` that match the naming pattern
-   `*_initial_*.pth` (torchscript).
+3. Predicts class probabilities with all TorchScript checkpoints in the models directory.
 4. Accepts a chunk when `max(probabilities) ≥ selection.pseudo_confidence_threshold`.
 5. Saves the mel array + soft‑label vector and appends a metadata row with
    reduced sample weight (`labeling.pseudo_label_weight`).
 
 The script is idempotent – duplicate raw waveforms are skipped via an MD5 hash
-cache shared with *process_gold.py*.
+cache shared with other stages.
 """
 from __future__ import annotations
-
 import hashlib
 import logging
 from pathlib import Path
@@ -35,9 +32,13 @@ import yaml
 import utils  # project‑local helpers (taxonomy, resize_mel, VAD, hash_chunk_id)
 
 # -----------------------------------------------------------------------------
-# Config & logging
+# Configuration & logging
 # -----------------------------------------------------------------------------
-with open("process.yaml", "r", encoding="utf-8") as f:
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent.parent
+CONFIG_PATH = ROOT_DIR / "config" / "process.yaml"
+MODELS_DIR = ROOT_DIR / "models"
+with CONFIG_PATH.open("r", encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 paths_cfg = CFG["paths"]
@@ -52,21 +53,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("process_pseudo")
 
 # -----------------------------------------------------------------------------
-# Paths & dirs
+# Paths & directories
 # -----------------------------------------------------------------------------
-AUDIO_DIR = Path(paths_cfg["audio_dir"])
-PROCESSED_DIR = Path(paths_cfg["processed_dir"])
+AUDIO_DIR = Path(paths_cfg["audio_dir"]).expanduser()
+PROCESSED_DIR = Path(paths_cfg["processed_dir"]).expanduser()
 MEL_DIR = PROCESSED_DIR / "mels"
 LABEL_DIR = PROCESSED_DIR / "labels"
 for d in (MEL_DIR, LABEL_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-TRAIN_CSV = Path(paths_cfg["train_csv"])
-METADATA_CSV = Path(paths_cfg["train_metadata"])
-MODELS_DIR = Path("/data/birdclef/models")
+TRAIN_CSV = Path(paths_cfg["train_csv"]).expanduser()
+METADATA_CSV = Path(paths_cfg["train_metadata"]).expanduser()
+# Derive models directory as sibling of processed data\ nMODELS_DIR = PROCESSED_DIR.parent / "models"
 
 # -----------------------------------------------------------------------------
-# Taxonomy + state
+# Taxonomy & state
 # -----------------------------------------------------------------------------
 class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), TRAIN_CSV)
 NUM_CLASSES = len(class_list)
@@ -83,7 +84,7 @@ hash_file = PROCESSED_DIR / "audio_hashes.txt"
 seen_hashes: set[str] = set(hash_file.read_text().split()) if hash_file.exists() else set()
 
 # -----------------------------------------------------------------------------
-# Previously used recordings (already in metadata)
+# Previously seen recordings (any chunk) – skip those files entirely
 # -----------------------------------------------------------------------------
 if METADATA_CSV.exists():
     used_files = set(pd.read_csv(METADATA_CSV, usecols=["filename"]).filename.astype(str))
@@ -97,7 +98,7 @@ try:
     vad_model, vad_utils = utils.load_vad()
     get_speech_timestamps = vad_utils["get_speech_timestamps"]
 except Exception:
-    log.warning("VAD not available – pseudo step will not filter speech.")
+    log.warning("VAD not available – speech filtering disabled.")
     vad_model = None
     get_speech_timestamps = None
 
@@ -109,37 +110,35 @@ def contains_voice(samples: np.ndarray) -> bool:
     return bool(ts)
 
 # -----------------------------------------------------------------------------
-# Ensemble loading (torchscript only) – any *_initial_*.pth inside MODELS_DIR
+# Load ensemble of TorchScript models
 # -----------------------------------------------------------------------------
 ensemble: List[torch.jit.ScriptModule] = []
-for ckpt in MODELS_DIR.glob("*_initial_*.pth"):
+for ckpt in MODELS_DIR.glob("**/*.ts.pt"):
     try:
-        model = torch.jit.load(str(ckpt), map_location="cpu")
+        model = torch.jit.load(str(ckpt), map_location="cuda")
         model.eval()
         ensemble.append(model)
-        log.info("Loaded %s", ckpt.name)
+        log.info("Loaded model: %s", ckpt.name)
     except Exception as e:
-        log.warning("Skipping %s (%s)", ckpt.name, e)
+        log.warning("Skipping %s (load error: %s)", ckpt.name, e)
 
 if not ensemble:
-    log.error("No torchscript checkpoints found – aborting pseudo‑labeling.")
+    log.error("No TorchScript checkpoints found under %s – aborting.", MODELS_DIR)
     raise SystemExit(1)
 
-# Move models to GPU if possible
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 for m in ensemble:
     m.to(DEVICE)
 
 # -----------------------------------------------------------------------------
-# Helper utils
+# Silence filter
 # -----------------------------------------------------------------------------
-
 def is_silent(wave: np.ndarray, thresh_db: float = -50.0) -> bool:
-    db = 10 * np.log10(np.maximum(1e-12, np.mean(wave ** 2)))
+    db = 10 * np.log10(np.maximum(1e-12, np.mean(wave**2)))
     return db < thresh_db
 
 # -----------------------------------------------------------------------------
-# Main loop over train.csv
+# Main pseudo‑labeling loop
 # -----------------------------------------------------------------------------
 train_df = pd.read_csv(TRAIN_CSV)
 meta_rows: List[dict] = []
@@ -148,8 +147,9 @@ for rec in train_df.itertuples(index=False):
     rec_file = str(rec.filename)
     primary_label = rec.primary_label
 
+    # skip recordings already represented
     if rec_file in used_files:
-        continue  # already covered by golden / rare
+        continue
 
     wav_path = AUDIO_DIR / str(primary_label) / rec_file
     if not wav_path.exists():
@@ -159,23 +159,23 @@ for rec in train_df.itertuples(index=False):
                 wav_path = alt
                 break
     if not wav_path.exists():
-        log.debug("File missing: %s", rec_file)
+        log.debug("Missing file: %s", rec_file)
         continue
 
-    # -------- Dedup raw waveform --------
-    y = librosa.load(wav_path, sr=sample_rate, mono=True)[0]
+    # -------- Deduplicate raw waveform --------
+    y, _ = librosa.load(wav_path, sr=sample_rate, mono=True)
     h = hashlib.md5(y.tobytes()).hexdigest()
     if dedup_cfg["enabled"] and h in seen_hashes:
         continue
     seen_hashes.add(h)
 
-    # -------- Pre‑cleaning --------
-    if audio_cfg["trim_top_db"] is not None:
+    # -------- Pre‑cleaning (trim silence) --------
+    if audio_cfg.get("trim_top_db") is not None:
         y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
     if len(y) == 0:
         continue
 
-    # Pad so that last window fits exactly
+    # pad to match hop
     pad = (hop_samples - len(y) % hop_samples) % hop_samples
     if pad:
         y = np.pad(y, (0, pad))
@@ -183,24 +183,19 @@ for rec in train_df.itertuples(index=False):
 
     ptr = 0
     while ptr + chunk_samples <= total_len:
-        chunk = y[ptr : ptr + chunk_samples]
-        ptr_next = ptr + hop_samples
-        ptr = ptr_next
+        chunk = y[ptr:ptr + chunk_samples]
+        ptr += hop_samples
 
         if is_silent(chunk):
             continue
         if contains_voice(chunk):
             continue
 
-        # -------- Mel + resize --------
+        # -------- Mel‑spectrogram + resize --------
         mel = librosa.feature.melspectrogram(
-            chunk,
-            sr=sample_rate,
-            n_fft=mel_cfg["n_fft"],
-            hop_length=mel_cfg["hop_length"],
-            n_mels=mel_cfg["n_mels"],
-            fmin=mel_cfg["fmin"],
-            fmax=mel_cfg["fmax"],
+            chunk, sr=sample_rate,
+            n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
+            n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"],
             power=mel_cfg["power"],
         )
         mel_db = librosa.power_to_db(mel, ref=np.max)
@@ -225,15 +220,13 @@ for rec in train_df.itertuples(index=False):
         np.save(mel_path, mel_db)
         np.save(label_path, probs_avg.astype(np.float32))
 
-        meta_rows.append(
-            {
-                "filename": rec_file,
-                "end_sec": round((ptr + chunk_samples) / sample_rate, 3),
-                "mel_path": str(mel_path),
-                "label_path": str(label_path),
-                "weight": float(label_cfg["pseudo_label_weight"]),
-            }
-        )
+        meta_rows.append({
+            "filename": rec_file,
+            "end_sec": round((ptr) / sample_rate, 3),
+            "mel_path": str(mel_path),
+            "label_path": str(label_path),
+            "weight": float(label_cfg["pseudo_label_weight"]),
+        })
 
     log.info("Pseudo‑processed %s", rec_file)
 
@@ -248,5 +241,5 @@ if meta_rows:
 else:
     log.info("No new pseudo‑labelled chunks generated.")
 
-if dedup_cfg["enabled"]:
-    hash_file.write_text("\n".join(seen_hashes))
+if dedup_cfg.get("enabled", False):
+    hash_file.write_text("\n".join(sorted(seen_hashes)))
