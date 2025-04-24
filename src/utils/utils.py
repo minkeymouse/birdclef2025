@@ -13,29 +13,31 @@ create_label_vector   → one-hot / soft-label vector, handles strings or lists
 hash_chunk_id         → short SHA-1 from (filename, start_sec)
 resize_mel            → bilinear resize that preserves dB range
 load_vad              → lazy Silero VAD loader (torch-hub)
+is_silent             → simple dB-based silence check
+contains_voice        → VAD-based speech detection
 
 Public API is defined in __all__ at bottom.
 """
-
 from __future__ import annotations
 
 import ast
 import hashlib
 import logging
-import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union, Callable
+import torch
 
 import numpy as np
 import pandas as pd
 from PIL import Image
-import torch, torchaudio
+
 
 # ----------------------------------------------------------------------------
 # Logging
 # ----------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
+
 
 # ----------------------------------------------------------------------------
 # Taxonomy utilities
@@ -72,9 +74,11 @@ def load_taxonomy(
     class_map = {sp: idx for idx, sp in enumerate(class_list)}
     return class_list, class_map
 
+
 # ----------------------------------------------------------------------------
 # Label helpers
 # ----------------------------------------------------------------------------
+
 def parse_secondary_labels(
     sec: Optional[Union[str, Sequence[str]]]
 ) -> List[str]:
@@ -103,7 +107,7 @@ def parse_secondary_labels(
     return []
 
 
-def create_label_vector(
+def add_secondary_label(
     primary_label: str,
     secondary_labels: Optional[Union[str, Sequence[str]]],
     class_map: Dict[str, int],
@@ -118,10 +122,8 @@ def create_label_vector(
     If use_soft=False, secondaries get 1.0 (multi-hot).
     """
     vec = np.zeros(len(class_map), dtype=np.float32)
-    # Primary
     if primary_label in class_map:
         vec[class_map[primary_label]] = primary_weight
-    # Secondary
     secs = parse_secondary_labels(secondary_labels)
     if not secs:
         return vec
@@ -136,9 +138,11 @@ def create_label_vector(
                 vec[class_map[sp]] = 1.0
     return vec
 
+
 # ----------------------------------------------------------------------------
 # Misc small helpers
 # ----------------------------------------------------------------------------
+
 def hash_chunk_id(
     filename: str,
     start_sec: float,
@@ -169,8 +173,9 @@ def resize_mel(
     arr = np.asarray(img).astype(np.float32) / 255.0
     return arr * (hi - lo) + lo
 
+
 # ----------------------------------------------------------------------------
-# Voice-activity detection (lazy torch-hub)
+# Silence & Voice Detection
 # ----------------------------------------------------------------------------
 
 def is_silent(
@@ -178,21 +183,39 @@ def is_silent(
     thresh_db: float = -50.0,
 ) -> bool:
     """
-    Check if the audio is silent based on a dB threshold.
+    Check if the audio is silent based on a dB threshold (RMS).
     """
-    db = 10 * np.log10(np.maximum(1e-12, np.mean(wave**2)))
+    rms = np.sqrt(np.mean(wave**2))
+    db = 20 * np.log10(rms + 1e-12)
     return db < thresh_db
+
+
+def load_vad() -> Tuple["torch.jit.ScriptModule", Callable]:
+    """
+    Lazy-load Silero VAD model and its get_speech_timestamps fn.
+    """
+    import torch
+    model, utils = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False
+    )
+    get_speech_timestamps = utils[2]
+    return model, get_speech_timestamps
+
 
 def contains_voice(
     samples: np.ndarray,
-    vad_model: torch.jit.ScriptModule,
-    get_speech_timestamps: Callable,
+    sr: int,
+    threshold: float = 0.5,
 ) -> bool:
     """
-    Check if the audio contains voice using VAD.
+    Check if the audio contains speech using Silero VAD.
     """
-    ts = get_speech_timestamps(samples, vad_model, sampling_rate=16000, threshold=0.5)
-    return bool(ts)
+    import torch
+    model, get_speech_ts = load_vad()
+    tensor = torch.from_numpy(samples).float()
+    speech_ts = get_speech_ts(tensor, model, sampling_rate=sr, threshold=threshold)
+    return bool(speech_ts)
+
 
 # ----------------------------------------------------------------------------
 # Public API
@@ -203,5 +226,7 @@ __all__ = [
     "create_label_vector",
     "hash_chunk_id",
     "resize_mel",
+    "is_silent",
     "load_vad",
+    "contains_voice",
 ]
