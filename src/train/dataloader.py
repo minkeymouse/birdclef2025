@@ -12,7 +12,6 @@ Classes:
 """
 from __future__ import annotations
 
-import json
 import os
 import time
 from pathlib import Path
@@ -29,14 +28,13 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 project_root = Path(__file__).resolve().parents[2]
 import sys
 sys.path.insert(0, str(project_root))
-from src.utils import create_label_vector
 from src.utils.metrics import macro_auc_score, macro_precision_score
 
 __all__ = ["BirdClefDataset", "create_dataloader", "train_model"]
 
 
 class BirdClefDataset(Dataset):
-    """Dataset for BirdCLEF: loads mel-spectrograms and soft-label vectors."""
+    """Dataset for BirdCLEF: loads mel-spectrograms and label vectors from metadata."""
 
     def __init__(
         self,
@@ -50,6 +48,7 @@ class BirdClefDataset(Dataset):
         self.class_map = class_map
         self.num_classes = len(class_map)
         self.augment = augment
+
         # infer mel_shape if not provided
         if mel_shape is None:
             sample_path = self.df.iloc[0]["mel_path"]
@@ -58,32 +57,35 @@ class BirdClefDataset(Dataset):
         else:
             self.mel_shape = mel_shape
 
+        # extract sample weights
+        self._weights = self.df.get("weight", pd.Series(1.0, index=self.df.index))
+        self._weights = self._weights.fillna(1.0).astype(np.float32).to_numpy()
+
     def __len__(self) -> int:
         return len(self.df)
 
     def __getitem__(self, index: int):
         row = self.df.iloc[index]
-        mel_path = row["mel_path"]
-        label_path = row["label_path"]
-        weight = row.get("weight", 0.0)
+        mel_path = row.get("mel_path")
+        label_path = row.get("label_path")
         if not mel_path or pd.isna(mel_path):
             raise FileNotFoundError("Missing 'mel_path' in metadata.")
         if not label_path or pd.isna(label_path):
             raise FileNotFoundError("Missing 'label_path' in metadata.")
-        if not weight or pd.isna(weight):
-            raise FileNotFoundError("Missing 'weight' in metadata.")
+
         mel = np.load(mel_path)
-        label = np.load(label_path)
+        label_vec = np.load(label_path).astype(np.float32)
+
         # resize if shape mismatch
-        if mel.shape != self.mel_shape:
+        if mel.shape != tuple(self.mel_shape):
             mel = cv2.resize(mel, (self.mel_shape[1], self.mel_shape[0]))
         if self.augment:
             mel = self._augment_mel(mel)
+
         # convert to 3-channel image tensor
         mel_tensor = torch.from_numpy(mel).unsqueeze(0).repeat(3, 1, 1).float()
-        label_vec = torch.from_numpy(label).float()
-        weight = torch.tensor(weight, dtype=torch.float32)
-        return mel_tensor, label_vec, weight
+        weight = torch.tensor(self._weights[index], dtype=torch.float32)
+        return mel_tensor, torch.from_numpy(label_vec), weight
 
     def _augment_mel(self, mel: np.ndarray) -> np.ndarray:
         """Random time-frequency masking (SpecAugment-style)."""
@@ -112,15 +114,26 @@ def create_dataloader(
     """Build DataLoader; use WeightedRandomSampler if sample weights vary."""
     if num_workers is None:
         num_workers = 0 if os.name == "nt" else 4
-    sampler = WeightedRandomSampler(
-        weights=list(dataset._weights),
-        num_samples=len(dataset),
-        replacement=True,
-    )
+
+    weights = getattr(dataset, "_weights", None)
+    if weights is not None and not np.allclose(weights, 1.0):
+        sampler = WeightedRandomSampler(
+            weights=list(weights),
+            num_samples=len(dataset),
+            replacement=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        sampler=sampler,
+        shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )

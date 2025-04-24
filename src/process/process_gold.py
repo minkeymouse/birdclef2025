@@ -65,8 +65,6 @@ if HASH_FILE.exists():
     seen_hashes.update(HASH_FILE.read_text().splitlines())
 
 df = pd.read_csv(TRAIN_CSV)
-if sel_cfg.get("require_single_label", False) and "secondary_labels" in df.columns:
-    df = df[df["secondary_labels"].apply(lambda x: not isinstance(x, str) or x.strip() == "")]
 golden_rating = sel_cfg["golden_rating"]
 rare_species_thresh = sel_cfg["rare_species_threshold"]
 
@@ -96,7 +94,7 @@ meta_rows: List[dict] = []
 for rec in golden_df.itertuples(index=False):
     fname = rec.filename
     label = str(rec.primary_label)
-    audio_path = AUDIO_DIR / label / fname
+    audio_path = AUDIO_DIR / fname
     if not audio_path.exists():
         log.warning("Missing file: %s", fname)
         continue
@@ -123,7 +121,7 @@ for rec in golden_df.itertuples(index=False):
         if utils.contains_voice(chunk, sample_rate):
             continue
         m = librosa.feature.melspectrogram(
-            chunk,
+            y=chunk,
             sr=sample_rate,
             n_fft=mel_cfg["n_fft"],
             hop_length=mel_cfg["hop_length"],

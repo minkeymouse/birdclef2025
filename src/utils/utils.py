@@ -180,14 +180,14 @@ def resize_mel(
 
 def is_silent(
     wave: np.ndarray,
-    thresh_db: float = -50.0,
+    db_thresh: float = -50.0,
 ) -> bool:
     """
     Check if the audio is silent based on a dB threshold (RMS).
     """
     rms = np.sqrt(np.mean(wave**2))
     db = 20 * np.log10(rms + 1e-12)
-    return db < thresh_db
+    return db < db_thresh
 
 
 def load_vad() -> Tuple["torch.jit.ScriptModule", Callable]:
@@ -195,10 +195,10 @@ def load_vad() -> Tuple["torch.jit.ScriptModule", Callable]:
     Lazy-load Silero VAD model and its get_speech_timestamps fn.
     """
     import torch
-    model, utils = torch.hub.load(
-        repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False
+    model, utils_tuple = torch.hub.load(
+        repo_or_dir='snakers4/silero-vad', model='silero_vad', skip_validation=True, force_reload=False
     )
-    get_speech_timestamps = utils[2]
+    (get_speech_timestamps, *_) = utils_tuple
     return model, get_speech_timestamps
 
 
