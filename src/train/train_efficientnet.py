@@ -1,99 +1,250 @@
-# train_efficientnet.py
-import yaml
-import json
-import torch
-from train_utils import BirdClefDataset, create_dataloader, train_model
+#!/usr/bin/env python3
+"""
+train_efficientnet.py – EfficientNet‑B0 ensemble trainer
+======================================================
+Train **N** EfficientNet‑B0 models (different random seeds) on the BirdCLEF
+10‑second‑chunk dataset described in *train_metadata.csv* and a YAML
+configuration file (default: ``config/initial_train.yaml``).
 
-if __name__ == "__main__":
-    # Load training config
-    with open("config/train.yaml", 'r') as f:
-        config = yaml.safe_load(f)
-    # Identify EfficientNet config
-    arch_config = None
-    for arch in config['model']['architectures']:
-        if arch['name'].startswith("efficientnet"):
-            arch_config = arch
-            break
-    if arch_config is None:
-        raise ValueError("EfficientNet configuration not found in train.yaml")
-    model_name = arch_config['name']
-    num_models = arch_config.get('num_models', 1)
-    pretrained = arch_config.get('pretrained', True)
-    # Load training metadata
-    train_meta_path = config['dataset']['train_metadata']
-    df = pd.read_csv(train_meta_path)
-    # If pseudo-labeled samples should be included and exist, append them
-    if config['dataset'].get('include_pseudo', False):
-        pseudo_meta_path = os.path.join(os.path.dirname(train_meta_path), "soundscape_metadata.csv")
-        if os.path.exists(pseudo_meta_path):
-            df_pseudo = pd.read_csv(pseudo_meta_path)
-            # We assume pseudo metadata already in same format (including label_json and weight)
-            df = pd.concat([df, df_pseudo], ignore_index=True)
-    # If synthetic samples should be included, they are assumed to be already in train_metadata or processed.
-    # (If synthetic are separate, one could similarly read and append them here.)
-    # Create class map (species to index)
-    if 'label_json' in df.columns:
-        # Build class set from all labels present
-        species_set = {sp for js in df['label_json'] for sp in json.loads(js).keys()}
-    else:
-        # If no label_json, assume a 'primary_label' column exists
-        species_set = set(df['primary_label'].unique())
-        # Also include any secondary labels if provided
-        if 'secondary_labels' in df.columns:
-            for sec_list in df['secondary_labels']:
-                if isinstance(sec_list, str):
-                    for sp in sec_list.split():
-                        species_set.add(sp)
-    species_list = sorted(species_set)
-    class_map = {sp: idx for idx, sp in enumerate(species_list)}
-    num_classes = len(class_map)
-    # Split train/val (for simplicity, use a small percentage as validation)
-    val_frac = config['training'].get('val_fraction', 0.1)
-    df_val = df.sample(frac=val_frac, random_state=42)
-    df_train = df.drop(df_val.index).reset_index(drop=True)
+Key points implemented from the workflow spec
+--------------------------------------------
+* **Soft Cross‑Entropy** is used so we can handle one‑hot **and** soft labels
+  (primary = 1.0, secondary ≈ 0.05) while still following the user’s wish for
+  CE‑style training, not BCE.
+* **Sample weighting** – every chunk row can carry a ``weight`` column that is
+  multiplied into the loss.
+* Top‑3 checkpoints by *macro‑AUC* are stored under
+  ``models/efficientnet_b0/`` with time‑stamped filenames.
+* Script can be pointed at any YAML cfg via ``--cfg`` – that lets the *automl*
+  pipeline reuse the same code for later iterations.
+
+Run example
+-----------
+```bash
+conda activate birdclef
+python -m src.train.train_efficientnet \
+       --cfg config/initial_train.yaml
+```
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader
+from torchvision import models
+
+# Project‑local helpers
+from src.train.dataloader import BirdClefDataset, create_dataloader
+from src.utils.metrics import macro_auc_score, macro_precision_score  # user‑provided util
+
+# ---------------------------------------------------------------------------
+# ── Utility: soft‑label cross‑entropy (handles one‑hot + soft labels) ─────────
+# ---------------------------------------------------------------------------
+class SoftCrossEntropy(nn.Module):
+    """Cross‑entropy for *probability* or *soft* targets.
+
+    *   ``input``  – raw logits, shape *(N, C)*
+    *   ``target`` – floats in **[0, 1]** of same shape *(N, C)* OR one‑hot.
+
+    The loss is:  *−Σ target × log_softmax(input)* averaged over samples.
+    """
+
+    def __init__(self, reduction: str = "mean") -> None:  # reduction ≈ torch style
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        log_prob = torch.log_softmax(input, dim=1)
+        loss = -(target * log_prob).sum(dim=1)  # sum over classes
+        if self.reduction == "none":
+            return loss
+        elif self.reduction == "mean":
+            return loss.mean()
+        else:  # sum
+            return loss.sum()
+
+# ---------------------------------------------------------------------------
+# ── Training loop (very thin wrapper around train_utils.train_model logic) ───
+# ---------------------------------------------------------------------------
+
+def train_single_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: dict,
+    device: torch.device,
+    run_id: int,
+):
+    """Train one seed of EfficientNet and return best checkpoint path list."""
+
+    epochs = cfg["training"]["epochs"]
+    opt_cfg = cfg["optimizer"]
+
+    # Optimiser
+    optimizer = optim.AdamW(
+        model.parameters(), lr=opt_cfg["lr"], weight_decay=opt_cfg["weight_decay"]
+    )
+
+    # Scheduler (cosine only for now)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cfg["scheduler"].get("T_max", epochs),
+        eta_min=cfg["scheduler"].get("eta_min", 1e-6),
+    )
+
+    # Loss: soft CE with sample weights applied outside
+    criterion = SoftCrossEntropy(reduction="none")
+
+    best_scores: list[float] = []
+    best_ckpts: list[str] = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        for x, y, w in train_loader:
+            x, y, w = x.to(device, non_blocking=True), y.to(device), w.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            per_sample_loss = criterion(logits, y) * w  # weight each sample
+            loss = per_sample_loss.mean()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item() * x.size(0)
+        scheduler.step()
+
+        # Validation
+        model.eval()
+        preds_all, targets_all = [], []
+        with torch.no_grad():
+            for x, y, _ in val_loader:
+                x, y = x.to(device), y.to(device)
+                preds_all.append(torch.softmax(model(x), dim=1).cpu().numpy())
+                targets_all.append(y.cpu().numpy())
+        preds_all = np.vstack(preds_all)
+        targets_all = np.vstack(targets_all)
+        val_auc = macro_auc_score(targets_all, preds_all)
+        val_prec = macro_precision_score(targets_all, preds_all, threshold=0.5)
+
+        print(
+            f"[Run {run_id}] Epoch {epoch}/{epochs} :: "
+            f"loss={epoch_loss/len(train_loader.dataset):.4f} "
+            f"valAUC={val_auc:.4f} valPrec@0.5={val_prec:.4f}"
+        )
+
+        # Keep top‑3 by AUC
+        if len(best_scores) < 3 or val_auc > min(best_scores):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ckpt_dir = Path(cfg["paths"]["models_dir"])  # already created by caller
+            ckpt_path = ckpt_dir / f"efficientnet_b0_run{run_id}_{ts}.pth"
+            torch.save({"model_state_dict": model.state_dict()}, ckpt_path)
+
+            if len(best_scores) < 3:
+                best_scores.append(val_auc)
+                best_ckpts.append(str(ckpt_path))
+            else:
+                worst = int(np.argmin(best_scores))
+                os.remove(best_ckpts[worst])
+                best_scores[worst] = val_auc
+                best_ckpts[worst] = str(ckpt_path)
+            print(f"  ↳ saved checkpoint → {ckpt_path}")
+    # Sort checkpoints best→worst before returning
+    order = np.argsort(best_scores)[::-1]
+    return [best_ckpts[i] for i in order]
+
+# ---------------------------------------------------------------------------
+# ── Main entry point ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def main(cfg_path: str):
+    with open(cfg_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    # Locate architecture block for EfficientNet
+    arch_cfg = next(
+        (a for a in cfg["model"]["architectures"] if a["name"].startswith("efficientnet")),
+        None,
+    )
+    if arch_cfg is None:
+        raise ValueError("EfficientNet config block missing in YAML file")
+
+    num_models = arch_cfg.get("num_models", 1)
+    pretrained = arch_cfg.get("pretrained", True)
+
+    # ------------------------------------------------------------------
+    # Dataset & loaders
+    # ------------------------------------------------------------------
+    df_meta = pd.read_csv(cfg["dataset"]["train_metadata"])
+    # Add pseudo‑labelled rows if requested
+    if cfg["dataset"].get("include_pseudo", False):
+        pseudo_path = Path(cfg["dataset"]["train_metadata"]).with_name("soundscape_metadata.csv")
+        if pseudo_path.exists():
+            df_meta = pd.concat([df_meta, pd.read_csv(pseudo_path)], ignore_index=True)
+
+    # Build class map from metadata (label files are npy vectors of fixed length)
+    # Here we just infer num_classes from a label sample
+    sample_lbl = np.load(df_meta.loc[0, "label_path"])
+    num_classes = sample_lbl.shape[0]
+
+    val_frac = cfg["training"].get("val_fraction", 0.1)
+    df_val = df_meta.sample(frac=val_frac, random_state=cfg["training"]["seed"])
+    df_train = df_meta.drop(df_val.index).reset_index(drop=True)
     df_val = df_val.reset_index(drop=True)
-    # Create datasets
-    train_dataset = BirdClefDataset(df_train, class_map, mel_shape=(128, 256), augment=True)
-    val_dataset = BirdClefDataset(df_val, class_map, mel_shape=(128, 256), augment=False)
-    train_loader = create_dataloader(train_dataset, batch_size=config['training']['batch_size'], shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_size=config['training']['batch_size'], shuffle=False, num_workers=4)
-    # Set device (use GPU if available)
+
+    train_ds = BirdClefDataset(df_train, mel_shape=(128, 256), augment=True)
+    val_ds = BirdClefDataset(df_val, mel_shape=(128, 256), augment=False)
+
+    train_loader = create_dataloader(train_ds, batch_size=cfg["training"]["batch_size"], shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=cfg["training"]["batch_size"], shuffle=False, num_workers=4)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # Train specified number of models (e.g., 3 seeds for ensemble)
-    saved_checkpoints = []
-    base_seed = config['training'].get('seed', 42)
-    for run in range(1, num_models+1):
-        # Set reproducibility seed
+    torch.backends.cudnn.benchmark = True
+
+    # Directory for checkpoints
+    ckpt_root = Path("models") / "efficientnet_b0"
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+    cfg.setdefault("paths", {})["models_dir"] = str(ckpt_root)
+
+    saved: list[str] = []
+    base_seed = cfg["training"]["seed"]
+
+    for run in range(1, num_models + 1):
         torch.manual_seed(base_seed + run)
         np.random.seed(base_seed + run)
-        # Initialize model
-        from torchvision import models
-        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
-        # Adjust final layer for num_classes
-        num_feats = model.classifier[1].in_features
-        model.classifier = torch.nn.Linear(num_feats, num_classes)
-        model = model.to(device)
-        # If fine-tuning from a provided initial checkpoint (for pseudo label iterations)
-        init_ckpt_base = arch_config.get('init_checkpoint', None)
-        if init_ckpt_base:
-            ckpt_path = f"{init_ckpt_base}_{run}.pth"
+
+        model = models.efficientnet_b0(
+            weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+        )
+        in_feats = model.classifier[1].in_features
+        model.classifier = nn.Linear(in_feats, num_classes)
+        model.to(device)
+
+        # Optional warm‑start ckpt
+        if (ckpt_base := arch_cfg.get("init_checkpoint")) is not None:
+            ckpt_path = f"{ckpt_base}_{run}.pth"
             if os.path.exists(ckpt_path):
-                ckpt = torch.load(ckpt_path, map_location=device)
-                model.load_state_dict(ckpt['model_state_dict'])
-                print(f"Loaded initial checkpoint for {model_name} run{run} from {ckpt_path}")
-        # Prepare config for train_model
-        run_config = config.copy()
-        run_config['current_arch'] = model_name
-        run_config['current_run'] = run
-        run_config['class_map'] = class_map
-        run_config['paths'] = {
-            'models_dir': os.path.join("models", model_name)  # save in models/<architecture> folder
-        }
-        os.makedirs(run_config['paths']['models_dir'], exist_ok=True)
-        # Train model
-        best_ckpts = train_model(model, train_loader, val_loader, run_config, device)
-        saved_checkpoints.extend(best_ckpts)
-    # After training, output the list of saved checkpoint paths
-    print("Training complete. Saved model checkpoints:")
-    for ckpt in saved_checkpoints:
-        print(" -", ckpt)
+                model.load_state_dict(torch.load(ckpt_path, map_location=device)["model_state_dict"])
+                print(f"→ loaded init checkpoint for run {run} from {ckpt_path}")
+
+        saved += train_single_model(model, train_loader, val_loader, cfg, device, run)
+
+    print("\nTraining complete – saved checkpoints:")
+    for p in saved:
+        print(" •", p)
+
+
+if __name__ == "__main__":
+    import yaml  # local import to avoid polluting global namespace
+
+    parser = argparse.ArgumentParser(description="Train EfficientNet ensemble")
+    parser.add_argument("--cfg", type=str, default="config/initial_train.yaml", help="Path to YAML config")
+    args = parser.parse_args()
+
+    main(args.cfg)

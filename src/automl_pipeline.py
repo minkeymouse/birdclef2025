@@ -1,148 +1,231 @@
-# automl_pipeline.py
+#!/usr/bin/env python3
+"""
+automl_pipeline.py – BirdCLEF‑2025 end‑to‑end AutoML orchestrator
+=================================================================
+This single entry‑point reproduces *exactly* the workflow we have
+agreed on in chat – from high‑confidence “golden” chunk extraction
+all the way to the final submission CSV.
+
+The pipeline is **resumable**.  Each stage checks for its expected
+artefacts before running, so you can safely interrupt / restart or
+iterate more loops later.
+
+CLI overview
+------------
+```bash
+# 1) full initial run (golden → initial 6 models → soundscape pseudo‑labels)
+python -m src.automl_pipeline --initial
+
+# 2) add 3 refinement loops on top of existing state
+python -m src.automl_pipeline --iterate 3
+```
+
+Implementation notes
+-------------------
+* Heavy work is off‑loaded to dedicated scripts already in *src/process*
+  and *src/train* – this wrapper only orchestrates them.
+* All subprocesses inherit *stdout* so you can tail the log in **tmux**.
+* YAML config paths are centralised in the constants section.  If you
+  move the config files, just update those constants.
+* We convert checkpoints to **TorchScript** once per training script so
+  the VAD‑less *process_pseudo.py* can `torch.jit.load()` them quickly.
+"""
+from __future__ import annotations
+
+import argparse
+import logging
 import os
-import yaml
-import pandas as pd
-import numpy as np
+import shutil
 import subprocess
-from src.utils.inference_utils import load_model, predict_chunks, smooth_predictions, ensemble_predictions
-from src.utils.metrics import create_pseudo_labels
+import sys
+import time
+from pathlib import Path
+from textwrap import dedent
+
+import yaml
+
+# -----------------------------------------------------------------------------
+# Constants – adjust if you move the YAML files
+# -----------------------------------------------------------------------------
+CFG_PROCESS = Path("config/process.yaml")
+CFG_INIT_TRAIN = Path("config/initial_train.yaml")
+CFG_TRAIN = Path("config/train.yaml")  # generic for later loops
+CFG_INFER = Path("config/inference.yaml")
+
+# Training entry points (within src/train)
+TRAIN_EFF_SCRIPT = Path("src/train/train_efficientnet.py")
+TRAIN_REG_SCRIPT = Path("src/train/train_regnety.py")
+
+# Process scripts
+PROC_GOLD = Path("src/process/process_gold.py")
+PROC_RARE = Path("src/process/process_rare.py")
+PROC_PSEUDO = Path("src/process/process_pseudo.py")
+
+# Top‑level directories (read from process.yaml once)
+with CFG_PROCESS.open() as f:
+    _PROC_CFG = yaml.safe_load(f)
+_DATA_ROOT = Path(_PROC_CFG["paths"]["data_root"]).expanduser()
+PROCESSED_DIR = Path(_PROC_CFG["paths"]["processed_dir"]).expanduser()
+MODELS_DIR = Path(_PROC_CFG["paths"]["processed_dir"]).parent / "models"
+SOUNDSCAPE_DIR = _DATA_ROOT / "train_soundscapes"
+
+# -----------------------------------------------------------------------------
+# Logging helper
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y‑%m‑%d %H:%M:%S",
+)
+log = logging.getLogger("automl")
+
+
+# -----------------------------------------------------------------------------
+# Sub‑process wrapper
+# -----------------------------------------------------------------------------
+
+def _run(cmd: list[str] | str, check: bool = True):
+    """Run *cmd* (list or str) and stream output. Abort on non‑zero exit."""
+    if isinstance(cmd, list):
+        display = " ".join(cmd)
+    else:
+        display = cmd
+    log.info("RUN → %s", display)
+    start = time.time()
+    try:
+        subprocess.run(cmd, shell=isinstance(cmd, str), check=check)
+    except subprocess.CalledProcessError as e:
+        log.error("Command failed: %s", e)
+        sys.exit(1)
+    log.info("✔ finished in %.1fs", time.time() - start)
+
+
+# -----------------------------------------------------------------------------
+# Stage helpers
+# -----------------------------------------------------------------------------
+
+def stage_process_golden():
+    """Generate the high‑confidence golden dataset (idempotent)."""
+    meta_csv = Path(_PROC_CFG["paths"]["train_metadata"])
+    if meta_csv.exists():
+        log.info("train_metadata.csv already exists – skip golden extraction.")
+        return
+    _run(["python", str(PROC_GOLD)])
+    # Rare stage is optional for *initial* but fast – include it here so the
+    # first model already sees minorities.
+    _run(["python", str(PROC_RARE)])
+
+
+def stage_process_pseudo():
+    """Run pseudo‑label generation on unseen recordings + update metadata."""
+    _run(["python", str(PROC_PSEUDO)])
+
+
+def stage_train(cfg_path: Path):
+    """Train both ensembles as per *cfg_path*."""
+    _run(["python", str(TRAIN_EFF_SCRIPT), "--cfg", str(cfg_path)])
+    _run(["python", str(TRAIN_REG_SCRIPT), "--cfg", str(cfg_path)])
+
+    # After training convert the *top‑3* checkpoints of each architecture to
+    # TorchScript so *process_pseudo.py* can load them without class code.
+    for arch in ("efficientnet_b0", "regnety_800mf"):
+        arch_dir = MODELS_DIR / arch
+        for pth in arch_dir.glob("*.pth"):
+            ts_path = pth.with_suffix(".ts.pt")
+            if ts_path.exists():
+                continue
+            _run(
+                [
+                    "python",
+                    "- <<PY",
+                    dedent(
+                        f"""
+                        import torch, sys, pathlib
+                        p = pathlib.Path('{pth}');
+                        ckpt = torch.load(p, map_location='cpu')
+                        from torchvision import models
+                        if '{arch}'.startswith('efficientnet'):
+                            m = models.efficientnet_b0(weights=None)
+                            m.classifier[1] = torch.nn.Linear(m.classifier[1].in_features, ckpt['model_state_dict']['classifier.1.weight'].shape[0])
+                        else:
+                            m = models.regnet_y_800mf(weights=None)
+                            m.fc = torch.nn.Linear(m.fc.in_features, ckpt['model_state_dict']['fc.weight'].shape[0])
+                        m.load_state_dict(ckpt['model_state_dict'], strict=True)
+                        m.eval()
+                        torch.jit.script(m).save(str(p.with_suffix('.ts.pt')))
+                        """,
+                    ),
+                    "PY",
+                ],
+                check=True,
+            )
+
+
+def stage_inference():
+    """Run final inference on the public test soundscapes."""
+    _run(["python", "src/inference.py"])
+
+
+# -----------------------------------------------------------------------------
+# Main orchestrator
+# -----------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="End‑to‑end AutoML pipeline")
+    parser.add_argument(
+        "--initial",
+        action="store_true",
+        help="Run golden extraction, initial 6‑model training and soundscape pseudo‑labeling.",
+    )
+    parser.add_argument(
+        "--iterate",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Run N additional refinement loops (rare + pseudo → re‑train).",
+    )
+    parser.add_argument(
+        "--final-infer",
+        action="store_true",
+        help="After loops, run inference on the *test* set to create submission.csv.",
+    )
+    args = parser.parse_args()
+
+    # -------------------- Stage 0: golden / initial ----------------------
+    if args.initial:
+        log.info("==== Stage 0 – golden extraction ====")
+        stage_process_golden()
+
+        log.info("==== Stage 1 – initial training (6 models) ====")
+        stage_train(CFG_INIT_TRAIN)
+
+        log.info("==== Stage 2 – first pseudo‑labels for soundscapes ====")
+        stage_process_pseudo()
+
+    # -------------------- Iterative refinement ---------------------------
+    loops = args.iterate
+    for i in range(1, loops + 1):
+        log.info("==== ITERATION %d/%d – rare + pseudo + retrain ====", i, loops)
+        stage_process_pseudo()  # adds new confident chunks to metadata
+
+        # For later loops we switch to the generic train.yaml which now includes
+        # *include_pseudo* / *include_synthetic* true by default.
+        with CFG_TRAIN.open() as f:
+            cfg = yaml.safe_load(f)
+        cfg["dataset"]["include_pseudo"] = True
+        cfg["dataset"]["include_synthetic"] = True
+        tmp_cfg = PROCESSED_DIR / f"auto_train_loop{i}.yaml"
+        tmp_cfg.write_text(yaml.safe_dump(cfg))
+
+        stage_train(tmp_cfg)
+
+    # -------------------- Final public test inference -------------------
+    if args.final_infer or (not args.initial and loops == 0):
+        log.info("==== Final inference on public test soundscapes ====")
+        stage_inference()
+
+    log.info("🎉 Pipeline finished.")
+
 
 if __name__ == "__main__":
-    # Load configs
-    with open("config/train.yaml", 'r') as f:
-        train_config = yaml.safe_load(f)
-    with open("config/inference.yaml", 'r') as f:
-        infer_config = yaml.safe_load(f)
-    data_root = os.path.dirname(train_config['dataset']['train_metadata'])
-    # 1. Pre-processing: ensure processed data exists
-    train_meta_path = train_config['dataset']['train_metadata']
-    if not os.path.exists(train_meta_path):
-        raise RuntimeError("Processed training metadata not found. Please run data preprocessing before pipeline.")
-    # (Optional: call a preprocessing script here if needed, e.g., process.py to generate train_metadata.csv)
-    # 2. Initial training (with no pseudo, maybe no synthetic)
-    # Override config flags for initial run
-    train_config['dataset']['include_pseudo'] = False
-    train_config['dataset']['include_synthetic'] = False
-    # Also possibly use a different learning rate or epochs for initial stage if desired
-    initial_train_config_path = "config/_initial_train_tmp.yaml"
-    with open(initial_train_config_path, 'w') as f:
-        yaml.safe_dump(train_config, f)
-    print("Starting initial training...")
-    subprocess.run(["python", "train_efficientnet.py"], check=True)
-    subprocess.run(["python", "train_regnety.py"], check=True)
-    print("Initial training completed.")
-    # After initial training, copy the best model weights as "initial" checkpoints for next loop (for fine-tuning).
-    models_dir = infer_config['paths']['models_dir']
-    eff_dir = os.path.join(models_dir, "efficientnet_b0")
-    reg_dir = os.path.join(models_dir, "regnety_008")
-    # Identify best checkpoints for each run (assuming train scripts print them or we pick last epoch of each run).
-    # Here, for simplicity, assume the highest epoch files for run1, run2, run3 in each arch are best.
-    initial_eff_ckpts = []
-    initial_reg_ckpts = []
-    for run in range(1, train_config['model']['architectures'][0]['num_models']+1):
-        # EfficientNet
-        ckpt_files = [f for f in os.listdir(eff_dir) if f.startswith("efficientnet_b0_run%d" % run)]
-        if not ckpt_files:
-            continue
-        best_ckpt = sorted(ckpt_files, key=lambda x: int(x.split('_epoch')[-1].split('.pth')[0]))[-1]  # highest epoch
-        src = os.path.join(eff_dir, best_ckpt)
-        dst = os.path.join(eff_dir, f"efficientnet_b0_initial_{run}.pth")
-        os.replace(src, dst)
-        initial_eff_ckpts.append(dst)
-        # RegNet
-        ckpt_files = [f for f in os.listdir(reg_dir) if f.startswith("regnety_008_run%d" % run)]
-        if not ckpt_files:
-            continue
-        best_ckpt = sorted(ckpt_files, key=lambda x: int(x.split('_epoch')[-1].split('.pth')[0]))[-1]
-        src = os.path.join(reg_dir, best_ckpt)
-        dst = os.path.join(reg_dir, f"regnety_008_initial_{run}.pth")
-        os.replace(src, dst)
-        initial_reg_ckpts.append(dst)
-    # Update config to use these as init_checkpoint for fine-tuning
-    for arch in train_config['model']['architectures']:
-        if arch['name'].startswith("efficientnet"):
-            arch['init_checkpoint'] = os.path.join(models_dir, "efficientnet_b0", "efficientnet_b0_initial")
-        elif arch['name'].startswith("regnety"):
-            arch['init_checkpoint'] = os.path.join(models_dir, "regnety_008", "regnety_008_initial")
-    train_config['dataset']['include_pseudo'] = True
-    train_config['dataset']['include_synthetic'] = True  # now include synthetic as well
-    # Save updated config for retraining
-    retrain_config_path = "config/_retrain_tmp.yaml"
-    with open(retrain_config_path, 'w') as f:
-        yaml.safe_dump(train_config, f)
-    # 3. Iterative training loops with pseudo-label refinement
-    max_loops = train_config.get('automl_loops', 5)
-    for loop in range(1, max_loops):
-        print(f"Starting training loop {loop} with pseudo-labels...")
-        # Train models (fine-tune from initial weights including pseudo and synthetic)
-        subprocess.run(["python", "train_efficientnet.py"], check=True)
-        subprocess.run(["python", "train_regnety.py"], check=True)
-        print(f"Loop {loop} training completed. Generating pseudo-labels for next loop...")
-        # 4. Inference on training soundscapes to update pseudo-labels
-        # Load the newly trained ensemble (all 6 models) for inference on unlabeled data
-        ensemble_ckpts = infer_config['ensemble']['checkpoints']  # expecting final names (which we might not have yet)
-        # If not explicitly set, we can derive from last training run outputs.
-        # For simplicity, use initial checkpoint names (which now hold updated weights after fine-tuning)
-        ensemble_ckpts = []
-        for run in range(1, train_config['model']['architectures'][0]['num_models']+1):
-            ensemble_ckpts.append(f"efficientnet_b0_initial_{run}.pth")
-        for run in range(1, train_config['model']['architectures'][1]['num_models']+1):
-            ensemble_ckpts.append(f"regnety_008_initial_{run}.pth")
-        # Load models
-        models = []
-        for ckpt_name in ensemble_ckpts:
-            if ckpt_name.startswith("efficientnet"):
-                arch = "efficientnet_b0"
-            else:
-                arch = "regnety_008"
-            ckpt_path = os.path.join(models_dir, arch, ckpt_name)
-            model, species_map = load_model(arch, len(species_map) if species_map else len(class_map), ckpt_path, torch.device("cpu"))
-            models.append(model)
-        # Run inference on unlabeled soundscapes (assuming they are in data_root/train_soundscapes)
-        unlabeled_dir = os.path.join(data_root, "train_soundscapes")
-        if not os.path.isdir(unlabeled_dir):
-            print("No unlabeled soundscapes directory found; skipping pseudo-label generation.")
-            break
-        pseudo_entries = []
-        for fname in os.listdir(unlabeled_dir):
-            if not fname.lower().endswith(('.wav', '.ogg', '.mp3')):
-                continue
-            file_path = os.path.join(unlabeled_dir, fname)
-            y, sr = librosa.load(file_path, sr=None)
-            # Obtain ensemble predictions for this file's 5s chunks
-            all_preds = []
-            for model in models:
-                preds = predict_chunks(model, y, sr, chunk_duration=5.0)
-                all_preds.append(preds)
-            # Smooth and ensemble
-            for m in range(len(all_preds)):
-                all_preds[m] = smooth_predictions(all_preds[m], smoothing_window=5)
-            combined = ensemble_predictions(all_preds, strategy='min_then_avg')
-            # Generate pseudo-label dictionary for each chunk above threshold
-            species_list = sorted(species_map.keys()) if species_map else sorted(class_map.keys())
-            pseudo_labels = create_pseudo_labels(combined, species_list, threshold=presence_threshold)
-            # Build DataFrame rows for these pseudo-labels
-            file_id = os.path.splitext(fname)[0]
-            for i, label_dict in enumerate(pseudo_labels):
-                if not label_dict:
-                    # If no species above threshold in this chunk, we can optionally include it as all-negative example
-                    # but we might skip adding it to avoid overwhelming with negatives.
-                    continue
-                row = {
-                    "filename": file_id,
-                    "label_json": json.dumps(label_dict),
-                    "weight": 0.5  # pseudo-label weight
-                }
-                pseudo_entries.append(row)
-        # Save pseudo labels to CSV
-        if pseudo_entries:
-            pseudo_df = pd.DataFrame(pseudo_entries)
-            pseudo_csv_path = os.path.join(data_root, "processed", "soundscape_metadata.csv")
-            pseudo_df.to_csv(pseudo_csv_path, index=False)
-            print(f"Pseudo-labels updated: {len(pseudo_entries)} chunks labeled and saved to {pseudo_csv_path}")
-        else:
-            print("No pseudo-labels generated in this iteration.")
-    # 5. Final inference on test soundscapes
-    print("Final training complete. Running inference on test set...")
-    subprocess.run(["python", "inference.py"], check=True)
-    print("AutoML pipeline finished. Submission file is ready.")
+    main()

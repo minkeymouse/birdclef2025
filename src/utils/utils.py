@@ -1,103 +1,258 @@
 #!/usr/bin/env python3
 """
-utils.py – Shared utility functions for the BirdCLEF 2025 pipeline.
-Includes:
-- Taxonomy loading and class mapping,
-- Label vector creation for multi-label and pseudo-label samples,
-- Chunk ID hashing for unique file naming,
-- Mel spectrogram resizing.
+utils.py – shared helpers for the BirdCLEF-2025 pipeline
+========================================================
+Functions here are imported by *every* stage (pre-processing, training,
+inference).  Keep them lightweight: **no heavy ML imports at module load**.
+
+Provided helpers
+----------------
+load_taxonomy         → canonical class list + {species: idx} map (cached)
+parse_secondary_labels → robust '[…]'-string → List[str] parser
+create_label_vector   → one-hot / soft-label vector, handles strings or lists
+hash_chunk_id         → short SHA-1 from (filename, start_sec)
+resize_mel            → bilinear resize that preserves dB range
+load_vad              → lazy Silero VAD loader (torch-hub)
+
+All public names are re-exported via ``utils.__init__.__all__``.
 """
+from __future__ import annotations
+
 import ast
 import hashlib
-import numpy as np
-from PIL import Image
-import pandas as pd
+import logging
+import os
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
 
-def load_taxonomy(taxonomy_csv_path: str, train_csv_path: str):
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+# -----------------------------------------------------------------------------#
+# Taxonomy utilities                                                           #
+# -----------------------------------------------------------------------------#
+_PRI_LABEL_COLUMNS = ("primary_label", "ebird_code", "species_code")
+
+
+@lru_cache(maxsize=1)
+def load_taxonomy(
+    taxonomy_csv_path: str | os.PathLike | None,
+    train_csv_path: str | os.PathLike | None = None,
+) -> Tuple[List[str], Dict[str, int]]:
     """
-    Load species list and mapping from taxonomy or train data.
-    Returns (class_list, class_map) where class_list is a list of species codes and 
-    class_map is a dict mapping species code to index.
+    Return *(class_list, class_map)* where ``class_list`` is the **sorted**
+    list of all 206 species codes and ``class_map`` maps code → index.
+
+    The lookup order is
+
+        1. explicit *taxonomy.csv* (preferred)
+        2. fallback to *train.csv* primary labels.
     """
-    class_list = []
-    if taxonomy_csv_path and pd.io.common.file_exists(taxonomy_csv_path):
-        # If a taxonomy CSV is provided, use it to get the list of classes (species)
-        tax_df = pd.read_csv(taxonomy_csv_path)
-        # Assume there's a column with species code (could be 'ebird_code' or 'species_code' or similar)
-        for col in ["ebird_code", "species_code", "primary_label"]:
-            if col in tax_df.columns:
-                class_list = list(pd.unique(tax_df[col]))
-                break
-    if not class_list:
-        # Fallback: derive class list from training data
-        train_df = pd.read_csv(train_csv_path)
-        class_list = sorted(pd.unique(train_df["primary_label"]))
-    # Ensure consistent ordering
-    class_list = sorted(class_list)
-    class_map = {species: idx for idx, species in enumerate(class_list)}
+    def _read_species_from_df(df: pd.DataFrame) -> Sequence[str]:
+        for col in _PRI_LABEL_COLUMNS:
+            if col in df.columns:
+                return df[col].dropna().astype(str).unique()
+        raise ValueError(
+            "None of the expected label columns "
+            f"{_PRI_LABEL_COLUMNS} found in DataFrame."
+        )
+
+    # ---------- 1) taxonomy CSV ------------------------------------------------
+    if taxonomy_csv_path and Path(taxonomy_csv_path).is_file():
+        species = _read_species_from_df(pd.read_csv(taxonomy_csv_path))
+    # ---------- 2) fallback: train CSV ----------------------------------------
+    elif train_csv_path and Path(train_csv_path).is_file():
+        species = _read_species_from_df(pd.read_csv(train_csv_path))
+    else:
+        raise FileNotFoundError(
+            "Neither taxonomy_csv_path nor train_csv_path could be read."
+        )
+
+    class_list = sorted(map(str, species))
+    class_map = {sp: i for i, sp in enumerate(class_list)}
     return class_list, class_map
 
-def create_label_vector(primary_label: str, secondary_labels: list, class_map: dict,
-                        primary_weight: float = 0.7, secondary_weight: float = 0.3,
-                        use_soft: bool = True) -> np.ndarray:
-    """
-    Create a label vector for a training chunk.
-    - If use_soft is True and secondary_labels is non-empty, assign primary_label a weight (primary_weight)
-      and distribute secondary_weight among secondary_labels (evenly if multiple).
-    - If use_soft is False or there are no secondary labels, returns a one-hot vector for primary and any secondaries (multi-hot if multiple and not soft).
-    """
-    num_classes = len(class_map)
-    label_vec = np.zeros(num_classes, dtype=np.float32)
-    if not secondary_labels or not use_soft:
-        # No secondaries or we want hard labels
-        # Mark primary as 1
-        if primary_label in class_map:
-            label_vec[class_map[primary_label]] = 1.0
-        # If there are secondary labels but no soft labeling, mark them as well (multi-hot)
-        if secondary_labels and not use_soft:
-            for sec in secondary_labels:
-                if sec in class_map:
-                    label_vec[class_map[sec]] = 1.0
-    else:
-        # Soft label distribution: primary and secondaries
-        if primary_label in class_map:
-            label_vec[class_map[primary_label]] = primary_weight
-        if secondary_labels:
-            # distribute secondary_weight among all secondary labels
-            share = secondary_weight
-            sec_count = len(secondary_labels)
-            if sec_count > 0:
-                per_sec = share / sec_count
-            else:
-                per_sec = 0.0
-            for sec in secondary_labels:
-                if sec in class_map:
-                    label_vec[class_map[sec]] = per_sec
-    return label_vec
 
-def hash_chunk_id(filename: str, start_sec: float) -> str:
+# -----------------------------------------------------------------------------#
+# Label helpers                                                                #
+# -----------------------------------------------------------------------------#
+def parse_secondary_labels(sec: str | Sequence[str] | None) -> List[str]:
     """
-    Generate a unique hash ID for a chunk given the source filename and start time.
+    Convert BirdCLEF’s *secondary_labels* column (often a stringified list) to
+    ``List[str]``.  Returns ``[]`` if empty / None / unparsable.
     """
-    base = f"{filename}_{start_sec:.3f}"
-    # Use a short hash for uniqueness
-    h = hashlib.sha1(base.encode('utf-8')).hexdigest()
-    return h[:8]  # use first 8 hex digits for brevity
+    if sec is None or (isinstance(sec, float) and np.isnan(sec)):
+        return []
+    if isinstance(sec, list):
+        return [str(s).strip() for s in sec if s]
+    if isinstance(sec, str):
+        sec = sec.strip()
+        if sec in ("", "[]"):
+            return []
+        try:
+            parsed = ast.literal_eval(sec)
+            # literal_eval can return tuple / list / str
+            if isinstance(parsed, (list, tuple)):
+                return [str(s).strip() for s in parsed if s]
+            if isinstance(parsed, str):
+                return [parsed.strip()]
+        except Exception:
+            # fallback: assume comma / space separated
+            return [s.strip() for s in sec.replace(",", " ").split() if s.strip()]
+    return []
 
-def resize_mel(mel_db: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+
+def create_label_vector(
+    primary_label: str,
+    secondary_labels: Sequence[str] | str | None,
+    class_map: Dict[str, int],
+    *,
+    primary_weight: float = 0.7,
+    secondary_weight: float = 0.3,
+    use_soft: bool = True,
+) -> np.ndarray:
     """
-    Resize a mel spectrogram (in dB) to the target height and width using bilinear interpolation.
-    Preserves dynamic range by normalizing before resize and re-scaling after.
+    Build a label vector of length ``len(class_map)``.
+
+    Parameters
+    ----------
+    primary_label
+        The *primary_label* field from train.csv.
+    secondary_labels
+        Sequence or raw string from *secondary_labels* column.
+    class_map
+        Species → index mapping (from :func:`load_taxonomy`)
+    primary_weight, secondary_weight
+        Weights used when ``use_soft=True`` *and* secondaries exist.
+        They **do not have to sum to 1.0** – this vector is treated as
+        a target *probability* distribution, not necessarily normalised.
+    use_soft
+        If *False*, any present secondary label(s) get **1.0** just like
+        the primary (multi-hot).  If *True*, uses the provided weights.
+
+    Notes
+    -----
+    *Any* unknown species codes are silently ignored (rare but safe).
+    """
+    sec_list = parse_secondary_labels(secondary_labels)
+    n_classes = len(class_map)
+    vec = np.zeros(n_classes, dtype=np.float32)
+
+    # -------- primary ---------------------------------------------------------
+    if primary_label in class_map:
+        vec[class_map[primary_label]] = (
+            primary_weight if (sec_list and use_soft) else 1.0
+        )
+
+    # -------- secondary -------------------------------------------------------
+    if not sec_list:
+        return vec
+
+    if use_soft:
+        per_sec = secondary_weight / len(sec_list)
+        for sp in sec_list:
+            if sp in class_map:
+                vec[class_map[sp]] = per_sec
+    else:  # multi-hot
+        for sp in sec_list:
+            if sp in class_map:
+                vec[class_map[sp]] = 1.0
+    return vec
+
+
+# -----------------------------------------------------------------------------#
+# Misc small helpers                                                           #
+# -----------------------------------------------------------------------------#
+def hash_chunk_id(filename: str, start_sec: float, length: int = 8) -> str:
+    """
+    Short SHA-1 hash for a (file, start_time) pair – good enough for 10⁶+ chunks.
+
+    >>> hash_chunk_id("XC123.ogg", 12.345)
+    'e1a2b3c4'
+    """
+    h = hashlib.sha1(f"{filename}_{start_sec:.3f}".encode()).hexdigest()
+    return h[:length]
+
+
+def resize_mel(
+    mel_db: np.ndarray,
+    target_h: int,
+    target_w: int,
+) -> np.ndarray:
+    """
+    Bilinear-resize a log-mel spectrogram **without destroying its dynamic
+    range** (normalise → resize → de-normalise).
     """
     h, w = mel_db.shape
     if (h, w) == (target_h, target_w):
         return mel_db
-    mel_min, mel_max = mel_db.min(), mel_db.max()
-    # Normalize to 0-255
-    mel_norm = (mel_db - mel_min) / (mel_max - mel_min + 1e-6)
-    mel_img = Image.fromarray((mel_norm * 255).astype(np.uint8))
-    mel_img = mel_img.resize((target_w, target_h), Image.BILINEAR)
-    mel_resized = np.array(mel_img).astype(np.float32) / 255.0
-    # Re-scale to original dB range
-    mel_resized = mel_resized * (mel_max - mel_min + 1e-6) + mel_min
-    return mel_resized
+
+    lo, hi = float(mel_db.min()), float(mel_db.max())
+    norm = (mel_db - lo) / (hi - lo + 1e-6)
+    img = Image.fromarray((norm * 255).astype(np.uint8))
+    img = img.resize((target_w, target_h), Image.BILINEAR)
+    out = np.asarray(img).astype(np.float32) / 255.0
+    return out * (hi - lo) + lo
+
+
+# -----------------------------------------------------------------------------#
+# Voice-activity detection (lazy torch-hub)                                    #
+# -----------------------------------------------------------------------------#
+def load_vad(cache_dir: str | os.PathLike | None = None):
+    """
+    Lazy-load the **Silero VAD** Torch-Script model.
+
+    Returns
+    -------
+    model : torch.jit.ScriptModule
+    helpers : dict[str, callable]
+        Keys: ``get_speech_timestamps``, ``read_audio``,
+        ``save_audio``, ``collect_chunks``, ``merge_chunks``
+    """
+    import importlib
+    import types
+
+    torch = importlib.import_module("torch")  # heavy, but only *inside* the call
+    if cache_dir:
+        os.environ.setdefault("TORCH_HOME", str(Path(cache_dir).expanduser()))
+
+    logging.getLogger("torch.hub").setLevel(logging.ERROR)
+    model, utils_tuple = torch.hub.load(
+        "snakers4/silero-vad",
+        "silero_vad",
+        trust_repo=True,
+        onnx=False,
+        force_reload=False,
+    )
+    (
+        get_speech_timestamps,
+        save_audio,
+        read_audio,
+        VADIterator,
+        collect_chunks,
+    ) = utils_tuple
+
+    helpers = {
+        "get_speech_timestamps": get_speech_timestamps,
+        "save_audio": save_audio,
+        "read_audio": read_audio,
+        "collect_chunks": collect_chunks,
+        # merge_chunks was removed upstream; VADIterator covers it
+        "VADIterator": VADIterator,
+    }
+    return model, helpers
+
+
+# -----------------------------------------------------------------------------#
+# Public re-exports (duplicated in utils/__init__.py)                          #
+# -----------------------------------------------------------------------------#
+__all__ = [
+    "load_taxonomy",
+    "parse_secondary_labels",
+    "create_label_vector",
+    "hash_chunk_id",
+    "resize_mel",
+    "load_vad",
+]

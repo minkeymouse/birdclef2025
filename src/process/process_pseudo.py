@@ -1,211 +1,252 @@
 #!/usr/bin/env python3
 """
-process_pseudo.py – Generate pseudo-labels for remaining unlabeled recordings.
+process_pseudo.py – Expand training data with high‑confidence pseudo‑labels.
 
-Uses the initially trained models to predict labels for all recordings not already in the training set.
-For each recording not in train_metadata (i.e., not processed in golden or rare stages):
- - Splits the recording into chunks (with overlap) for inference,
- - Averages predictions from all available models (ensemble),
- - For each chunk where the top prediction confidence >= threshold, saves that chunk with the model-provided label probabilities as soft labels,
- - Marks these chunks as pseudo-labeled with a lower weight,
- - Appends the new entries to train_metadata.csv.
+After the initial (golden/rare) model training round, this script scans the
+whole *train_audio* archive again and adds chunks **not yet represented** in
+`train_metadata.csv`.
 
-Run after initial model training to expand the training dataset with pseudo-labeled data.
+For every unseen recording it:
+1. Runs VAD + silence checks to discard human speech and empty segments.
+2. Splits into the same 10‑s / 5‑s‑hop windows used for training.
+3. Predicts class probabilities with **all** checkpoints in
+   `/data/birdclef/models` that match the naming pattern
+   `*_initial_*.pth` (torchscript).
+4. Accepts a chunk when `max(probabilities) ≥ selection.pseudo_confidence_threshold`.
+5. Saves the mel array + soft‑label vector and appends a metadata row with
+   reduced sample weight (`labeling.pseudo_label_weight`).
+
+The script is idempotent – duplicate raw waveforms are skipped via an MD5 hash
+cache shared with *process_gold.py*.
 """
-import os, hashlib, logging
+from __future__ import annotations
+
+import hashlib
+import logging
 from pathlib import Path
-import yaml
+from typing import List
+
 import librosa
 import numpy as np
 import pandas as pd
 import torch
-import utils
+import yaml
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("process_pseudo")
+import utils  # project‑local helpers (taxonomy, resize_mel, VAD, hash_chunk_id)
 
-# Load config
-with open("process.yaml", "r") as f:
-    config = yaml.safe_load(f)
-paths_cfg = config["paths"]
-audio_cfg = config["audio"]
-chunk_cfg = config["chunking"]
-mel_cfg = config["mel"]
-sel_cfg = config["selection"]
-label_cfg = config["labeling"]
-DATA_ROOT = Path(paths_cfg["data_root"])
+# -----------------------------------------------------------------------------
+# Config & logging
+# -----------------------------------------------------------------------------
+with open("process.yaml", "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
+
+paths_cfg = CFG["paths"]
+audio_cfg = CFG["audio"]
+chunk_cfg = CFG["chunking"]
+mel_cfg = CFG["mel"]
+sel_cfg = CFG["selection"]
+label_cfg = CFG["labeling"]
+dedup_cfg = CFG["deduplication"]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("process_pseudo")
+
+# -----------------------------------------------------------------------------
+# Paths & dirs
+# -----------------------------------------------------------------------------
 AUDIO_DIR = Path(paths_cfg["audio_dir"])
 PROCESSED_DIR = Path(paths_cfg["processed_dir"])
+MEL_DIR = PROCESSED_DIR / "mels"
+LABEL_DIR = PROCESSED_DIR / "labels"
+for d in (MEL_DIR, LABEL_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
 TRAIN_CSV = Path(paths_cfg["train_csv"])
 METADATA_CSV = Path(paths_cfg["train_metadata"])
-models_dir = Path("/data/birdclef/models")  # directory where initial models are stored (from initial_train stage)
+MODELS_DIR = Path("/data/birdclef/models")
 
-# Load class map and list
+# -----------------------------------------------------------------------------
+# Taxonomy + state
+# -----------------------------------------------------------------------------
 class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), TRAIN_CSV)
-num_classes = len(class_list)
+NUM_CLASSES = len(class_list)
+log.info("Loaded %d classes.", NUM_CLASSES)
 
-# Load train_metadata to find used files
+sample_rate = audio_cfg["sample_rate"]
+chunk_samples = int(chunk_cfg["train_chunk_duration"] * sample_rate)
+hop_samples = int(chunk_cfg["train_chunk_hop"] * sample_rate)
+
+# -----------------------------------------------------------------------------
+# Deduplication cache (shared)
+# -----------------------------------------------------------------------------
+hash_file = PROCESSED_DIR / "audio_hashes.txt"
+seen_hashes: set[str] = set(hash_file.read_text().split()) if hash_file.exists() else set()
+
+# -----------------------------------------------------------------------------
+# Previously used recordings (already in metadata)
+# -----------------------------------------------------------------------------
 if METADATA_CSV.exists():
-    used_files = set(pd.read_csv(METADATA_CSV)["filename"].astype(str).unique())
+    used_files = set(pd.read_csv(METADATA_CSV, usecols=["filename"]).filename.astype(str))
 else:
     used_files = set()
 
-# Prepare models for inference (load all initial trained model checkpoints)
-# We assume initial models are saved with a known naming scheme (as per initial_train.yaml config)
-ensemble_models = []
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Model architecture definitions (match those in initial_train.yaml)
-initial_archs = [("efficientnet_b0", 3), ("regnety_008", 3)]
-for arch_name, count in initial_archs:
-    for i in range(1, count+1):
-        ckpt_path = models_dir / f"{arch_name}_initial_{i}.pth"
-        if not ckpt_path.exists():
-            logger.warning(f"Model checkpoint not found: {ckpt_path}")
-            continue
-        # Load model (assuming torchscript or state dict saved)
-        try:
-            model = torch.jit.load(str(ckpt_path)) if ckpt_path.suffix == ".pt" else None
-        except Exception:
-            model = None
-        if model is None:
-            # If saved as state dict, you'd need model class definitions to load. 
-            # Here we assume model was saved as torchscript or entire model.
-            logger.warning(f"Unable to load model (requires definition): {ckpt_path.name}")
-            continue
-        model.eval().to(device)
-        ensemble_models.append(model)
-logger.info(f"Loaded {len(ensemble_models)} models for pseudo-label inference.")
+# -----------------------------------------------------------------------------
+# Voice‑activity detection helper
+# -----------------------------------------------------------------------------
+try:
+    vad_model, vad_utils = utils.load_vad()
+    get_speech_timestamps = vad_utils["get_speech_timestamps"]
+except Exception:
+    log.warning("VAD not available – pseudo step will not filter speech.")
+    vad_model = None
+    get_speech_timestamps = None
 
-if not ensemble_models:
-    logger.error("No models loaded for inference. Aborting pseudo-labeling.")
-    exit(1)
 
-# Deduplication: prepare seen hashes set including all already used files
-seen_hashes = set()
-hash_file = PROCESSED_DIR / "audio_hashes.txt"
-if hash_file.exists():
-    with open(hash_file, 'r') as hf:
-        for line in hf:
-            seen_hashes.add(line.strip())
+def contains_voice(samples: np.ndarray) -> bool:
+    if vad_model is None:
+        return False
+    ts = get_speech_timestamps(samples, vad_model, sampling_rate=sample_rate, threshold=0.5)
+    return bool(ts)
 
-new_entries = []
-# Iterate over all recordings in train.csv that were not used in training
+# -----------------------------------------------------------------------------
+# Ensemble loading (torchscript only) – any *_initial_*.pth inside MODELS_DIR
+# -----------------------------------------------------------------------------
+ensemble: List[torch.jit.ScriptModule] = []
+for ckpt in MODELS_DIR.glob("*_initial_*.pth"):
+    try:
+        model = torch.jit.load(str(ckpt), map_location="cpu")
+        model.eval()
+        ensemble.append(model)
+        log.info("Loaded %s", ckpt.name)
+    except Exception as e:
+        log.warning("Skipping %s (%s)", ckpt.name, e)
+
+if not ensemble:
+    log.error("No torchscript checkpoints found – aborting pseudo‑labeling.")
+    raise SystemExit(1)
+
+# Move models to GPU if possible
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+for m in ensemble:
+    m.to(DEVICE)
+
+# -----------------------------------------------------------------------------
+# Helper utils
+# -----------------------------------------------------------------------------
+
+def is_silent(wave: np.ndarray, thresh_db: float = -50.0) -> bool:
+    db = 10 * np.log10(np.maximum(1e-12, np.mean(wave ** 2)))
+    return db < thresh_db
+
+# -----------------------------------------------------------------------------
+# Main loop over train.csv
+# -----------------------------------------------------------------------------
 train_df = pd.read_csv(TRAIN_CSV)
-for _, row in train_df.iterrows():
-    file_id = str(row.get("filename") or row.get("file") or row.get("recording_id"))
-    primary_label = row["primary_label"]
-    if file_id in used_files:
-        continue
-    audio_path = AUDIO_DIR / primary_label / file_id
-    if not audio_path.exists():
-        # try with extension
-        found = False
-        for ext in [".ogg", ".mp3", ".wav"]:
-            if (AUDIO_DIR / primary_label / f"{file_id}{ext}").exists():
-                audio_path = AUDIO_DIR / primary_label / f"{file_id}{ext}"
-                found = True
+meta_rows: List[dict] = []
+
+for rec in train_df.itertuples(index=False):
+    rec_file = str(rec.filename)
+    primary_label = rec.primary_label
+
+    if rec_file in used_files:
+        continue  # already covered by golden / rare
+
+    wav_path = AUDIO_DIR / str(primary_label) / rec_file
+    if not wav_path.exists():
+        for ext in (".ogg", ".mp3", ".wav"):
+            alt = wav_path.with_suffix(ext)
+            if alt.exists():
+                wav_path = alt
                 break
-        if not found:
-            logger.warning(f"File not found for pseudo-labeling: {file_id}")
-            continue
-
-    # Dedup check
-    y, sr = librosa.load(audio_path, sr=audio_cfg["sample_rate"], mono=True)
-    audio_hash = hashlib.md5(y.tobytes()).hexdigest()
-    if config["deduplication"]["enabled"] and audio_hash in seen_hashes:
-        logger.info(f"Skipping duplicate (unlabeled) audio: {file_id}")
+    if not wav_path.exists():
+        log.debug("File missing: %s", rec_file)
         continue
-    seen_hashes.add(audio_hash)
 
-    # Trim ends silence
+    # -------- Dedup raw waveform --------
+    y = librosa.load(wav_path, sr=sample_rate, mono=True)[0]
+    h = hashlib.md5(y.tobytes()).hexdigest()
+    if dedup_cfg["enabled"] and h in seen_hashes:
+        continue
+    seen_hashes.add(h)
+
+    # -------- Pre‑cleaning --------
     if audio_cfg["trim_top_db"] is not None:
         y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
     if len(y) == 0:
         continue
 
-    # Chunk for inference (use same chunk length and hop as training)
-    chunk_samples = int(chunk_cfg["train_chunk_duration"] * audio_cfg["sample_rate"])
-    hop_samples = int(chunk_cfg["train_chunk_hop"] * audio_cfg["sample_rate"])
-    total_samples = len(y)
-    # Pad the audio at end to cover last segment fully
-    if total_samples < chunk_samples:
-        # pad with silence to one chunk length
-        pad = chunk_samples - total_samples
-        y = np.concatenate([y, np.zeros(pad, dtype=y.dtype)])
-        total_samples = len(y)
-    elif total_samples % hop_samples != 0:
-        # pad so that the last start index aligns to cover end
-        pad = hop_samples - (total_samples % hop_samples)
-        y = np.concatenate([y, np.zeros(pad, dtype=y.dtype)])
-        total_samples = len(y)
+    # Pad so that last window fits exactly
+    pad = (hop_samples - len(y) % hop_samples) % hop_samples
+    if pad:
+        y = np.pad(y, (0, pad))
+    total_len = len(y)
 
-    # Slide through audio
-    start = 0
-    while start < total_samples:
-        end = start + chunk_samples
-        if end > total_samples:
-            segment = y[start:total_samples]
-            # pad this last segment to full length
-            segment = np.pad(segment, (0, end - total_samples), mode='constant')
-        else:
-            segment = y[start:end]
-        start_sec = start / audio_cfg["sample_rate"]
-        # Compute mel spectrogram for the segment
-        mel_spec = librosa.feature.melspectrogram(segment, sr=audio_cfg["sample_rate"],
-                                                 n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
-                                                 n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"], power=mel_cfg["power"])
-        mel_db = librosa.power_to_db(mel_spec, ref=np.max)
-        # Resize mel to target shape
-        h, w = mel_db.shape
-        target_h, target_w = mel_cfg["target_shape"]
-        if (h, w) != (target_h, target_w):
-            mel_db = utils.resize_mel(mel_db, target_h, target_w)
-        # Convert mel to torch tensor and predict with ensemble
-        mel_tensor = torch.from_numpy(mel_db).unsqueeze(0).unsqueeze(0).to(device)  # shape (1,1,H,W)
-        # If model expects 3-channel input, we would stack mel 3 times here. Assume our models were adapted to 1-channel.
-        avg_pred = np.zeros(num_classes, dtype=np.float32)
+    ptr = 0
+    while ptr + chunk_samples <= total_len:
+        chunk = y[ptr : ptr + chunk_samples]
+        ptr_next = ptr + hop_samples
+        ptr = ptr_next
+
+        if is_silent(chunk):
+            continue
+        if contains_voice(chunk):
+            continue
+
+        # -------- Mel + resize --------
+        mel = librosa.feature.melspectrogram(
+            chunk,
+            sr=sample_rate,
+            n_fft=mel_cfg["n_fft"],
+            hop_length=mel_cfg["hop_length"],
+            n_mels=mel_cfg["n_mels"],
+            fmin=mel_cfg["fmin"],
+            fmax=mel_cfg["fmax"],
+            power=mel_cfg["power"],
+        )
+        mel_db = librosa.power_to_db(mel, ref=np.max)
+        mel_db = utils.resize_mel(mel_db, *mel_cfg["target_shape"]).astype(np.float32)
+
+        # -------- Inference --------
+        x = torch.from_numpy(mel_db).unsqueeze(0).unsqueeze(0).to(DEVICE)
+        probs_sum = np.zeros(NUM_CLASSES, dtype=np.float32)
         with torch.no_grad():
-            for model in ensemble_models:
-                # Each model should output a tensor of shape (1, num_classes) logits
-                logits = model(mel_tensor)
-                probs = torch.sigmoid(logits).cpu().numpy().flatten()  # convert to probabilities
-                avg_pred += probs.astype(np.float32)
-        avg_pred /= len(ensemble_models)
-        # Determine if this chunk has a confident prediction
-        top_prob = float(np.max(avg_pred))
-        if top_prob >= sel_cfg["pseudo_confidence_threshold"]:
-            # Save chunk and pseudo label
-            chunk_id = utils.hash_chunk_id(file_id, start_sec)
-            mel_path = PROCESSED_DIR / "mels" / f"{chunk_id}.npy"
-            label_path = PROCESSED_DIR / "labels" / f"{chunk_id}.npy"
-            np.save(mel_path, mel_db.astype(np.float32))
-            # Save soft label vector (predicted probabilities)
-            label_vec = avg_pred  # already numpy array of float32
-            np.save(label_path, label_vec.astype(np.float32))
-            # Assign weight (pseudo labels have lower weight)
-            w = label_cfg["pseudo_label_weight"]
-            # Optionally scale weight by confidence (not explicitly configured, so skipping)
-            new_entries.append({
-                "filename": file_id,
-                "start_sec": round(start_sec, 3),
+            for model in ensemble:
+                logits = model(x)
+                probs = torch.sigmoid(logits).cpu().numpy().squeeze()
+                probs_sum += probs.astype(np.float32)
+        probs_avg = probs_sum / len(ensemble)
+        if probs_avg.max() < sel_cfg["pseudo_confidence_threshold"]:
+            continue
+
+        # -------- Persist --------
+        chunk_id = utils.hash_chunk_id(rec_file, ptr / sample_rate)
+        mel_path = MEL_DIR / f"{chunk_id}.npy"
+        label_path = LABEL_DIR / f"{chunk_id}.npy"
+        np.save(mel_path, mel_db)
+        np.save(label_path, probs_avg.astype(np.float32))
+
+        meta_rows.append(
+            {
+                "filename": rec_file,
+                "end_sec": round((ptr + chunk_samples) / sample_rate, 3),
                 "mel_path": str(mel_path),
                 "label_path": str(label_path),
-                "weight": float(w),
-                "pseudo": 1
-            })
-        start += hop_samples
-    logger.info(f"Inferred pseudo-labels for file: {file_id}")
+                "weight": float(label_cfg["pseudo_label_weight"]),
+            }
+        )
 
-# Append pseudo-labeled entries to metadata
-if new_entries:
-    md_df = pd.DataFrame(new_entries, columns=["filename","start_sec","mel_path","label_path","weight","pseudo"])
-    md_df.to_csv(METADATA_CSV, mode='a', index=False, header=False)
-    logger.info(f"Appended {len(md_df)} pseudo-labeled chunks to train_metadata.csv.")
+    log.info("Pseudo‑processed %s", rec_file)
+
+# -----------------------------------------------------------------------------
+# Save metadata & hash cache
+# -----------------------------------------------------------------------------
+if meta_rows:
+    out_df = pd.DataFrame(meta_rows)
+    header = not METADATA_CSV.exists()
+    out_df.to_csv(METADATA_CSV, mode="a", index=False, header=header)
+    log.info("Added %d pseudo‑labelled chunks → %s", len(out_df), METADATA_CSV)
 else:
-    logger.info("No pseudo-labeled chunks added (no confident predictions).")
+    log.info("No new pseudo‑labelled chunks generated.")
 
-# Update dedup hash record
-if config["deduplication"]["enabled"]:
-    with open(PROCESSED_DIR / "audio_hashes.txt", 'w') as hf:
-        for h in seen_hashes:
-            hf.write(f"{h}\n")
+if dedup_cfg["enabled"]:
+    hash_file.write_text("\n".join(seen_hashes))
