@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-process_gold.py – Generate high-confidence “golden” training chunks for BirdCLEF-2025.
+process_initial.py – Generate high-confidence initial training chunks for BirdCLEF-2025.
 
 Pipeline
 --------

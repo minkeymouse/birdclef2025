@@ -173,8 +173,8 @@ def train_model(
             eta_min=float(sch_cfg.get("eta_min", 1e-6)),
         )
 
-    best_scores: List[float] = []
-    best_ckpts: List[str] = []
+    best_score: float = float("-inf")
+    best_ckpt: Optional[str] = None
     mdir = Path(config["paths"]["models_dir"])
     mdir.mkdir(parents=True, exist_ok=True)
     arch = config.get("current_arch", "model")
@@ -213,20 +213,18 @@ def train_model(
 
         fname = f"{arch}_run{run_id}_epoch{epoch}_auc{val_auc:.4f}_{int(time.time())}.pth"
         fpath = mdir / fname
-        if len(best_scores) < 3 or val_auc > min(best_scores):
-            torch.save({"model_state_dict": model.state_dict(), "class_map": config.get("class_map")}, str(fpath))
-            if len(best_scores) < 3:
-                best_scores.append(val_auc)
-                best_ckpts.append(str(fpath))
-            else:
-                worst = int(np.argmin(best_scores))
-                try:
-                    os.remove(best_ckpts[worst])
-                except FileNotFoundError:
-                    pass
-                best_scores[worst] = val_auc
-                best_ckpts[worst] = str(fpath)
-            print(f"  → checkpoint saved: {fpath}")
+        # if this epoch is better than any before, drop the old and save new
+        if val_auc > best_score:
+            if best_ckpt is not None:
+                try: os.remove(best_ckpt)
+                except OSError: pass
+            torch.save(
+                {"model_state_dict": model.state_dict(), "class_map": config.get("class_map")},
+                str(fpath),
+            )
+            best_score = val_auc
+            best_ckpt   = str(fpath)
+            print(f"  → new best checkpoint: {fpath} (AUC {val_auc:.4f})")
 
-    order = sorted(range(len(best_scores)), key=lambda i: best_scores[i], reverse=True)
-    return [best_ckpts[i] for i in order]
+    return [best_ckpt] if best_ckpt is not None else []
+

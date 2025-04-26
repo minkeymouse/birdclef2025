@@ -189,17 +189,18 @@ def is_silent(
     db = 20 * np.log10(rms + 1e-12)
     return db < db_thresh
 
+# load the VAD model exactly once
+_VAD_MODEL, _VAD_UTILS = torch.hub.load(
+    repo_or_dir='snakers4/silero-vad',
+    model='silero_vad',
+    skip_validation=True,
+    force_reload=False
+)
+(_GET_SPEECH_TS, *_) = _VAD_UTILS
 
 def load_vad() -> Tuple["torch.jit.ScriptModule", Callable]:
-    """
-    Lazy-load Silero VAD model and its get_speech_timestamps fn.
-    """
-    import torch
-    model, utils_tuple = torch.hub.load(
-        repo_or_dir='snakers4/silero-vad', model='silero_vad', skip_validation=True, force_reload=False
-    )
-    (get_speech_timestamps, *_) = utils_tuple
-    return model, get_speech_timestamps
+    """Return the cached Silero VAD model and timestamp fn."""
+    return _VAD_MODEL, _GET_SPEECH_TS
 
 
 def contains_voice(
@@ -210,7 +211,6 @@ def contains_voice(
     """
     Check if the audio contains speech using Silero VAD.
     """
-    import torch
     model, get_speech_ts = load_vad()
     tensor = torch.from_numpy(samples).float()
     speech_ts = get_speech_ts(tensor, model, sampling_rate=sr, threshold=threshold)

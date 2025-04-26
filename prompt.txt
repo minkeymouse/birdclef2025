@@ -1,106 +1,2440 @@
-FYI
+I have ran the following code so far.
 
-GENERAL FLOW
+Tree structure:
 
-We read /data/birdclef/train.csv. The file contains columns 'primary_label', 'secondary_labels', 'type', 'filename', 'collection',
-       'rating', 'url', 'latitude', 'longitude', 'scientific_name',
-       'common_name', 'author', 'license'.
-We will be using 'primary_label', 'secondary_labels', 'type', 'filename', 'rating', 'latitude', 'longitude' For our analysis.
-Observing the data, I found that for the files that has rating of 5 they only had one label each.
+(birdclef) (base) minkeymouse@mvalley:~/kaggle_projects/birdclef$ tree
+.
+├── config
+│   ├── process.yaml
+│   └── train.yaml
+├── data -> /data
+├── logs
+├── models
+│   ├── efficientnet_b0_run1_epoch49_auc0.9995_1745550002.pth
+│   ├── efficientnet_b0_run2_epoch50_auc0.9997_1745553137.pth
+│   ├── efficientnet_b0_run3_epoch50_auc0.9996_1745556210.pth
+│   ├── regnety_800mf_run1_epoch50_auc0.9996_1745558776.pth
+│   ├── regnety_800mf_run2_epoch50_auc0.9994_1745561341.pth
+│   └── regnety_800mf_run3_epoch50_auc0.9994_1745563904.pth
+├── notebooks
+│   └── notebook.ipynb
+├── prompt.txt
+└── src
+    ├── __init__.py
+    ├── process
+    │   ├── __init__.py
+    │   ├── process_initial.py
+    │   ├── process_pseudo_labels.py
+    │   ├── process_resample.py
+    │   ├── process.synthesis.py
+    │   └── __pycache__
+    │       ├── __init__.cpython-312.pyc
+    │       └── process_gold.cpython-312.pyc
+    ├── __pycache__
+    │   └── __init__.cpython-312.pyc
+    ├── submission.py
+    ├── train
+    │   ├── dataloader.py
+    │   ├── __init__.py
+    │   ├── __pycache__
+    │   │   ├── dataloader.cpython-312.pyc
+    │   │   └── __init__.cpython-312.pyc
+    │   ├── train_efficientnet.py
+    │   └── train_regnety.py
+    └── utils
+        ├── __init__.py
+        ├── metrics.py
+        ├── __pycache__
+        │   ├── __init__.cpython-312.pyc
+        │   ├── metrics.cpython-312.pyc
+        │   └── utils.cpython-312.pyc
+        └── utils.py
 
-Example train.csv from /data/birdclef/train.csv
-primary_label,secondary_labels,type,filename,collection,rating,url,latitude,longitude,scientific_name,common_name,author,license
-1139490,[''],[''],1139490/CSA36385.ogg,CSA,0,http://colecciones.humboldt.org.co/rec/sonidos/IAvH-CSA-36385/IAvH-CSA-36385.mp3,7.3206,-73.7128,Ragoniella pulchella,Ragoniella pulchella,Fabio A. Sarria-S,cc-by-nc-sa 4.0
-1139490,[''],[''],1139490/CSA36389.ogg,CSA,0,http://colecciones.humboldt.org.co/rec/sonidos/IAvH-CSA-36389/IAvH-CSA-36389.mp3,7.3206,-73.7128,Ragoniella pulchella,Ragoniella pulchella,Fabio A. Sarria-S,cc-by-nc-sa 4.0
-1192948,[''],[''],1192948/CSA36358.ogg,CSA,0,http://colecciones.humboldt.org.co/rec/sonidos/IAvH-CSA-36358/IAvH-CSA-36358.mp3,7.3791,-73.7313,Oxyprora surinamensis,Oxyprora surinamensis,Fabio A. Sarria-S,cc-by-nc-sa 4.0
+14 directories, 32 files
+(birdclef) (base) minkeymouse@mvalley:~/kaggle_projects/birdclef$ 
+
+configurations
+
+# process.yaml ― central configuration for BirdCLEF-2025 data pipeline
+# -------------------------------------------------------------------
+paths:
+  data_root: "data/birdclef"                         # project root
+  train_csv: "data/birdclef/train.csv"               # master metadata
+  taxonomy_csv: "data/birdclef/taxonomy.csv"         # species ↔︎ index map
+  audio_dir: "data/birdclef/train_audio"             # raw recordings (sub-dir per species)
+  processed_dir: "data/birdclef/DATABASE/"           # output root for chunks / labels
+  train_metadata: "data/birdclef/DATABASE/train_metadata.csv"  
+  minority_samples: "data/birdclef/DATABASE/samples"
+  train_soundscapes: "data/birdclef/train_soundscapes"
+  synthetic_dir: "data/birdclef/DATABASE/synthetic"           # optional: synthetic clips by species
+
+audio:
+  sample_rate: 32000          # Hz – all audio is resampled to this
+  trim_top_db: 20             # dB – silence threshold for librosa.effects.trim
+  min_duration: 5.0           # s  – shorter clips are cyclic-padded / looped
+  
+chunking:
+  train_chunk_duration: 10.0  # s – chunk length used for training
+  train_chunk_hop: 5.0        # s – hop between consecutive chunks
+  eval_segment_duration: 5.0  # s – window size used at inference time
+
+mel:
+  n_fft: 1024                 # STFT window size
+  hop_length: 500             # STFT hop (samples)
+  n_mels: 128                 # mel filter banks
+  fmin: 40                    # Hz – lower mel bound
+  fmax: 15000                 # Hz – upper mel bound
+  power: 2.0                  # 1.0 = magnitude, 2.0 = power
+  target_shape: [256, 256]    # (height, width) after resizing
+
+deduplication:
+  enabled: true               # skip identical waveforms
+  method: "hash"              # current implementation = MD5 of resampled raw
+
+selection:
+  golden_rating: 5                # ≥ this & no secondary labels → golden set
+  minimum_rating: 3            
+  rare_species_threshold: 100      # < this recordings → rare species
+  max_count: 300
+  synthetic_target_count: 20      # if real < this, top-up with synthetic audio
+  pseudo_confidence_threshold: 0.5  # min prob for accepting pseudo-labels
 
 
-We will first construct our 'golden' dataset with these 5 rating one-labeled data. divide them into 10 second chunks and drop bad chunks, drop duplicate, drop human voices.
-Their label tensor will be 206 dimension and only has 1 for 1 corresponding index. class and index mapping is given in CFG. File's directory is given at CFG too.
-After processing the data, we now have 10 seconds chunks mel-spectogram tensor and corresponding label tensor. We need to save the meta data in new train_metadata.csv file in current directory.
-This train_metadata file will have each row for a chunk with columns 'filename', 'end_sec', 'mel_path', 'label_path', 'weight'.
-With this golden data, we will now construct training database further but only with those under-represented.
-The goal is to make as promising data as possible for initial training. Since there are about 26000 audio files and exactly 206 species, I want to add training files with following rule.
-I have following "rate_count.csv" file ready at my home directory.
-
-primary_label,rating,count
-21038,0,2
-21116,0,2
-21211,0,8
-21211,2,4
-21211,3,44
-21211,4,19
-21211,5,1
-22333,0,43
-22333,3,1
-22333,4,2
-22333,5,1
-22973,0,40
-...
-
-With this file we selectively choose files to make them into mel chunks. With some rules, we choose so called 'golden' filebase for initial training.
-For instance, if we have certain species with more than 100 5 rating files, we don't collect them any more.
-Also, we must include all the files that has sum of less than 20, we include all of them regardless of their ratings.
-With this rule in mind, we select files. Since now files have minorities, we should start doing the labeling.
-If there's not secondary label, we just create the one hot encoded vector label and save it with mel file and record this into train_metadata.csv.
-However, if there's secondary label, we first mark primary label's class with 1 and secondary labels with 0.05s.
-For instance, if a file has secondary label of 5 species, from the first to last in the list they get labels for 0.05.
-For the weight, if the file is rated 5 and has only one label, it has highest weight which is 1. However, if the file is from minority (less than 20) they also get weight of 1.
-weight will be used in dataloader for sampling the chunks.
-Now for the rest of the files, we use the similar strategy. We will control the data by pseudo labelling and weights.
-Files from minorities will get higher weights and files from abundant species will get smaller weights.
-For the labels, in initialization, primary label gets 1 and secondary labels get 0.05. I haven't decided on weight strategy so you should find your best way to do this.
-After initial set up with labelled data is done, we will train the model.
-We will be training 3 best models for each: efficientnet and regnety. We will save the model results in /data/birdclef/models with proper names.
-Though previous code uses benchmarks, we will not be using benchmarks of any. Our 6 models will become benchmarks.
-
-Once the training is done, we will make inferences based on trained models on chunks so we can make them more precise.
-For instance, with this process, we will be able to identify exactly which chunks contain birdcalls and which chunks contain secondary labels.
-Once inference is done, we will compare the result with actual train_metadata.
-If certain chunk does have species with higher probability than 0.5 and in metadata it is said to have such species(first or secondary label), then we will update the label for that species of that chunk into 1.
-Now once label is updated and noises are dropped, we will do the training again with updated label.
-Such overfitting is (I think) good because our competition is closed set on 206 classes of birds.
-We will repeat the process about 5 times and then we will have our best 6 models.
-
-Now it's time to label unlabeled soundscapes.
-
-First we will make inferences and create pseudo labels with our model.
-Then, Using our 'golden data' with all the classes available as validation set, we will train our model with mixture of chunks from labeled and pseudo labelled data.
-After some iteration, we will have our 6 another updated models.
-
-Then, we will apply mixing of sounds(using golden data to create soundscapes) and synthetic data to create additional datasets.
-With these additional dataset, we will also train the model again.
-
-Then, we will submit.
+labeling:
+  use_soft_labels: true           # multi-label vectors instead of strict one-hot
+  primary_label_weight: 0.7       # weight for primary species (when soft labels used)
+  secondary_label_weight: 0.3     # total weight shared across secondary species
+  pseudo_label_weight: 0.5        # down-weight pseudo-labelled chunks
+  rare_label_weight: 1.0          # weight multiplier for rare-class samples
 
 
-TRAINING DETAILS
+# config/train.yaml ─ baseline training configuration
+# ---------------------------------------------------
+# Only the keys referenced in the training scripts are included;
+# any extra keys will be ignored by the loaders.
 
-More specifically, training and inference will be done with following steps.
-1. Batch of mels and labels will be loaded for training. As we load, some additional processing such as augmentation, masking will be done.
-2. In the training, We will be using 10 seconds chunk and use CE(Cross Entropy, NOT BINARY cross entropy) with 206 labels.
-3. we will use weights of 0.5 of first half and 0.5 of second half for prediction probability. Loss will be calculated based on this procedure.
-4. Then, we will save the best 3 models to the /models/ directory with efficientnet_[current time].pth or regnety_[current time].pth.
-5. Inference will use these average of time chunks from each models to produce prediction probability. For each model, 3 models min will be used as prediction for labeling. Among 2 results from each model, we will again average the probability to produce final prediction for each chunk.
-6. For inference, it is complicated. We will use consecutive 5 chunks (t-2, t-1, t, t+1, t+2) and average the probability. This will yield prob for efficientnet_1.
-7. Among efficientnet_1, efficientnet_2, efficientnet_3 we will use min of these 3 probs for one single prob labels for efficiennet. Among prob from efficientnet and regnety, we will average them.
-8. This will yield one final probability labels for each 5 second chunk. We will now save updated label for each chunk in our training database.
-9. This ends training-inference procedure.
+dataset:
+  # Meta-data CSV produced by process.py
+  train_metadata: "data/birdclef/DATABASE/train_metadata.csv"
+  train_csv: "data/birdclef/train.csv"
+  target_shape: [256, 256]
+  # Toggle inclusion of additional data sources
+  include_pseudo: false          # (soundscape_metadata.csv)
+  include_synthetic: false       # (DiffWave-generated clips)
 
-SPECIFIC AUTOML WORKFLOW
+model:
+  architectures:
+    # 1) EfficientNet-B0 ensemble
+    - name: "efficientnet_b0"
+      num_models: 3              
 
-Following is how I will run the automl.
+    # 2) RegNetY-0.8 GF ensemble
+    - name: "regnety_800mf"      
+      num_models: 3
 
-1. ssh to my server and move to the project directory.
-2. tmux new -s birdclef
-3. conda activate birdclef
-4. Run automl with initial mode like --initial
- - This will build 'golden' initial DATABASE with 10 seconds chunks in DATABASE/ directory: DATABASE/mels, DATABASE/labels, DATABASE/train_metadata.csv
- - After golden database with all 206 classes created, it will train initial 6 models, 3 efficientnet, 3 regnety.
- - Use these models to do inference and create labels in train_soundscapes data. Read each file in /data/birdclef/train_soundscapes, use our inference logic to label them. Save the mels, labels, and metadata. Create flag for soundscape files in metadata.
- - No additional inference is run here, prints initialization complete.
-5. Then, I will run automl and it has 3 stages. This will be iterated n times as argument --iterate n or something like this.
- - 1st stage: Randomly sample 2000 files from train_audio focusing on minority species. Make the copy .ogg files and save the copies in DATABASE/samples directory with names original_name_copied_[time stamp].ogg. Then, Use such copied ogg files to create mels with proper processing such as dropping noise, dropping no sounds removing voices, etc. Then, labels, add lines to train_metadata.csv for mapping.
- - 2nd stage: Train the model. Apply all necessary augmentations or techniques. Now we have new 6 .pth checkpoints updated and saved.
- - 3rd stage: Inference and update labels in soundscapes files. For new label vector of each species, p_new = p_old + \sqrt{p(1-p)}/260 is updating rule for probability but you can use better ones.
-6. Lastly, After iterations are complete, save the resulting models, labels. Also save result summary(running time collected, logging, results) in one file as .txt and save it into /output/ directory.
+training:
+  epochs: 50
+  batch_size: 32
+  num_workers: 4
+  val_fraction: 0.10             # ← scripts already default to 0.1
+  seed: 42                       # base seed; each run adds +run_id
+
+optimizer:
+  type: "AdamW"
+  lr: 2.0e-3                     # initial LR
+  weight_decay: 1.0e-4
+
+loss:
+  efficientnet: "CE"
+  regnety: "CE"                       # CrossEntropyLoss
+
+scheduler:
+  type: "CosineAnnealingLR"
+  T_max: 10                      # same as epochs
+  eta_min: 1.0e-6
+
+paths:
+  models_dir: "models"  # where to save checkpoints
+
+data processing code(initial run)
+
+#!/usr/bin/env python3
+"""
+process_initial.py – Generate high-confidence initial training chunks for BirdCLEF-2025.
+
+Pipeline
+--------
+1. Read **process.yaml** for paths and hyper-parameters.
+2. Filter `train.csv` to recordings that satisfy:
+   • rating ≥ selection.golden_rating (default 5)
+   • zero secondary labels when selection.require_single_label is true.
+3. For each qualifying recording:
+   a. Deduplicate by MD5 hash of the raw waveform.
+   b. Trim leading/trailing silence.
+   c. Ensure ≥ audio.min_duration by cyclic-padding.
+   d. Slide a 10-second window with 5-second hop:
+      – Skip if too silent or contains human speech.
+      – Save mel-spectrogram and 1-hot label vector.
+      – Record metadata with weight = `labeling.golden_label_weight`.
+4. Persist updated `audio_hashes.txt` and `train_metadata.csv`.
+"""
+from __future__ import annotations
+import hashlib
+import logging
+import sys
+from pathlib import Path
+from typing import List
+
+import librosa
+import numpy as np
+import pandas as pd
+import yaml
+
+project_root = Path(__file__).resolve().parents[2]
+config_path = project_root / "config" / "process.yaml"
+sys.path.insert(0, str(project_root))
+from src.utils import utils
+
+with open(config_path, "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
+paths_cfg = CFG["paths"]
+audio_cfg = CFG["audio"]
+chunk_cfg = CFG["chunking"]
+mel_cfg = CFG["mel"]
+sel_cfg = CFG["selection"]
+label_cfg = CFG["labeling"]
+dedup_cfg = CFG["deduplication"]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("process_gold")
+
+AUDIO_DIR = Path(paths_cfg["audio_dir"])
+PROCESSED_DIR = Path(paths_cfg["processed_dir"])
+MEL_DIR = PROCESSED_DIR / "mels"
+LABEL_DIR = PROCESSED_DIR / "labels"
+MEL_DIR.mkdir(parents=True, exist_ok=True)
+LABEL_DIR.mkdir(parents=True, exist_ok=True)
+METADATA_CSV = Path(paths_cfg["train_metadata"])
+TRAIN_CSV = Path(paths_cfg["train_csv"])
+HASH_FILE = PROCESSED_DIR / "audio_hashes.txt"
+
+class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), TRAIN_CSV)
+NUM_CLASSES = len(class_list)
+seen_hashes: set[str] = set()
+if HASH_FILE.exists():
+    seen_hashes.update(HASH_FILE.read_text().splitlines())
+
+df = pd.read_csv(TRAIN_CSV)
+golden_rating = sel_cfg["golden_rating"]
+rare_species_thresh = sel_cfg["rare_species_threshold"]
+
+best_rating_df = df[df["rating"] >= golden_rating]
+label_counts = df.groupby("primary_label")["filename"].transform("count")
+minority_df = df[label_counts < rare_species_thresh]
+golden_df = pd.concat([best_rating_df, minority_df], ignore_index=True)
+selected_labels = set(golden_df["primary_label"].unique())
+
+for offset in [0.5, 1, 1.5, 2]:
+    threshold = golden_rating - offset
+    sub_df = df[df["rating"] >= threshold]
+    new_df = sub_df[~sub_df["primary_label"].isin(selected_labels)]
+    if not new_df.empty:
+        golden_df = pd.concat([golden_df, new_df], ignore_index=True)
+        selected_labels |= set(new_df["primary_label"].unique())
+
+golden_df = golden_df.drop_duplicates(subset=["filename"])
+
+chunk_sec = chunk_cfg["train_chunk_duration"]
+hop_sec = chunk_cfg["train_chunk_hop"]
+sample_rate = audio_cfg["sample_rate"]
+chunk_samples = int(chunk_sec * sample_rate)
+hop_samples = int(hop_sec * sample_rate)
+
+meta_rows: List[dict] = []
+for rec in golden_df.itertuples(index=False):
+    fname = rec.filename
+    label = str(rec.primary_label)
+    audio_path = AUDIO_DIR / fname
+    if not audio_path.exists():
+        log.warning("Missing file: %s", fname)
+        continue
+    y, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
+    h = hashlib.md5(y.tobytes()).hexdigest()
+    if dedup_cfg.get("enabled", False) and h in seen_hashes:
+        continue
+    seen_hashes.add(h)
+    if audio_cfg.get("trim_top_db") is not None:
+        y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
+    if y.size == 0:
+        continue
+    min_dur = int(audio_cfg["min_duration"] * sample_rate)
+    if y.size < min_dur:
+        reps = int(np.ceil(min_dur / y.size))
+        y = np.tile(y, reps)[:min_dur]
+    total = len(y)
+    ptr = 0
+    while ptr + chunk_samples <= total:
+        chunk = y[ptr : ptr + chunk_samples]
+        ptr += hop_samples
+        if utils.is_silent(chunk, db_thresh=audio_cfg.get("silence_thresh_db", -50.0)):
+            continue
+        if utils.contains_voice(chunk, sample_rate):
+            continue
+        m = librosa.feature.melspectrogram(
+            y=chunk,
+            sr=sample_rate,
+            n_fft=mel_cfg["n_fft"],
+            hop_length=mel_cfg["hop_length"],
+            n_mels=mel_cfg["n_mels"],
+            fmin=mel_cfg["fmin"],
+            fmax=mel_cfg["fmax"],
+            power=mel_cfg["power"],
+        )
+        mel_db = librosa.power_to_db(m, ref=np.max)
+        mel_db = utils.resize_mel(mel_db, *mel_cfg["target_shape"]).astype(np.float32)
+        chunk_id = utils.hash_chunk_id(fname, ptr / sample_rate)
+        mel_path = MEL_DIR / f"{chunk_id}.npy"
+        label_path = LABEL_DIR / f"{chunk_id}.npy"
+        np.save(mel_path, mel_db)
+        lbl = np.zeros(NUM_CLASSES, dtype=np.float32)
+        idx = class_map.get(label)
+        if idx is None:
+            continue
+        lbl[idx] = 1.0
+        np.save(label_path, lbl)
+        meta_rows.append(
+            {
+                "filename": fname,
+                "end_sec": round(ptr / sample_rate, 3),
+                "mel_path": str(mel_path),
+                "label_path": str(label_path),
+                "weight": float(label_cfg.get("golden_label_weight", 1.0)),
+            }
+        )
+
+meta_df = pd.DataFrame(meta_rows)
+if METADATA_CSV.exists():
+    existing = pd.read_csv(METADATA_CSV)
+    meta_df = pd.concat([existing, meta_df], ignore_index=True)
+meta_df.to_csv(METADATA_CSV, index=False)
+
+with HASH_FILE.open("w") as f:
+    f.write("\n".join(sorted(seen_hashes)))
+
+Ran this code to generate mels/labels from train_audio datasets.
+
+Then, I ran following codes to train initial models.
+
+#!/usr/bin/env python3
+"""
+dataloader.py – dataset, sampler, and training loop utilities
+============================================================
+Shared by train_efficientnet.py and train_regnety.py.
+
+Classes:
+- BirdClefDataset   — loads mel-spectrogram chunks and soft-label vectors from metadata.
+- create_dataloader — builds a PyTorch DataLoader with optional WeightedRandomSampler.
+- train_model      — generic training loop with Soft Cross-Entropy and sample weighting,
+                     saving top-3 checkpoints by macro-AUC (imported from metrics module).
+"""
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+# project imports
+project_root = Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(project_root))
+from src.utils.metrics import macro_auc_score, macro_precision_score
+
+__all__ = ["BirdClefDataset", "create_dataloader", "train_model"]
+
+
+class BirdClefDataset(Dataset):
+    """Dataset for BirdCLEF: loads mel-spectrograms and label vectors from metadata."""
+
+    def __init__(
+        self,
+        metadata_df: pd.DataFrame,
+        class_map: Dict[str, int],
+        *,
+        mel_shape: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        self.df = metadata_df.reset_index(drop=True)
+        self.class_map = class_map
+        self.num_classes = len(class_map)
+        self.augment = augment
+
+        # infer mel_shape if not provided
+        if mel_shape is None:
+            sample_path = self.df.iloc[0]["mel_path"]
+            sample = np.load(sample_path)
+            self.mel_shape = sample.shape
+        else:
+            self.mel_shape = mel_shape
+
+        # extract sample weights
+        self._weights = self.df.get("weight", pd.Series(1.0, index=self.df.index))
+        self._weights = self._weights.fillna(1.0).astype(np.float32).to_numpy()
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, index: int):
+        row = self.df.iloc[index]
+        mel_path = row.get("mel_path")
+        label_path = row.get("label_path")
+        if not mel_path or pd.isna(mel_path):
+            raise FileNotFoundError("Missing 'mel_path' in metadata.")
+        if not label_path or pd.isna(label_path):
+            raise FileNotFoundError("Missing 'label_path' in metadata.")
+
+        mel = np.load(mel_path)
+        label_vec = np.load(label_path).astype(np.float32)
+
+        # resize if shape mismatch
+        if mel.shape != tuple(self.mel_shape):
+            mel = cv2.resize(mel, (self.mel_shape[1], self.mel_shape[0]))
+        if self.augment:
+            mel = self._augment_mel(mel)
+
+        # convert to 3-channel image tensor
+        mel_tensor = torch.from_numpy(mel).unsqueeze(0).repeat(3, 1, 1).float()
+        weight = torch.tensor(self._weights[index], dtype=torch.float32)
+        return mel_tensor, torch.from_numpy(label_vec), weight
+
+    def _augment_mel(self, mel: np.ndarray) -> np.ndarray:
+        """Random time-frequency masking (SpecAugment-style)."""
+        h, w = mel.shape
+        # freq mask
+        for _ in range(np.random.randint(1, 3)):
+            f0 = np.random.randint(0, h)
+            f_len = np.random.randint(5, max(6, h // 8 + 1))
+            mel[f0 : f0 + f_len, :] = mel.mean()
+        # time mask
+        for _ in range(np.random.randint(1, 3)):
+            t0 = np.random.randint(0, w)
+            t_len = np.random.randint(5, max(6, w // 8 + 1))
+            mel[:, t0 : t0 + t_len] = mel.mean()
+        return mel
+
+
+def create_dataloader(
+    dataset: BirdClefDataset,
+    *,
+    batch_size: int,
+    shuffle: bool = False,
+    num_workers: Optional[int] = None,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """Build DataLoader; use WeightedRandomSampler if sample weights vary."""
+    if num_workers is None:
+        num_workers = 0 if os.name == "nt" else 4
+
+    weights = getattr(dataset, "_weights", None)
+    if weights is not None and not np.allclose(weights, 1.0):
+        sampler = WeightedRandomSampler(
+            weights=list(weights),
+            num_samples=len(dataset),
+            replacement=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+def _soft_ce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Soft Cross-Entropy loss for probability targets."""
+    log_prob = torch.log_softmax(logits, dim=1)
+    return -(targets * log_prob).sum(dim=1)
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    config: dict,
+    device: torch.device,
+) -> List[str]:
+    """Train model, save top-3 checkpoints by macro-AUC, and return their paths."""
+    epochs = int(config["training"]["epochs"])
+    opt_cfg = config.get("optimizer", {})
+    lr = float(opt_cfg.get("lr", 1e-3))
+    wd = float(opt_cfg.get("weight_decay", 0.0))
+    opt_type = opt_cfg.get("type", "adamw").lower()
+    optimizer = (
+        optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        if opt_type == "adamw"
+        else optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    )
+
+    sch_cfg = config.get("scheduler", {})
+    scheduler = None
+    if sch_cfg.get("type") == "CosineAnnealingLR":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(sch_cfg.get("T_max", epochs)),
+            eta_min=float(sch_cfg.get("eta_min", 1e-6)),
+        )
+
+    best_score: float = float("-inf")
+    best_ckpt: Optional[str] = None
+    mdir = Path(config["paths"]["models_dir"])
+    mdir.mkdir(parents=True, exist_ok=True)
+    arch = config.get("current_arch", "model")
+    run_id = config.get("current_run", 1)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for x, y, w in train_loader:
+            x, y, w = x.to(device), y.to(device), w.to(device)
+            optimizer.zero_grad()
+            loss = (_soft_ce_loss(model(x), y) * w).mean()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * x.size(0)
+        if scheduler:
+            scheduler.step()
+        avg_loss = total_loss / len(train_loader.dataset)
+
+        model.eval()
+        preds, gts = [], []
+        with torch.no_grad():
+            for x, y, _ in val_loader:
+                logits = model(x.to(device))
+                preds.append(torch.softmax(logits, dim=1).cpu().numpy())
+                gts.append(y.numpy())
+        y_pred = np.vstack(preds)
+        y_true = np.vstack(gts)
+
+        val_auc = macro_auc_score(y_true, y_pred)
+        val_prec = macro_precision_score(y_true, y_pred)
+        print(
+            f"Epoch {epoch}/{epochs} | loss {avg_loss:.4f} | "
+            f"AUC {val_auc:.4f} | Precision {val_prec:.4f}"
+        )
+
+        fname = f"{arch}_run{run_id}_epoch{epoch}_auc{val_auc:.4f}_{int(time.time())}.pth"
+        fpath = mdir / fname
+        # if this epoch is better than any before, drop the old and save new
+        if val_auc > best_score:
+            if best_ckpt is not None:
+                try: os.remove(best_ckpt)
+                except OSError: pass
+            torch.save(
+                {"model_state_dict": model.state_dict(), "class_map": config.get("class_map")},
+                str(fpath),
+            )
+            best_score = val_auc
+            best_ckpt   = str(fpath)
+            print(f"  → new best checkpoint: {fpath} (AUC {val_auc:.4f})")
+
+    return [best_ckpt] if best_ckpt is not None else []
+
+#!/usr/bin/env python3
+"""
+train_regnety.py – RegNetY-800MF ensemble trainer
+================================================
+Train **N** RegNetY-800MF models (different random seeds) on the BirdCLEF
+10-second-chunk dataset using a YAML configuration file.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import yaml
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from torchvision import models
+
+# project imports
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+from src.train.dataloader import BirdClefDataset, create_dataloader, train_model
+from src.utils import utils
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train an ensemble of RegNetY-800MF models on BirdCLEF data"
+    )
+    parser.add_argument(
+        "--config", "-c",
+        type=Path,
+        default=project_root / "config" / "train.yaml",
+        help="Path to training config YAML"
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    # Load configuration
+    with open(args.config, "r", encoding="utf-8") as f:
+        CFG = yaml.safe_load(f)
+
+    # Pull sections
+    dataset_cfg   = CFG.get("dataset", {})
+    model_cfg     = CFG.get("model", {})
+    training_cfg  = CFG.get("training", {})
+    optimizer_cfg = CFG.get("optimizer", {})
+    loss_cfg      = CFG.get("loss", {})
+    scheduler_cfg = CFG.get("scheduler", {})
+    paths_cfg     = CFG.get("paths", {})
+
+    # Locate RegNetY block
+    archs = model_cfg.get("architectures", [])
+    reg_cfg = next(
+        (a for a in archs if a.get("name", "").lower().startswith("regnety")),
+        None,
+    )
+    if reg_cfg is None:
+        raise ValueError("No RegNetY entry found under model.architectures in config.")
+    model_name = reg_cfg["name"]
+    num_models = int(reg_cfg.get("num_models", 1))
+    pretrained = bool(reg_cfg.get("pretrained", True))
+
+    # ----------------------------------
+    # Load and prepare metadata
+    # ----------------------------------
+    df_meta = pd.read_csv(dataset_cfg.get("train_metadata"))
+    # Optionally include pseudo or synthetic data
+    if dataset_cfg.get("include_pseudo", False):
+        pseudo_path = Path(dataset_cfg.get("train_metadata")).with_name("soundscape_metadata.csv")
+        if pseudo_path.is_file():
+            df_meta = pd.concat([df_meta, pd.read_csv(pseudo_path)], ignore_index=True)
+    if dataset_cfg.get("include_synthetic", False):
+        synth_path = Path(dataset_cfg.get("train_metadata")).with_name("synthetic_metadata.csv")
+        if synth_path.is_file():
+            df_meta = pd.concat([df_meta, pd.read_csv(synth_path)], ignore_index=True)
+
+    # Class list and map
+    class_list, class_map = utils.load_taxonomy(
+        paths_cfg.get("taxonomy_csv"),
+        dataset_cfg.get("train_csv")
+    )
+
+    # Train/validation split
+    val_frac  = float(training_cfg.get("val_fraction", 0.1))
+    base_seed = int(training_cfg.get("seed", 42))
+    df_val    = df_meta.sample(frac=val_frac, random_state=base_seed)
+    df_train  = df_meta.drop(df_val.index).reset_index(drop=True)
+    df_val    = df_val.reset_index(drop=True)
+
+    # ----------------------------------
+    # Datasets & DataLoaders
+    # ----------------------------------
+    mel_shape   = tuple(dataset_cfg.get("target_shape", [256, 256]))
+    batch_size  = int(training_cfg.get("batch_size", 32))
+    num_workers = int(training_cfg.get("num_workers", 4))
+
+    train_ds = BirdClefDataset(df_train, class_map, mel_shape=mel_shape, augment=True)
+    val_ds   = BirdClefDataset(df_val,   class_map, mel_shape=mel_shape, augment=False)
+
+    train_loader = create_dataloader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    val_loader = create_dataloader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    # ----------------------------------
+    # Device setup
+    # ----------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+
+    # ----------------------------------
+    # Checkpoint directory
+    # ----------------------------------
+    ckpt_root = Path(paths_cfg.get("models_dir", project_root / "models"))
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+
+    # ----------------------------------
+    # Training runs
+    # ----------------------------------
+    saved_ckpts: list[str] = []
+
+    for run in range(1, num_models + 1):
+        seed = base_seed + run
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # Initialize RegNetY-800MF
+        weights = models.RegNet_Y_800MF_Weights.DEFAULT if pretrained else None
+        model = models.regnet_y_800mf(weights=weights)
+        in_feats = model.fc.in_features
+        model.fc = nn.Linear(in_feats, len(class_map))
+        model.to(device)
+
+        # Optional warm-start
+        init_ckpt = reg_cfg.get("init_checkpoint")
+        if init_ckpt:
+            ckpt_path = Path(f"{init_ckpt}_{run}.pth")
+            if ckpt_path.is_file():
+                state = torch.load(ckpt_path, map_location=device)
+                model.load_state_dict(state.get("model_state_dict", state), strict=False)
+                print(f"Loaded init checkpoint for run {run} from {ckpt_path}")
+
+        # Context for train_model
+        CFG["current_arch"] = model_name
+        CFG["current_run"] = run
+        CFG["class_map"]   = class_map
+
+        # Train and collect checkpoints
+        ckpts = train_model(model, train_loader, val_loader, CFG, device)
+        saved_ckpts.extend(ckpts)
+
+    # ----------------------------------
+    # Summary
+    # ----------------------------------
+    print("\nTraining complete – saved checkpoints:")
+    for p in saved_ckpts:
+        print(f" • {p}")
+
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python3
+"""
+dataloader.py – dataset, sampler, and training loop utilities
+============================================================
+Shared by train_efficientnet.py and train_regnety.py.
+
+Classes:
+- BirdClefDataset   — loads mel-spectrogram chunks and soft-label vectors from metadata.
+- create_dataloader — builds a PyTorch DataLoader with optional WeightedRandomSampler.
+- train_model      — generic training loop with Soft Cross-Entropy and sample weighting,
+                     saving top-3 checkpoints by macro-AUC (imported from metrics module).
+"""
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+# project imports
+project_root = Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(project_root))
+from src.utils.metrics import macro_auc_score, macro_precision_score
+
+__all__ = ["BirdClefDataset", "create_dataloader", "train_model"]
+
+
+class BirdClefDataset(Dataset):
+    """Dataset for BirdCLEF: loads mel-spectrograms and label vectors from metadata."""
+
+    def __init__(
+        self,
+        metadata_df: pd.DataFrame,
+        class_map: Dict[str, int],
+        *,
+        mel_shape: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        self.df = metadata_df.reset_index(drop=True)
+        self.class_map = class_map
+        self.num_classes = len(class_map)
+        self.augment = augment
+
+        # infer mel_shape if not provided
+        if mel_shape is None:
+            sample_path = self.df.iloc[0]["mel_path"]
+            sample = np.load(sample_path)
+            self.mel_shape = sample.shape
+        else:
+            self.mel_shape = mel_shape
+
+        # extract sample weights
+        self._weights = self.df.get("weight", pd.Series(1.0, index=self.df.index))
+        self._weights = self._weights.fillna(1.0).astype(np.float32).to_numpy()
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, index: int):
+        row = self.df.iloc[index]
+        mel_path = row.get("mel_path")
+        label_path = row.get("label_path")
+        if not mel_path or pd.isna(mel_path):
+            raise FileNotFoundError("Missing 'mel_path' in metadata.")
+        if not label_path or pd.isna(label_path):
+            raise FileNotFoundError("Missing 'label_path' in metadata.")
+
+        mel = np.load(mel_path)
+        label_vec = np.load(label_path).astype(np.float32)
+
+        # resize if shape mismatch
+        if mel.shape != tuple(self.mel_shape):
+            mel = cv2.resize(mel, (self.mel_shape[1], self.mel_shape[0]))
+        if self.augment:
+            mel = self._augment_mel(mel)
+
+        # convert to 3-channel image tensor
+        mel_tensor = torch.from_numpy(mel).unsqueeze(0).repeat(3, 1, 1).float()
+        weight = torch.tensor(self._weights[index], dtype=torch.float32)
+        return mel_tensor, torch.from_numpy(label_vec), weight
+
+    def _augment_mel(self, mel: np.ndarray) -> np.ndarray:
+        """Random time-frequency masking (SpecAugment-style)."""
+        h, w = mel.shape
+        # freq mask
+        for _ in range(np.random.randint(1, 3)):
+            f0 = np.random.randint(0, h)
+            f_len = np.random.randint(5, max(6, h // 8 + 1))
+            mel[f0 : f0 + f_len, :] = mel.mean()
+        # time mask
+        for _ in range(np.random.randint(1, 3)):
+            t0 = np.random.randint(0, w)
+            t_len = np.random.randint(5, max(6, w // 8 + 1))
+            mel[:, t0 : t0 + t_len] = mel.mean()
+        return mel
+
+
+def create_dataloader(
+    dataset: BirdClefDataset,
+    *,
+    batch_size: int,
+    shuffle: bool = False,
+    num_workers: Optional[int] = None,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """Build DataLoader; use WeightedRandomSampler if sample weights vary."""
+    if num_workers is None:
+        num_workers = 0 if os.name == "nt" else 4
+
+    weights = getattr(dataset, "_weights", None)
+    if weights is not None and not np.allclose(weights, 1.0):
+        sampler = WeightedRandomSampler(
+            weights=list(weights),
+            num_samples=len(dataset),
+            replacement=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+def _soft_ce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """Soft Cross-Entropy loss for probability targets."""
+    log_prob = torch.log_softmax(logits, dim=1)
+    return -(targets * log_prob).sum(dim=1)
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    config: dict,
+    device: torch.device,
+) -> List[str]:
+    """Train model, save top-3 checkpoints by macro-AUC, and return their paths."""
+    epochs = int(config["training"]["epochs"])
+    opt_cfg = config.get("optimizer", {})
+    lr = float(opt_cfg.get("lr", 1e-3))
+    wd = float(opt_cfg.get("weight_decay", 0.0))
+    opt_type = opt_cfg.get("type", "adamw").lower()
+    optimizer = (
+        optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+        if opt_type == "adamw"
+        else optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    )
+
+    sch_cfg = config.get("scheduler", {})
+    scheduler = None
+    if sch_cfg.get("type") == "CosineAnnealingLR":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(sch_cfg.get("T_max", epochs)),
+            eta_min=float(sch_cfg.get("eta_min", 1e-6)),
+        )
+
+    best_score: float = float("-inf")
+    best_ckpt: Optional[str] = None
+    mdir = Path(config["paths"]["models_dir"])
+    mdir.mkdir(parents=True, exist_ok=True)
+    arch = config.get("current_arch", "model")
+    run_id = config.get("current_run", 1)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for x, y, w in train_loader:
+            x, y, w = x.to(device), y.to(device), w.to(device)
+            optimizer.zero_grad()
+            loss = (_soft_ce_loss(model(x), y) * w).mean()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * x.size(0)
+        if scheduler:
+            scheduler.step()
+        avg_loss = total_loss / len(train_loader.dataset)
+
+        model.eval()
+        preds, gts = [], []
+        with torch.no_grad():
+            for x, y, _ in val_loader:
+                logits = model(x.to(device))
+                preds.append(torch.softmax(logits, dim=1).cpu().numpy())
+                gts.append(y.numpy())
+        y_pred = np.vstack(preds)
+        y_true = np.vstack(gts)
+
+        val_auc = macro_auc_score(y_true, y_pred)
+        val_prec = macro_precision_score(y_true, y_pred)
+        print(
+            f"Epoch {epoch}/{epochs} | loss {avg_loss:.4f} | "
+            f"AUC {val_auc:.4f} | Precision {val_prec:.4f}"
+        )
+
+        fname = f"{arch}_run{run_id}_epoch{epoch}_auc{val_auc:.4f}_{int(time.time())}.pth"
+        fpath = mdir / fname
+        # if this epoch is better than any before, drop the old and save new
+        if val_auc > best_score:
+            if best_ckpt is not None:
+                try: os.remove(best_ckpt)
+                except OSError: pass
+            torch.save(
+                {"model_state_dict": model.state_dict(), "class_map": config.get("class_map")},
+                str(fpath),
+            )
+            best_score = val_auc
+            best_ckpt   = str(fpath)
+            print(f"  → new best checkpoint: {fpath} (AUC {val_auc:.4f})")
+
+    return [best_ckpt] if best_ckpt is not None else []
+
+
+Here are utilities I used.
+
+#!/usr/bin/env python3
+"""
+metrics.py – evaluation helpers for the BirdCLEF-2025 pipeline
+==============================================================
+All functions accept
+
+    * ``y_true`` – array-like, shape *(N, C)*  
+      Binary **or soft-label** ground-truth vectors.  Any value > 0 is treated
+      as “positive” for a class when deciding whether that class is *present*.
+
+    * ``y_pred`` – array-like, shape *(N, C)*  
+      Model probabilities (0-1).  For thresholded metrics we default to 0.5.
+
+Only classes that actually occur in *y_true* are included in the macro
+aggregation – this avoids undefined metrics on empty columns and matches
+common practice in multi-label bio-acoustic tasks.
+
+Public helpers
+--------------
+macro_auc_score            – macro-averaged ROC-AUC  
+macro_precision_score      – macro-averaged precision at threshold  
+macro_recall_score         – macro-averaged recall at threshold  
+macro_average_precision    – macro-averaged AP (area under PR-curve)  
+create_pseudo_labels       – threshold → {species: 1.0} dict per chunk
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Sequence
+
+import numpy as np
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+__all__ = [
+    "macro_auc_score",
+    "macro_precision_score",
+    "macro_recall_score",
+    "macro_average_precision",
+    "create_pseudo_labels",
+]
+
+
+# -----------------------------------------------------------------------------#
+# Internals                                                                    #
+# -----------------------------------------------------------------------------#
+def _valid_classes(y_true: np.ndarray) -> np.ndarray:
+    """Return indices of classes that appear at least once in *y_true*."""
+    return np.where((y_true > 0).sum(axis=0) > 0)[0]
+
+
+# -----------------------------------------------------------------------------#
+# ROC-AUC                                                                      #
+# -----------------------------------------------------------------------------#
+def macro_auc_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Macro-averaged ROC-AUC, skipping classes with no positives in *y_true*.
+    Returns **0.0** when no class is evaluable.
+    """
+    classes = _valid_classes(y_true)
+    if len(classes) == 0:
+        return 0.0
+
+    aucs: List[float] = []
+    for c in classes:
+        try:
+            aucs.append(roc_auc_score((y_true[:, c] > 0).astype(int), y_pred[:, c]))
+        except ValueError:
+            # constant predictions or other degenerate case
+            continue
+    return float(np.mean(aucs)) if aucs else 0.0
+
+
+# -----------------------------------------------------------------------------#
+# Precision / Recall                                                           #
+# -----------------------------------------------------------------------------#
+def _binary_preds(y_pred: np.ndarray, threshold: float) -> np.ndarray:
+    return (y_pred >= threshold).astype(int)
+
+
+def macro_precision_score(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    threshold: float = 0.5,
+) -> float:
+    """
+    Macro-averaged precision (a.k.a. PPV) at the given threshold.
+    Undefined classes are skipped.  If **all** remaining classes have
+    zero positive predictions, returns 0.0 by convention.
+    """
+    classes = _valid_classes(y_true)
+    if len(classes) == 0:
+        return 0.0
+
+    y_bin = _binary_preds(y_pred, threshold)
+    precisions: List[float] = []
+    for c in classes:
+        tp = np.sum((y_true[:, c] > 0) & (y_bin[:, c] == 1))
+        pp = np.sum(y_bin[:, c] == 1)
+        if pp == 0:
+            # no predicted positives – precision undefined (skip)
+            continue
+        precisions.append(tp / pp)
+    return float(np.mean(precisions)) if precisions else 0.0
+
+
+def macro_recall_score(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    threshold: float = 0.5,
+) -> float:
+    """
+    Macro-averaged recall (a.k.a. sensitivity) at the given threshold.
+    """
+    classes = _valid_classes(y_true)
+    if len(classes) == 0:
+        return 0.0
+
+    y_bin = _binary_preds(y_pred, threshold)
+    recalls: List[float] = []
+    for c in classes:
+        tp = np.sum((y_true[:, c] > 0) & (y_bin[:, c] == 1))
+        fn = np.sum((y_true[:, c] > 0) & (y_bin[:, c] == 0))
+        denom = tp + fn
+        if denom == 0:
+            continue
+        recalls.append(tp / denom)
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+# -----------------------------------------------------------------------------#
+# Average Precision (area under PR-curve)                                      #
+# -----------------------------------------------------------------------------#
+def macro_average_precision(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Macro-averaged **Average Precision** (integral of precision-recall curve).
+    Useful for ranking evaluations.  Skips classes with no positives.
+    """
+    classes = _valid_classes(y_true)
+    if len(classes) == 0:
+        return 0.0
+
+    aps: List[float] = []
+    for c in classes:
+        try:
+            aps.append(
+                average_precision_score((y_true[:, c] > 0).astype(int), y_pred[:, c])
+            )
+        except ValueError:
+            continue
+    return float(np.mean(aps)) if aps else 0.0
+
+
+# -----------------------------------------------------------------------------#
+# Pseudo-label helper                                                          #
+# -----------------------------------------------------------------------------#
+def create_pseudo_labels(
+    chunk_probs: np.ndarray,
+    species_list: Sequence[str],
+    *,
+    threshold: float = 0.5,
+) -> List[Dict[str, float]]:
+    """
+    Convert ``(T, C)`` probability array to a list of dicts suitable for
+    process_pseudo.py. Each dict maps species codes → 1.0 for classes
+    whose probability ≥ threshold.
+    """
+    assert chunk_probs.shape[1] == len(species_list), (
+        "`species_list` length must equal num_classes"
+    )
+    out: List[Dict[str, float]] = []
+    for probs in chunk_probs:
+        idxs = np.where(probs >= threshold)[0]
+        out.append({species_list[i]: 1.0 for i in idxs})
+    return out
+
+
+#!/usr/bin/env python3
+"""
+utils.py – shared helpers for the BirdCLEF-2025 pipeline
+========================================================
+Functions here are imported by *every* stage (preprocessing, training, inference).
+Keep them lightweight: **no heavy ML imports at module load**.
+
+Provided helpers
+----------------
+load_taxonomy         → canonical class list + {species: idx} map (cached)
+parse_secondary_labels → robust '[…]'-string → List[str] parser
+create_label_vector   → one-hot / soft-label vector, handles strings or lists
+hash_chunk_id         → short SHA-1 from (filename, start_sec)
+resize_mel            → bilinear resize that preserves dB range
+load_vad              → lazy Silero VAD loader (torch-hub)
+is_silent             → simple dB-based silence check
+contains_voice        → VAD-based speech detection
+
+Public API is defined in __all__ at bottom.
+"""
+from __future__ import annotations
+
+import ast
+import hashlib
+import logging
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union, Callable
+import torch
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# Taxonomy utilities
+# ----------------------------------------------------------------------------
+_PRI_LABEL_COLUMNS = ("primary_label", "ebird_code", "species_code")
+
+@lru_cache(maxsize=1)
+def load_taxonomy(
+    taxonomy_csv: Optional[Union[str, Path]],
+    train_csv: Optional[Union[str, Path]] = None,
+) -> Tuple[List[str], Dict[str, int]]:
+    """
+    Load species codes from taxonomy CSV or fallback to train CSV.
+    Returns (sorted class_list, class_map).
+    """
+    def _extract(df: pd.DataFrame) -> Sequence[str]:
+        for col in _PRI_LABEL_COLUMNS:
+            if col in df.columns:
+                return df[col].dropna().astype(str).unique()
+        raise ValueError(f"Expected one of {_PRI_LABEL_COLUMNS} in columns.")
+
+    if taxonomy_csv and Path(taxonomy_csv).is_file():
+        df = pd.read_csv(str(taxonomy_csv))
+        species = _extract(df)
+    elif train_csv and Path(train_csv).is_file():
+        df = pd.read_csv(str(train_csv))
+        species = _extract(df)
+    else:
+        raise FileNotFoundError(
+            "Could not read taxonomy or train CSV for species list."
+        )
+
+    class_list = sorted(map(str, species))
+    class_map = {sp: idx for idx, sp in enumerate(class_list)}
+    return class_list, class_map
+
+
+# ----------------------------------------------------------------------------
+# Label helpers
+# ----------------------------------------------------------------------------
+
+def parse_secondary_labels(
+    sec: Optional[Union[str, Sequence[str]]]
+) -> List[str]:
+    """
+    Parse BirdCLEF 'secondary_labels' entries into List[str].
+    Returns empty list if none or unparsable.
+    """
+    if sec is None:
+        return []
+    if isinstance(sec, float) and np.isnan(sec):
+        return []
+    if isinstance(sec, list):
+        return [str(s).strip() for s in sec if s]
+    if isinstance(sec, str):
+        s = sec.strip()
+        if not s or s == "[]":
+            return []
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, (list, tuple)):
+                return [str(x).strip() for x in parsed if x]
+            if isinstance(parsed, str):
+                return [parsed.strip()]
+        except Exception:
+            return [x.strip() for x in s.replace(",", " ").split() if x.strip()]
+    return []
+
+
+def add_secondary_label(
+    primary_label: str,
+    secondary_labels: Optional[Union[str, Sequence[str]]],
+    class_map: Dict[str, int],
+    *,
+    primary_weight: float = 1.0,
+    secondary_weight: float = 0.05,
+    use_soft: bool = True,
+) -> np.ndarray:
+    """
+    Build a target vector (len = len(class_map)) for training:
+    primary label = primary_weight, secondaries = equal share of secondary_weight.
+    If use_soft=False, secondaries get 1.0 (multi-hot).
+    """
+    vec = np.zeros(len(class_map), dtype=np.float32)
+    if primary_label in class_map:
+        vec[class_map[primary_label]] = primary_weight
+    secs = parse_secondary_labels(secondary_labels)
+    if not secs:
+        return vec
+    if use_soft:
+        share = secondary_weight / len(secs)
+        for sp in secs:
+            if sp in class_map:
+                vec[class_map[sp]] = share
+    else:
+        for sp in secs:
+            if sp in class_map:
+                vec[class_map[sp]] = 1.0
+    return vec
+
+
+# ----------------------------------------------------------------------------
+# Misc small helpers
+# ----------------------------------------------------------------------------
+
+def hash_chunk_id(
+    filename: str,
+    start_sec: float,
+    length: int = 8,
+) -> str:
+    """
+    Short SHA-1 hash for (filename, start_sec).
+    """
+    txt = f"{filename}_{start_sec:.3f}".encode()
+    return hashlib.sha1(txt).hexdigest()[:length]
+
+
+def resize_mel(
+    mel_db: np.ndarray,
+    target_h: int,
+    target_w: int,
+) -> np.ndarray:
+    """
+    Resize log-mel spectrogram preserving dynamic range.
+    """
+    h, w = mel_db.shape
+    if (h, w) == (target_h, target_w):
+        return mel_db
+    lo, hi = float(mel_db.min()), float(mel_db.max())
+    norm = (mel_db - lo) / (hi - lo + 1e-6)
+    img = Image.fromarray((norm * 255).astype(np.uint8))
+    img = img.resize((target_w, target_h), Image.BILINEAR)
+    arr = np.asarray(img).astype(np.float32) / 255.0
+    return arr * (hi - lo) + lo
+
+
+# ----------------------------------------------------------------------------
+# Silence & Voice Detection
+# ----------------------------------------------------------------------------
+
+def is_silent(
+    wave: np.ndarray,
+    db_thresh: float = -50.0,
+) -> bool:
+    """
+    Check if the audio is silent based on a dB threshold (RMS).
+    """
+    rms = np.sqrt(np.mean(wave**2))
+    db = 20 * np.log10(rms + 1e-12)
+    return db < db_thresh
+
+# load the VAD model exactly once
+_VAD_MODEL, _VAD_UTILS = torch.hub.load(
+    repo_or_dir='snakers4/silero-vad',
+    model='silero_vad',
+    skip_validation=True,
+    force_reload=False
+)
+(_GET_SPEECH_TS, *_) = _VAD_UTILS
+
+def load_vad() -> Tuple["torch.jit.ScriptModule", Callable]:
+    """Return the cached Silero VAD model and timestamp fn."""
+    return _VAD_MODEL, _GET_SPEECH_TS
+
+
+def contains_voice(
+    samples: np.ndarray,
+    sr: int,
+    threshold: float = 0.5,
+) -> bool:
+    """
+    Check if the audio contains speech using Silero VAD.
+    """
+    model, get_speech_ts = load_vad()
+    tensor = torch.from_numpy(samples).float()
+    speech_ts = get_speech_ts(tensor, model, sampling_rate=sr, threshold=threshold)
+    return bool(speech_ts)
+
+
+# ----------------------------------------------------------------------------
+# Public API
+# ----------------------------------------------------------------------------
+__all__ = [
+    "load_taxonomy",
+    "parse_secondary_labels",
+    "create_label_vector",
+    "hash_chunk_id",
+    "resize_mel",
+    "is_silent",
+    "load_vad",
+    "contains_voice",
+]
+
+
+Then, I ran following files to create mels and labels for unlabelled soundscapes datasets.
+
+#!/usr/bin/env python3
+"""
+temp.py – Generate pseudo-labeled chunks from unlabelled soundscapes.
+
+Supports a dry run via --testrun to verify logic without writing any files.
+"""
+import sys
+import argparse
+import logging
+import hashlib
+from pathlib import Path
+from typing import List
+
+import numpy as np
+import pandas as pd
+import librosa
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torch import nn
+import torch.nn.functional as F
+from torchvision import models
+
+# project imports
+project_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(project_root))
+from src.utils import utils
+
+# -----------------------------------------------------------------------------
+# 1. Hard-coded configuration
+# -----------------------------------------------------------------------------
+CFG = {
+    "paths": {
+        "train_soundscapes": "data/birdclef/train_soundscapes",
+        "processed_dir":    "data/birdclef/DATABASE",
+        "train_metadata":   "data/birdclef/DATABASE/train_metadata.csv",
+        "models_dir":       "models",
+        "taxonomy_csv":     "data/birdclef/taxonomy.csv",
+        "train_csv":        "data/birdclef/train.csv",
+    },
+    "audio": {
+        "sample_rate":       32000,
+        "trim_top_db":       20,
+        "min_duration":      5.0,
+        "silence_thresh_db": -50.0
+    },
+    "chunking": {
+        "train_chunk_duration": 10.0,
+        "train_chunk_hop":       5.0
+    },
+    "mel": {
+        "n_fft":         1024,
+        "hop_length":    500,
+        "n_mels":        128,
+        "fmin":          40,
+        "fmax":       15000,
+        "power":         2.0,
+        "target_shape": [256, 256]
+    },
+    "labeling": {
+        "pseudo_label_weight": 0.5
+    },
+    "selection": {
+        "pseudo_confidence_threshold": 0.5
+    }
+}
+
+# -----------------------------------------------------------------------------
+# 2. argparse for --testrun
+# -----------------------------------------------------------------------------
+parser = argparse.ArgumentParser(
+    description="Generate pseudo-labels for soundscape chunks"
+)
+parser.add_argument(
+    "--testrun",
+    action="store_true",
+    help="Run pipeline without saving files (dry run)"
+)
+args = parser.parse_args()
+test_run = args.testrun
+
+# logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("temp")
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def smooth_predictions(preds: np.ndarray) -> np.ndarray:
+    pad = np.pad(preds, ((1,1),(0,0)), mode='edge')
+    return (pad[:-2] + pad[1:-1] + pad[2:]) / 3.0
+
+class MelDataset(Dataset):
+    """Dataset of precomputed mel .npy tensors for inference."""
+    def __init__(self, paths: List[Path]):
+        self.paths = paths
+    def __len__(self):
+        return len(self.paths)
+    def __getitem__(self, idx: int):
+        mel = np.load(str(self.paths[idx])).astype(np.float32)
+        return torch.from_numpy(mel).unsqueeze(0).repeat(3,1,1)
+
+# -----------------------------------------------------------------------------
+# Main pipeline
+# -----------------------------------------------------------------------------
+def main():
+    paths_cfg = CFG["paths"]
+    audio_cfg = CFG["audio"]
+    chunk_cfg = CFG["chunking"]
+    mel_cfg   = CFG["mel"]
+    pseudo_thr = CFG["selection"]["pseudo_confidence_threshold"]
+
+    SOUND_DIR    = Path(paths_cfg["train_soundscapes"])
+    PROCESSED    = Path(paths_cfg["processed_dir"])
+    MEL_DIR      = PROCESSED / "mels"
+    LABEL_DIR    = PROCESSED / "labels"
+    METADATA_CSV = Path(paths_cfg["train_metadata"])
+    MODELS_DIR   = Path(paths_cfg["models_dir"])
+
+    for d in (MEL_DIR, LABEL_DIR):
+        if not test_run:
+            d.mkdir(parents=True, exist_ok=True)
+        log.info(f"[{'testrun' if test_run else 'run'}] ensured directory {d}")
+
+    # load class map
+    _, class_map = utils.load_taxonomy(
+        paths_cfg["taxonomy_csv"],
+        paths_cfg["train_csv"]
+    )
+    num_classes = len(class_map)
+
+    # chunk extraction
+    sr = audio_cfg["sample_rate"]
+    chunk_len = int(chunk_cfg["train_chunk_duration"] * sr)
+    hop_len   = int(chunk_cfg["train_chunk_hop"] * sr)
+    entries: List[tuple[str, float, Path]] = []
+
+    all_files = sorted(SOUND_DIR.glob("*.ogg"))
+    if test_run:
+        all_files = all_files[:5]
+
+    for fn in all_files:
+        y, _ = librosa.load(str(fn), sr=sr, mono=True)
+        if audio_cfg["trim_top_db"] is not None:
+            y, _ = librosa.effects.trim(y, top_db=audio_cfg["trim_top_db"])
+        if len(y) < sr * audio_cfg["min_duration"]:
+            reps = int(np.ceil((sr * audio_cfg["min_duration"]) / len(y)))
+            y = np.tile(y, reps)[:int(sr * audio_cfg["min_duration"])]
+        ptr = 0
+        while ptr + chunk_len <= len(y):
+            seg = y[ptr:ptr+chunk_len]
+            ptr += hop_len
+            if utils.is_silent(seg, db_thresh=audio_cfg["silence_thresh_db"]):
+                continue
+            if utils.contains_voice(seg, sr):
+                continue
+            m = librosa.feature.melspectrogram(
+                y=seg, sr=sr,
+                n_fft=mel_cfg["n_fft"], hop_length=mel_cfg["hop_length"],
+                n_mels=mel_cfg["n_mels"], fmin=mel_cfg["fmin"], fmax=mel_cfg["fmax"],
+                power=mel_cfg["power"]
+            )
+            mel_db = librosa.power_to_db(m, ref=np.max)
+            mel_db = utils.resize_mel(mel_db, *mel_cfg["target_shape"]).astype(np.float32)
+            cid = hashlib.sha1(f"{fn.name}_{ptr/sr:.3f}".encode()).hexdigest()[:8]
+            mp = MEL_DIR / f"{cid}.npy"
+            if not test_run:
+                np.save(str(mp), mel_db)
+            log.info(f"[{'testrun' if test_run else 'run'}] chunk → {mp}")
+            entries.append((fn.name, ptr/sr, mp))
+
+    # inference
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    eff_ckpts = sorted(MODELS_DIR.glob("efficientnet_b0_*.pth"))
+    reg_ckpts = sorted(MODELS_DIR.glob("regnety_800mf_*.pth"))
+
+    # build mel-only dataset + loader
+    mel_paths = [e[2] for e in entries]
+    ds = MelDataset(mel_paths)
+    loader = DataLoader(ds, batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
+
+    def run_arch(ckpts: List[Path], arch: str):
+        all_smoothed = []
+        for ckpt in ckpts:
+            # build model
+            if arch == "efficientnet_b0":
+                m = models.efficientnet_b0(weights=None)
+                in_f = m.classifier[1].in_features
+                m.classifier = nn.Linear(in_f, num_classes)
+            else:
+                m = models.regnet_y_800mf(weights=None)
+                in_f = m.fc.in_features
+                m.fc = nn.Linear(in_f, num_classes)
+            if not test_run:
+                state = torch.load(str(ckpt), map_location=device)
+                m.load_state_dict(state["model_state_dict"] if "model_state_dict" in state else state)
+            m.to(device).eval()
+
+            preds = []
+            with torch.no_grad():
+                for x in loader:
+                    x = x.to(device)
+                    logits = m(x)
+                    preds.append(F.softmax(logits, dim=1).cpu().numpy())
+            preds = np.vstack(preds)
+            all_smoothed.append(smooth_predictions(preds))
+        return np.min(np.stack(all_smoothed), axis=0)
+
+    log.info("Running EfficientNet ensemble...")
+    eff_min = run_arch(eff_ckpts, "efficientnet_b0")
+    log.info("Running RegNetY ensemble...")
+    reg_min = run_arch(reg_ckpts, "regnety_800mf")
+
+    final_probs = (eff_min + reg_min) / 2.0
+    w = CFG["labeling"]["pseudo_label_weight"]
+
+    # build metadata rows
+    rows = []
+    for (fn, t, mp), probs in zip(entries, final_probs):
+        lbl = np.zeros(num_classes, dtype=np.float32)
+        spc = []
+        for sp, i in class_map.items():
+            if probs[i] >= pseudo_thr:
+                lbl[i] = 1.0
+                spc.append(sp)
+        lp = LABEL_DIR / f"{mp.stem}.npy"
+        if not test_run:
+            np.save(str(lp), lbl)
+        log.info(f"[{'testrun' if test_run else 'run'}] saved label → {lp}")
+        rows.append({
+            "filename": fn,
+            "end_sec": round(t,3),
+            "mel_path": str(mp),
+            "label_path": str(lp),
+            "weight": w,
+            "source": "soundscapes",
+            "species": spc
+        })
+
+    new_df = pd.DataFrame(rows)
+    if not test_run and METADATA_CSV.exists():
+        old = pd.read_csv(METADATA_CSV)
+        out = pd.concat([old, new_df], ignore_index=True)
+        out.to_csv(METADATA_CSV, index=False)
+        log.info(f"Appended {len(new_df)} rows to {METADATA_CSV}")
+    else:
+        log.info(f"[{'testrun' if test_run else 'run'}] would append {len(new_df)} rows to {METADATA_CSV}")
+
+if __name__ == "__main__":
+    main()
+
+This file doesn't exist anymore because it was temporary.
+
+Then, from the following, it is automl process which I will be running repetitive.
+
+First, I run process_mixup.py to suit up the DATABASE with more multi-label mixed data.
+
+#!/usr/bin/env python3
+"""
+process_mixup.py ― Generate **multi‑species mix‑up** chunks for BirdCLEF‑2025
+==============================================================================
+
+**New feature** (2025‑04‑26): each mixed chunk now overlays a *random* number
+of recordings **uniformly sampled from 2 to 5**.  This better mimics real
+soundscapes where several species may vocalise simultaneously.
+
+Pipeline (updated)
+------------------
+1. Balance the candidate pool so no primary species exceeds 20 % share and all
+   206 species appear at least once.
+2. Coarse geo‑cluster recordings on a 0.5° grid.
+3. Within every cluster, repeatedly draw **k ∼ U{2, 3, 4, 5}** distinct
+   recordings with different primary species until <2 remain.
+4. Overlay the *k* waves at equal power → `mix = (1/k)·Σ yᵢ`, peak‑normalise.
+5. Skip silent or speech‑contaminated chunks; slide a 10 s window (5 s hop),
+   save log‑mel and multi‑label vector (primary = 1.0; others = 0.8·rating/5).
+6. Append rows to `DATABASE/train_metadata.csv`; update `audio_hashes.txt`.
+
+Run
+---
+```bash
+python -m src.process.process_mixup          # writes files
+python -m src.process.process_mixup --dry-run # logic only, no writes
+```
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import logging
+import math
+import random
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+import librosa
+import numpy as np
+import pandas as pd
+import yaml
+
+project_root = Path(__file__).resolve().parents[2]
+config_path = project_root / "config" / "process.yaml"
+sys.path.insert(0, str(project_root))
+from src.utils import utils  # noqa: E402
+
+with open(config_path, "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
+paths_cfg = CFG["paths"]
+audio_cfg = CFG["audio"]
+chunk_cfg = CFG["chunking"]
+mel_cfg = CFG["mel"]
+sel_cfg = CFG["selection"]
+label_cfg = CFG["labeling"]
+
+audio_dir = Path(paths_cfg["audio_dir"])
+processed_dir = Path(paths_cfg["processed_dir"])
+mel_dir = processed_dir / "mels"
+label_dir = processed_dir / "labels"
+for d in (mel_dir, label_dir):
+    d.mkdir(parents=True, exist_ok=True)
+
+metadata_csv = Path(paths_cfg["train_metadata"])
+train_csv = Path(paths_cfg["train_csv"])
+hash_file = processed_dir / "audio_hashes.txt"
+
+parser = argparse.ArgumentParser(description="Generate mix‑up training chunks")
+parser.add_argument("--dry-run", action="store_true", help="Skip disk writes")
+args = parser.parse_args()
+DRY = args.dry_run
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("process_mixup")
+
+CLASS_LIST, CLASS_MAP = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), train_csv)
+NUM_CLASSES = len(CLASS_LIST)
+SEEN_HASHES: set[str] = set(hash_file.read_text().splitlines()) if hash_file.exists() else set()
+
+SR = audio_cfg["sample_rate"]
+CHUNK_S = chunk_cfg["train_chunk_duration"]
+HOP_S = chunk_cfg["train_chunk_hop"]
+CHUNK_SAMPLES = int(CHUNK_S * SR)
+HOP_SAMPLES = int(HOP_S * SR)
+MIN_DUR_SAMPLES = int(audio_cfg["min_duration"] * SR)
+SILENCE_DB = audio_cfg.get("silence_thresh_db", -50.0)
+TRIM_DB = audio_cfg.get("trim_top_db")
+
+MIX_SEC_WEIGHT = 0.8  # weight for non‑primary species
+
+# -----------------------------------------------------------------------------
+# Stage 1 – Build balanced candidate pool
+# -----------------------------------------------------------------------------
+df = pd.read_csv(train_csv)
+min_rating = sel_cfg.get("minimum_rating", 3)
+rare_thresh = sel_cfg.get("rare_species_threshold", 100)
+max_count = sel_cfg.get("max_count", 300)
+
+primary_counts = df.groupby("primary_label")["filename"].transform("count")
+minority_df = df[primary_counts < rare_thresh]
+good_df = df[df["rating"] >= min_rating]
+not_too_much_df = df[primary_counts < max_count]
+base_df = pd.concat([minority_df, good_df, not_too_much_df], ignore_index=True)
+
+cap_pct = 0.50
+label_caps = {
+    sp: math.ceil(cap_pct * len(base_df)) if cnt / len(base_df) > cap_pct else cnt
+    for sp, cnt in base_df["primary_label"].value_counts().items()
+}
+subsets = [
+    base_df[base_df["primary_label"] == sp].sample(n=cap, random_state=None, replace=False)
+    for sp, cap in label_caps.items()
+]
+pool_df = pd.concat(subsets, ignore_index=True).drop_duplicates("filename")
+missing = set(CLASS_LIST) - set(pool_df["primary_label"].unique())
+if missing:
+    log.warning("Added %d missing species for full coverage", len(missing))
+    add_df = (
+        df[df["primary_label"].isin(missing)]
+        .sort_values("rating", ascending=False)
+        .groupby("primary_label")
+        .head(1)
+    )
+    pool_df = pd.concat([pool_df, add_df], ignore_index=True)
+
+# -----------------------------------------------------------------------------
+# Stage 2 – geo‑clusters (0.5° grid)
+# -----------------------------------------------------------------------------
+
+def cluster_id(lat: float, lon: float, gran: float = 0.5) -> str:
+    if np.isnan(lat) or np.isnan(lon):
+        return "nan"
+    return f"{round(lat / gran) * gran:.1f}_{round(lon / gran) * gran:.1f}"
+
+pool_df["cluster"] = pool_df.apply(lambda r: cluster_id(r.get("latitude", np.nan), r.get("longitude", np.nan)), axis=1)
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+def load_clip(path: Path) -> np.ndarray:
+    y, _ = librosa.load(str(path), sr=SR, mono=True)
+    if TRIM_DB is not None:
+        y, _ = librosa.effects.trim(y, top_db=TRIM_DB)
+    if y.size < MIN_DUR_SAMPLES:
+        reps = math.ceil(MIN_DUR_SAMPLES / y.size)
+        y = np.tile(y, reps)[:MIN_DUR_SAMPLES]
+    return y.astype(np.float32)
+
+
+def overlay(waves: List[np.ndarray]) -> np.ndarray:
+    max_len = max(w.size for w in waves)
+    stacked = np.zeros(max_len, dtype=np.float32)
+    for w in waves:
+        if w.size < max_len:
+            w = np.pad(w, (0, max_len - w.size))
+        stacked += w / len(waves)
+    return stacked / (np.max(np.abs(stacked)) + 1e-6)
+
+# -----------------------------------------------------------------------------
+# Stage 3 – assemble multi‑clip groups & generate chunks
+# -----------------------------------------------------------------------------
+meta_rows: List[dict] = []
+new_hashes: set[str] = set()
+clusters = {k: g.sample(frac=1.0, random_state=42) for k, g in pool_df.groupby("cluster") if k != "nan"}
+
+for g in clusters.values():
+    remain = g.to_dict("records")
+    random.shuffle(remain)
+    while len(remain) >= 2:
+        k = random.randint(2, min(5, len(remain)))  # 2 – 5 clips
+        group = [remain.pop() for _ in range(k)]
+        waves, labels, ratings = [], [], []
+        duplicate_species = False
+        seen_sp: set[str] = set()
+        for rec in group:
+            sp = rec["primary_label"]
+            if sp in seen_sp:
+                duplicate_species = True
+                break
+            seen_sp.add(sp)
+            path = audio_dir / rec["filename"]
+            if not path.is_file():
+                duplicate_species = True
+                break
+            waves.append(load_clip(path))
+            labels.append(sp)
+            ratings.append(rec["rating"])
+        if duplicate_species:
+            continue
+        mix = overlay(waves)
+        if utils.is_silent(mix, db_thresh=SILENCE_DB) or utils.contains_voice(mix, SR):
+            continue
+
+        ptr = 0
+        while ptr + CHUNK_SAMPLES <= mix.size:
+            chunk = mix[ptr : ptr + CHUNK_SAMPLES]
+            ptr += HOP_SAMPLES
+            mel = librosa.feature.melspectrogram(
+                y=chunk,
+                sr=SR,
+                n_fft=mel_cfg["n_fft"],
+                hop_length=mel_cfg["hop_length"],
+                n_mels=mel_cfg["n_mels"],
+                fmin=mel_cfg["fmin"],
+                fmax=mel_cfg["fmax"],
+                power=mel_cfg["power"],
+            )
+            mel_db = librosa.power_to_db(mel, ref=np.max)
+            mel_db = utils.resize_mel(mel_db, *mel_cfg["target_shape"]).astype(np.float32)
+
+            cid_str = "|".join([rec["filename"] for rec in group]) + f"_{ptr/SR:.3f}"
+            cid = hashlib.sha1(cid_str.encode()).hexdigest()[:8]
+            if cid in SEEN_HASHES or cid in new_hashes:
+                continue
+            new_hashes.add(cid)
+
+            mel_path = mel_dir / f"{cid}.npy"
+            label_path = label_dir / f"{cid}.npy"
+            if not DRY:
+                np.save(mel_path, mel_db)
+
+            lbl = np.zeros(NUM_CLASSES, dtype=np.float32)
+            # weight scheme: first = 1.0, others = 0.8·rating/5
+            for i, sp in enumerate(labels):
+                idx = CLASS_MAP.get(sp)
+                if idx is None:
+                    continue
+                w = 1.0 if i == 0 else MIX_SEC_WEIGHT * (ratings[i] / 5.0)
+                lbl[idx] = max(lbl[idx], w)
+            if not DRY:
+                np.save(label_path, lbl)
+
+            meta_rows.append(
+                {
+                    "filename": "|".join([rec["filename"] for rec in group]),
+                    "end_sec": round(ptr / SR, 3),
+                    "mel_path": str(mel_path),
+                    "label_path": str(label_path),
+                    "weight": float(label_cfg.get("rare_label_weight", 1.0)),
+                    "source": "mixup_audio",
+                    "species": "|".join(labels),
+                }
+            )
+
+log.info("Generated %d mixed chunks", len(meta_rows))
+
+if meta_rows and not DRY:
+    meta_df = pd.DataFrame(meta_rows)
+    if metadata_csv.exists():
+        old = pd.read_csv(metadata_csv)
+        meta_df = pd.concat([old, meta_df], ignore_index=True)
+    meta_df.to_csv(metadata_csv, index=False)
+    SEEN_HASHES.update(new_hashes)
+    with hash_file.open("w") as f:
+        f.write("\n".join(sorted(SEEN_HASHES)))
+    log.info("Appended metadata and updated hash list")
+else:
+    log.info("Dry‑run complete – no files written.")
+
+Then, I update the labels from inference of my previous trained models.
+
+#!/usr/bin/env python3
+"""
+process_update_labels.py – Refresh soft‑label vectors using an ensemble and
+optional Kalman smoothing
+==========================================================================
+
+* Reads **DATABASE/train_metadata.csv** and selects rows whose `source` is
+  in {"soundscapes", "mixup_audio"} (the noisy or synthetic sets we want to
+  refine).
+* Runs the EfficientNet‑B0 and RegNetY‑800MF ensembles on the corresponding
+  **pre‑computed mel‑spectrograms** (`mel_path`).
+    • For each architecture the element‑wise **minimum** across its three
+      checkpoints is taken ("hard" ensembling).
+    • The final probability vector is the **mean** of the two architecture
+      minima, matching the competition’s reference inference scheme.
+* Performs an **element‑wise Kalman update** of the stored probability vector
+  using the new ensemble estimate:
+
+    pₜ  ←  pₜ₋₁  +  K ⊙ (z  −  pₜ₋₁) ,   K = (P+Q) / (P+Q+R)
+
+  with diagonal covariance (independent species).  Hyper‑parameters `Q` and
+  `R` are set conservatively so the filter moves slowly toward the ensemble
+  unless the old label is very uncertain.
+* Overwrites the existing `.npy` label file **in‑place**; metadata rows are
+  untouched because their paths stay the same.
+* Supports `--dry-run` to preview the number of labels that would be updated
+  without actually writing to disk.
+
+Run
+---
+```bash
+python -m src.process.process_update_labels               # update labels
+python -m src.process.process_update_labels --dry-run     # preview only
+```
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from torch.utils.data import DataLoader, Dataset
+from torchvision import models
+
+# -----------------------------------------------------------------------------
+# Configuration & paths
+# -----------------------------------------------------------------------------
+project_root = Path(__file__).resolve().parents[2]
+config_path  = project_root / "config" / "process.yaml"
+sys.path.insert(0, str(project_root))
+from src.utils import utils  # noqa: E402  (after sys.path hack)
+
+with open(config_path, "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
+paths_cfg   = CFG["paths"]
+mel_cfg     = CFG["mel"]
+label_cfg   = CFG["labeling"]
+inf_cfg     = CFG.get("inference",      {})      # optional section
+ens_cfg     = CFG.get("ensemble",       {})
+
+MODEL_DIR   = project_root / paths_cfg.get("models_dir", "models")
+META_CSV    = project_root / paths_cfg["train_metadata"]
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+parser = argparse.ArgumentParser(description="Update label vectors using ensemble predictions")
+parser.add_argument("--dry-run", action="store_true", help="Run without writing files")
+parser.add_argument("--device",  default="auto",     help="cpu | cuda | auto (default)")
+args = parser.parse_args()
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("process_update_labels")
+
+device = (
+    torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto" else torch.device(args.device)
+)
+log.info("Using device: %s", device)
+
+auto_mixed_sources = {"soundscapes", "mixup_audio"}
+
+# -----------------------------------------------------------------------------
+# Dataset – returns (tensor, label_path)
+# -----------------------------------------------------------------------------
+class MelLabelDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, input_shape: Tuple[int, int]):
+        self.df = df.reset_index(drop=True)
+        self.h, self.w = input_shape
+    def __len__(self):
+        return len(self.df)
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        mel = np.load(row["mel_path"]).astype(np.float32)
+        if mel.shape != (self.h, self.w):
+            mel = utils.resize_mel(mel, self.h, self.w)
+        tens = torch.from_numpy(mel).unsqueeze(0).repeat(3, 1, 1)  # C=3
+        return tens, row["label_path"]
+
+# -----------------------------------------------------------------------------
+# Load taxonomy & metadata
+# -----------------------------------------------------------------------------
+class_list, _ = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), None)
+N_CLASSES     = len(class_list)
+
+meta = pd.read_csv(META_CSV)
+sel  = meta[meta["source"].isin(auto_mixed_sources)]
+if sel.empty:
+    log.info("No rows with source in %s – nothing to update.", auto_mixed_sources)
+    sys.exit(0)
+log.info("%d label files selected for refresh", len(sel))
+
+mel_h, mel_w = tuple(mel_cfg["target_shape"])
+loader = DataLoader(MelLabelDataset(sel, (mel_h, mel_w)), batch_size=inf_cfg.get("batch_size", 32), shuffle=False, num_workers=0, pin_memory=(device.type == "cuda"))
+
+# -----------------------------------------------------------------------------
+# Model helpers
+# -----------------------------------------------------------------------------
+
+def _build_model(arch: str, n_classes: int) -> torch.nn.Module:
+    if arch == "efficientnet_b0":
+        m = models.efficientnet_b0(weights=None)
+        m.classifier[1] = torch.nn.Linear(m.classifier[1].in_features, n_classes)
+        return m
+    if arch == "regnety_800mf":
+        m = models.regnet_y_800mf(weights=None)
+        m.fc = torch.nn.Linear(m.fc.in_features, n_classes)
+        return m
+    raise ValueError(f"Unsupported architecture: {arch}")
+
+
+def _load_checkpoint(path: Path, n_classes: int) -> Tuple[str, torch.nn.Module]:
+    arch = "efficientnet_b0" if "efficientnet" in path.name else "regnety_800mf"
+    model = _build_model(arch, n_classes)
+    state = torch.load(path, map_location="cpu")
+    model.load_state_dict(state.get("model_state_dict", state), strict=False)
+    model.to(device).eval()
+    return arch, model
+
+# Collect checkpoints according to ensemble patterns
+ckpt_patterns = ens_cfg.get("checkpoints", ["efficientnet_b0_run*.pth", "regnety_800mf_run*.pth"])
+ckpt_paths: List[Path] = []
+for pat in ckpt_patterns:
+    ckpt_paths.extend(sorted(MODEL_DIR.glob(pat)))
+if not ckpt_paths:
+    log.error("No checkpoints found under %s", MODEL_DIR)
+    sys.exit(1)
+
+arch_to_models: Dict[str, List[torch.nn.Module]] = {"efficientnet_b0": [], "regnety_800mf": []}
+for p in ckpt_paths:
+    arch, mdl = _load_checkpoint(p, N_CLASSES)
+    arch_to_models[arch].append(mdl)
+    log.info("Loaded %s", p.name)
+
+# -----------------------------------------------------------------------------
+# Kalman filter implementation (diagonal, independent per class)
+# -----------------------------------------------------------------------------
+class KalmanProbFilter:
+    def __init__(self, n: int, q: float = 1e-4, r: float = 1e-2):
+        self.n  = n
+        self.Q  = q * np.ones(n, dtype=np.float32)
+        self.R  = r * np.ones(n, dtype=np.float32)
+        self.P  = np.ones(n, dtype=np.float32)
+    def update(self, prior: np.ndarray, meas: np.ndarray) -> np.ndarray:
+        P_pred = self.P + self.Q
+        K      = P_pred / (P_pred + self.R)
+        post   = prior + K * (meas - prior)
+        self.P = (1. - K) * P_pred
+        return post.clip(0., 1.)
+
+kf = KalmanProbFilter(N_CLASSES)
+
+# -----------------------------------------------------------------------------
+# Inference loop
+# -----------------------------------------------------------------------------
+updated = 0
+with torch.no_grad():
+    for X, label_path in loader:
+        X = X.to(device, non_blocking=True)
+        # Gather per‑arch minima
+        per_arch_min = {}
+        for arch, models in arch_to_models.items():
+            preds = [torch.softmax(mdl(X), dim=1) for mdl in models]
+            per_arch_min[arch] = torch.min(torch.stack(preds), dim=0).values  # (B, C)
+        combined = 0.5 * (per_arch_min["efficientnet_b0"] + per_arch_min["regnety_800mf"])  # (B,C)
+        combined = combined.cpu().numpy()
+
+        for i in range(X.size(0)):
+            lp = Path(label_path[i])
+            if not lp.is_file():
+                log.warning("Label file missing: %s", lp)
+                continue
+            old = np.load(lp)
+            new = kf.update(old, combined[i])
+            if not args.dry_run:
+                np.save(lp, new.astype(np.float32))
+            updated += 1
+
+log.info("%sUpdated %d label vectors", "[dry‑run] " if args.dry_run else "", updated)
+
+Now after labels updated, I train the model again. First I run efficientnet training.
+
+#!/usr/bin/env python3
+"""
+train_efficientnet.py — (re‑)train EfficientNet‑B0 ensemble **from previous checkpoints only**
+===========================================================================================
+
+* Each run (1‥N) **must** have an existing checkpoint whose filename starts with
+  ``{model_name}_run{run_id}_``; otherwise we abort with *FileNotFoundError*.
+* The script resumes *weights* from that checkpoint but **initialises a fresh
+  optimiser / scheduler**, so you can fine‑tune on an updated dataset while
+  retaining the learnt representation.
+* Training configuration is read from *config/train.yaml* (see repo).
+
+Usage
+-----
+```bash
+python -m src.train.train_efficientnet -c config/train.yaml
+```
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from torch import nn
+from torchvision import models
+
+# -----------------------------------------------------------------------------
+# Project imports
+# -----------------------------------------------------------------------------
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+from src.train.dataloader import BirdClefDataset, create_dataloader, train_model  # noqa: E402
+from src.utils import utils  # noqa: E402
+
+# -----------------------------------------------------------------------------
+# Helper – locate most recent checkpoint for a given run
+# -----------------------------------------------------------------------------
+
+def latest_ckpt(run_id: int, ckpt_root: Path, model_name: str) -> Path:
+    """Return newest ``*.pth`` checkpoint for *run_id* or raise FileNotFoundError."""
+    pattern = f"{model_name}_run{run_id}_*.pth"
+    ckpts = sorted(ckpt_root.glob(pattern))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoint matching '{pattern}' in {ckpt_root}")
+    return ckpts[-1]  # filenames end with epoch + timestamp ⇒ lexicographic ≈ newest
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Resume EfficientNet‑B0 ensemble training")
+    p.add_argument("--config", "-c", type=Path, default=project_root / "config" / "train.yaml",
+                   help="Path to YAML training configuration")
+    return p.parse_args()
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+    with open(args.config, "r", encoding="utf-8") as f:
+        CFG = yaml.safe_load(f)
+
+    # --- pull subsections ----------------------------------------------------
+    dataset_cfg   = CFG["dataset"]
+    model_cfg     = CFG["model"]
+    training_cfg  = CFG["training"]
+    paths_cfg     = CFG["paths"]
+
+    # --- EfficientNet entry --------------------------------------------------
+    eff_cfg = next(a for a in model_cfg["architectures"] if a["name"].lower().startswith("efficientnet"))
+    model_name = eff_cfg["name"]
+    num_models = int(eff_cfg.get("num_models", 1))
+
+    # --- metadata ------------------------------------------------------------
+    df_meta = pd.read_csv(dataset_cfg["train_metadata"])
+    class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), dataset_cfg.get("train_csv"))
+
+    val_frac  = float(training_cfg.get("val_fraction", 0.1))
+    base_seed = int(training_cfg.get("seed", 42))
+    df_val    = df_meta.sample(frac=val_frac, random_state=base_seed)
+    df_train  = df_meta.drop(df_val.index).reset_index(drop=True)
+    df_val    = df_val.reset_index(drop=True)
+
+    mel_shape   = tuple(dataset_cfg.get("target_shape", [256, 256]))
+    batch_size  = int(training_cfg.get("batch_size", 32))
+    num_workers = int(training_cfg.get("num_workers", 4))
+
+    train_ds = BirdClefDataset(df_train, class_map, mel_shape=mel_shape, augment=True)
+    val_ds   = BirdClefDataset(df_val,   class_map, mel_shape=mel_shape, augment=False)
+
+    train_loader = create_dataloader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
+    val_loader   = create_dataloader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # --- hardware ------------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+
+    # --- checkpoint root -----------------------------------------------------
+    ckpt_root = project_root / paths_cfg.get("models_dir", "models")
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+
+    # --- train each run ------------------------------------------------------
+    saved_ckpts: List[str] = []
+    for run in range(1, num_models + 1):
+        torch.manual_seed(base_seed + run)
+        np.random.seed(base_seed + run)
+
+        # ----------------------------------
+        # Build model & load previous weights
+        # ----------------------------------
+        model = models.efficientnet_b0(weights=None)
+        model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(class_map))
+
+        ckpt_path = latest_ckpt(run, ckpt_root, model_name)
+        state = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(state.get("model_state_dict", state), strict=False)
+        print(f"✔ Resumed run {run} from {ckpt_path.name}")
+
+        model.to(device)
+
+        # ----------------------------------
+        # context for generic `train_model`
+        # ----------------------------------
+        CFG["current_arch"] = model_name
+        CFG["current_run"]  = run
+        CFG["class_map"]    = class_map
+
+        ckpts = train_model(model, train_loader, val_loader, CFG, device)
+        saved_ckpts.extend(ckpts)
+
+    # ---------------------------------------------------------------------
+    # Summary
+    # ---------------------------------------------------------------------
+    print("\nTraining complete – saved checkpoints:")
+    for p in saved_ckpts:
+        print(f" • {p}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
+
+Then, I will train the regnety too.
+
+#!/usr/bin/env python3
+"""
+train_regnety.py — (re‑)train RegNetY‑800MF ensemble **from previous checkpoints only**
+====================================================================================
+
+* For every run `1‥N` the script **must** find an existing checkpoint whose
+  filename starts with ``{model_name}_run{run_id}_``.  Missing checkpoints raise
+  *FileNotFoundError* so you never accidentally start from ImageNet weights.
+* We reload the *model weights* but **start a fresh optimiser/scheduler** so the
+  network is fine‑tuned on the latest dataset/labels without carrying over any
+  stale optimiser state.
+* Training/paths are controlled via the same YAML used by the EfficientNet
+  trainer (`config/train.yaml`).
+
+Usage
+-----
+```bash
+python -m src.train.train_regnety -c config/train.yaml
+```
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import List
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+from torch import nn
+from torchvision import models
+
+# -----------------------------------------------------------------------------
+# Project imports (repo root two levels up)
+# -----------------------------------------------------------------------------
+project_root = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(project_root))
+from src.train.dataloader import BirdClefDataset, create_dataloader, train_model  # noqa: E402
+from src.utils import utils  # noqa: E402
+
+# -----------------------------------------------------------------------------
+# Helper — locate newest checkpoint for a given run
+# -----------------------------------------------------------------------------
+
+def latest_ckpt(run_id: int, ckpt_root: Path, model_name: str) -> Path:
+    """Return newest ``*.pth`` checkpoint or raise *FileNotFoundError*."""
+    pattern = f"{model_name}_run{run_id}_*.pth"
+    ckpts = sorted(ckpt_root.glob(pattern))
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoint matching '{pattern}' in {ckpt_root}")
+    return ckpts[-1]  # filenames end with epoch + timestamp ⇒ lexicographic ≈ newest
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Resume RegNetY‑800MF ensemble training")
+    p.add_argument("--config", "-c", type=Path, default=project_root / "config" / "train.yaml",
+                   help="Path to YAML training configuration")
+    return p.parse_args()
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args()
+    with open(args.config, "r", encoding="utf-8") as f:
+        CFG = yaml.safe_load(f)
+
+    # --- config excerpts -----------------------------------------------------
+    dataset_cfg   = CFG["dataset"]
+    model_cfg     = CFG["model"]
+    training_cfg  = CFG["training"]
+    paths_cfg     = CFG["paths"]
+
+    # --- RegNetY block -------------------------------------------------------
+    reg_cfg = next(a for a in model_cfg["architectures"] if a["name"].lower().startswith("regnety"))
+    model_name = reg_cfg["name"]  # e.g. "regnety_800mf"
+    num_models = int(reg_cfg.get("num_models", 1))
+
+    # --- metadata ------------------------------------------------------------
+    df_meta = pd.read_csv(dataset_cfg["train_metadata"])
+
+    # optional: include pseudo / synthetic if flags are set in YAML ------------
+    if dataset_cfg.get("include_pseudo", False):
+        pseudo_path = Path(dataset_cfg["train_metadata"]).with_name("soundscape_metadata.csv")
+        if pseudo_path.is_file():
+            df_meta = pd.concat([df_meta, pd.read_csv(pseudo_path)], ignore_index=True)
+    if dataset_cfg.get("include_synthetic", False):
+        synth_path = Path(dataset_cfg["train_metadata"]).with_name("synthetic_metadata.csv")
+        if synth_path.is_file():
+            df_meta = pd.concat([df_meta, pd.read_csv(synth_path)], ignore_index=True)
+
+    # taxonomy ---------------------------------------------------------------
+    class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), dataset_cfg.get("train_csv"))
+
+    # split -------------------------------------------------------------------
+    val_frac  = float(training_cfg.get("val_fraction", 0.1))
+    base_seed = int(training_cfg.get("seed", 42))
+    df_val    = df_meta.sample(frac=val_frac, random_state=base_seed)
+    df_train  = df_meta.drop(df_val.index).reset_index(drop=True)
+    df_val    = df_val.reset_index(drop=True)
+
+    # datasets / loaders ------------------------------------------------------
+    mel_shape   = tuple(dataset_cfg.get("target_shape", [256, 256]))
+    batch_size  = int(training_cfg.get("batch_size", 32))
+    num_workers = int(training_cfg.get("num_workers", 4))
+
+    train_ds = BirdClefDataset(df_train, class_map, mel_shape=mel_shape, augment=True)
+    val_ds   = BirdClefDataset(df_val,   class_map, mel_shape=mel_shape, augment=False)
+
+    train_loader = create_dataloader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
+    val_loader   = create_dataloader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # hardware ---------------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.backends.cudnn.benchmark = True
+
+    # checkpoint root ---------------------------------------------------------
+    ckpt_root = project_root / paths_cfg.get("models_dir", "models")
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+
+    # train each run ----------------------------------------------------------
+    saved_ckpts: List[str] = []
+    for run in range(1, num_models + 1):
+        torch.manual_seed(base_seed + run)
+        np.random.seed(base_seed + run)
+
+        # build model --------------------------------------------------------
+        model = models.regnet_y_800mf(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, len(class_map))
+
+        # load previous checkpoint -----------------------------------------
+        ckpt_path = latest_ckpt(run, ckpt_root, model_name)
+        state = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(state.get("model_state_dict", state), strict=False)
+        print(f"✔ Resumed run {run} from {ckpt_path.name}")
+
+        model.to(device)
+
+        # context for generic trainer --------------------------------------
+        CFG["current_arch"] = model_name
+        CFG["current_run"]  = run
+        CFG["class_map"]    = class_map
+
+        ckpts = train_model(model, train_loader, val_loader, CFG, device)
+        saved_ckpts.extend(ckpts)
+
+    # summary ----------------------------------------------------------------
+    print("\nTraining complete – saved checkpoints:")
+    for p in saved_ckpts:
+        print(f" • {p}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
+
+
+Then, I want to run multiple bash at once.
+
+python src/process/process_update_labels.py
+python src/train/train_efficientnet.py
+python src/train/train_regnety.py
