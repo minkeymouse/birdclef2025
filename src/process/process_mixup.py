@@ -95,7 +95,7 @@ MIX_SEC_WEIGHT = 0.8  # weight for non‑primary species
 # Stage 1 – Build balanced candidate pool
 # -----------------------------------------------------------------------------
 df = pd.read_csv(train_csv)
-min_rating = sel_cfg.get("minimum_rating", 3)
+min_rating = sel_cfg.get("minimum_rating", 5)
 rare_thresh = sel_cfg.get("rare_species_threshold", 100)
 max_count = sel_cfg.get("max_count", 300)
 
@@ -167,7 +167,7 @@ meta_rows: List[dict] = []
 new_hashes: set[str] = set()
 clusters = {k: g.sample(frac=1.0, random_state=42) for k, g in pool_df.groupby("cluster") if k != "nan"}
 
-MAX_NEW = 5000
+MAX_NEW = 3000
 generated = 0
 
 for g in clusters.values():

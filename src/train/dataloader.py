@@ -29,6 +29,7 @@ project_root = Path(__file__).resolve().parents[2]
 import sys
 sys.path.insert(0, str(project_root))
 from src.utils.metrics import macro_auc_score, macro_precision_score
+from src.train.loss import get_criterion
 
 __all__ = ["BirdClefDataset", "create_dataloader", "train_model"]
 
@@ -173,6 +174,12 @@ def train_model(
             eta_min=float(sch_cfg.get("eta_min", 1e-6)),
         )
 
+    criterion = get_criterion(alpha=0.25,
+        gamma=2,
+        reduction="mean",
+        bce_weight=0.6,
+        focal_weight=1.4
+    )
     best_loss: float = float("inf")
     best_ckpt: Optional[str] = None
     mdir = Path(config["paths"]["models_dir"])
@@ -186,7 +193,8 @@ def train_model(
         for x, y, w in train_loader:
             x, y, w = x.to(device), y.to(device), w.to(device)
             optimizer.zero_grad()
-            loss = (_soft_ce_loss(model(x), y) * w).mean()
+            raw = criterion(model(x), y)
+            loss = (raw * w).mean()
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * x.size(0)
@@ -200,7 +208,8 @@ def train_model(
             for x, y, w in val_loader:
                 x, y, w = x.to(device), y.to(device), w.to(device)
                 logits = model(x)
-                val_loss_tot += (_soft_ce_loss(logits, y) * w).mean().item() * x.size(0)
+                raw_val = criterion(logits, y)
+                val_loss_tot += (raw_val * w).mean().item() * x.size
                 preds.append(torch.softmax(logits, dim=1).cpu().numpy())
                 gts.append(y.cpu().numpy())
 
