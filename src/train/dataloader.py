@@ -173,7 +173,7 @@ def train_model(
             eta_min=float(sch_cfg.get("eta_min", 1e-6)),
         )
 
-    best_score: float = float("-inf")
+    best_score: float = float("inf")
     best_ckpt: Optional[str] = None
     mdir = Path(config["paths"]["models_dir"])
     mdir.mkdir(parents=True, exist_ok=True)
@@ -195,12 +195,16 @@ def train_model(
         avg_loss = total_loss / len(train_loader.dataset)
 
         model.eval()
-        preds, gts = [], []
+        val_loss_tot, preds, gts = 0.0, [], []
         with torch.no_grad():
-            for x, y, _ in val_loader:
-                logits = model(x.to(device))
+            for x, y, w in val_loader:
+                x, y, w = x.to(device), y.to(device), w.to(device)
+                logits = model(x)
+                val_loss_tot += (_soft_ce_loss(logits, y) * w).mean().item() * x.size(0)
                 preds.append(torch.softmax(logits, dim=1).cpu().numpy())
                 gts.append(y.numpy())
+
+        val_loss = val_loss_tot / len(val_loader.dataset)
         y_pred = np.vstack(preds)
         y_true = np.vstack(gts)
 
@@ -208,13 +212,14 @@ def train_model(
         val_prec = macro_precision_score(y_true, y_pred)
         print(
             f"Epoch {epoch}/{epochs} | loss {avg_loss:.4f} | "
+            f"train loss {avg_loss:.4f} | val loss {val_loss:.4f} | "
             f"AUC {val_auc:.4f} | Precision {val_prec:.4f}"
         )
 
         fname = f"{arch}_run{run_id}_epoch{epoch}_auc{val_auc:.4f}_{int(time.time())}.pth"
         fpath = mdir / fname
         # if this epoch is better than any before, drop the old and save new
-        if val_auc > best_score:
+        if val_loss < best_score - 1e-6:
             if best_ckpt is not None:
                 try: os.remove(best_ckpt)
                 except OSError: pass
@@ -222,9 +227,9 @@ def train_model(
                 {"model_state_dict": model.state_dict(), "class_map": config.get("class_map")},
                 str(fpath),
             )
-            best_score = val_auc
+            best_loss = val_loss
             best_ckpt   = str(fpath)
-            print(f"  → new best checkpoint: {fpath} (AUC {val_auc:.4f})")
+            print(f"  → new best checkpoint: {fpath} (val loss {val_loss:.4f})")
 
     return [best_ckpt] if best_ckpt is not None else []
 
