@@ -209,7 +209,7 @@ def train_model(
                 x, y, w = x.to(device), y.to(device), w.to(device)
                 logits = model(x)
                 raw_val = criterion(logits, y)
-                val_loss_tot += (raw_val * w).mean().item() * x.size
+                val_loss_tot += (raw_val * w).mean().item() * x.size(0)
                 preds.append(torch.softmax(logits, dim=1).cpu().numpy())
                 gts.append(y.cpu().numpy())
 
