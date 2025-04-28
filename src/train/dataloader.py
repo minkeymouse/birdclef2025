@@ -8,7 +8,7 @@ Classes:
 - BirdClefDataset   — loads mel-spectrogram chunks and soft-label vectors from metadata.
 - create_dataloader — builds a PyTorch DataLoader with optional WeightedRandomSampler.
 - train_model      — generic training loop with Soft Cross-Entropy and sample weighting,
-                     saving top-3 checkpoints by macro-AUC (imported from metrics module).
+                     saving best checkpoints by loss (imported from metrics module).
 """
 from __future__ import annotations
 
@@ -152,7 +152,7 @@ def train_model(
     config: dict,
     device: torch.device,
 ) -> List[str]:
-    """Train model, save top-3 checkpoints by macro-AUC, and return their paths."""
+    """Train model, save best checkpoint by loss, and return their paths."""
     epochs = int(config["training"]["epochs"])
     opt_cfg = config.get("optimizer", {})
     lr = float(opt_cfg.get("lr", 1e-3))
@@ -173,7 +173,7 @@ def train_model(
             eta_min=float(sch_cfg.get("eta_min", 1e-6)),
         )
 
-    best_score: float = float("inf")
+    best_loss: float = float("inf")
     best_ckpt: Optional[str] = None
     mdir = Path(config["paths"]["models_dir"])
     mdir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +202,7 @@ def train_model(
                 logits = model(x)
                 val_loss_tot += (_soft_ce_loss(logits, y) * w).mean().item() * x.size(0)
                 preds.append(torch.softmax(logits, dim=1).cpu().numpy())
-                gts.append(y.numpy())
+                gts.append(y.cpu().numpy())
 
         val_loss = val_loss_tot / len(val_loader.dataset)
         y_pred = np.vstack(preds)
@@ -211,15 +211,15 @@ def train_model(
         val_auc = macro_auc_score(y_true, y_pred)
         val_prec = macro_precision_score(y_true, y_pred)
         print(
-            f"Epoch {epoch}/{epochs} | loss {avg_loss:.4f} | "
+            f"Epoch {epoch}/{epochs} | "
             f"train loss {avg_loss:.4f} | val loss {val_loss:.4f} | "
             f"AUC {val_auc:.4f} | Precision {val_prec:.4f}"
         )
 
-        fname = f"{arch}_run{run_id}_epoch{epoch}_auc{val_auc:.4f}_{int(time.time())}.pth"
+        fname = f"{arch}_run{run_id}_epoch{epoch}_loss{val_loss:.4f}_{int(time.time())}.pth"
         fpath = mdir / fname
         # if this epoch is better than any before, drop the old and save new
-        if val_loss < best_score - 1e-6:
+        if val_loss < best_loss - 1e-6:
             if best_ckpt is not None:
                 try: os.remove(best_ckpt)
                 except OSError: pass
