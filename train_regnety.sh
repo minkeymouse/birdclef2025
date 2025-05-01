@@ -1,2 +1,2 @@
 set -e
-python src/train/train_regnety_copy.py
+python src/train/train_regnety.py
