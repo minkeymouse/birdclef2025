@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-train_regnety.py — (re‑)train RegNetY‑800MF ensemble **from previous checkpoints only**
+train_regnety.py — (re‑)train RegNetY-ensemble **from previous checkpoints only**, using timm-backed RegNetY
 ====================================================================================
 
 * For every run `1‥N` the script **must** find an existing checkpoint whose
-  filename starts with ``{model_name}_run{run_id}_``.  Missing checkpoints raise
+  filename starts with `{model_name}_run{run_id}_`. Missing checkpoints raise
   *FileNotFoundError* so you never accidentally start from ImageNet weights.
 * We reload the *model weights* but **start a fresh optimiser/scheduler** so the
   network is fine‑tuned on the latest dataset/labels without carrying over any
@@ -30,43 +30,44 @@ import pandas as pd
 import torch
 import yaml
 from torch import nn
-from torchvision import models
+import timm
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Project imports (repo root two levels up)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 project_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(project_root))
 from src.train.dataloader import BirdClefDataset, create_dataloader, train_model  # noqa: E402
 from src.utils import utils  # noqa: E402
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Helper — locate newest checkpoint for a given run
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 def latest_ckpt(run_id: int, ckpt_root: Path, model_name: str) -> Path:
-    """Return newest ``*.pth`` checkpoint or raise *FileNotFoundError*."""
+    """Return newest `*.pth` checkpoint or raise *FileNotFoundError*."""
     pattern = f"{model_name}_run{run_id}_*.pth"
     ckpts = sorted(ckpt_root.glob(pattern))
     if not ckpts:
         raise FileNotFoundError(f"No checkpoint matching '{pattern}' in {ckpt_root}")
-    return ckpts[-1]  # filenames end with epoch + timestamp ⇒ lexicographic ≈ newest
+    return ckpts[-1]
 
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # CLI
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Resume RegNetY‑800MF ensemble training")
-    p.add_argument("--config", "-c", type=Path, default=project_root / "config" / "train.yaml",
-                   help="Path to YAML training configuration")
+    p = argparse.ArgumentParser(description="Resume RegNetY ensemble training")
+    p.add_argument(
+        "--config", "-c", type=Path,
+        default=project_root / "config" / "train.yaml",
+        help="Path to YAML training configuration"
+    )
     return p.parse_args()
 
-
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Main
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
@@ -74,14 +75,17 @@ def main() -> None:
         CFG = yaml.safe_load(f)
 
     # --- config excerpts -----------------------------------------------------
-    dataset_cfg   = CFG["dataset"]
-    model_cfg     = CFG["model"]
-    training_cfg  = CFG["training"]
-    paths_cfg     = CFG["paths"]
+    dataset_cfg  = CFG["dataset"]
+    model_cfg    = CFG["model"]
+    training_cfg = CFG["training"]
+    paths_cfg    = CFG["paths"]
 
     # --- RegNetY block -------------------------------------------------------
-    reg_cfg = next(a for a in model_cfg["architectures"] if a["name"].lower().startswith("regnety"))
-    model_name = reg_cfg["name"]  # e.g. "regnety_800mf"
+    reg_cfg = next(
+        a for a in model_cfg["architectures"]
+        if a["name"].lower().startswith("regnety")
+    )
+    model_name = reg_cfg["name"]      # e.g. "regnety_008"
     num_models = int(reg_cfg.get("num_models", 1))
 
     # --- metadata ------------------------------------------------------------
@@ -98,7 +102,9 @@ def main() -> None:
             df_meta = pd.concat([df_meta, pd.read_csv(synth_path)], ignore_index=True)
 
     # taxonomy ---------------------------------------------------------------
-    class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), dataset_cfg.get("train_csv"))
+    class_list, class_map = utils.load_taxonomy(
+        paths_cfg.get("taxonomy_csv"), dataset_cfg.get("train_csv")
+    )
 
     # split -------------------------------------------------------------------
     val_frac  = float(training_cfg.get("val_fraction", 0.1))
@@ -115,8 +121,12 @@ def main() -> None:
     train_ds = BirdClefDataset(df_train, class_map, mel_shape=mel_shape, augment=True)
     val_ds   = BirdClefDataset(df_val,   class_map, mel_shape=mel_shape, augment=False)
 
-    train_loader = create_dataloader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
-    val_loader   = create_dataloader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    train_loader = create_dataloader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = create_dataloader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
 
     # hardware ---------------------------------------------------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -132,11 +142,23 @@ def main() -> None:
         torch.manual_seed(base_seed + run)
         np.random.seed(base_seed + run)
 
-        # build model --------------------------------------------------------
-        model = models.regnet_y_800mf(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, len(class_map))
+        # build model via timm with single-channel input ---------------------
+        model = timm.create_model(
+            model_name,
+            pretrained=False,
+            in_chans=1,
+            drop_rate=0.0,
+            drop_path_rate=0.0,
+        )
+        # adapt final layer
+        if hasattr(model, 'fc'):
+            model.fc = nn.Linear(model.fc.in_features, len(class_map))
+        elif hasattr(model, 'classifier'):
+            model.classifier = nn.Linear(
+                model.classifier.in_features, len(class_map)
+            )
 
-        # load previous checkpoint -----------------------------------------
+        # load previous checkpoint -------------------------------------------
         ckpt_path = latest_ckpt(run, ckpt_root, model_name)
         state = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(state.get("model_state_dict", state), strict=False)
@@ -144,7 +166,7 @@ def main() -> None:
 
         model.to(device)
 
-        # context for generic trainer --------------------------------------
+        # context for generic trainer ----------------------------------------
         CFG["current_arch"] = model_name
         CFG["current_run"]  = run
         CFG["class_map"]    = class_map

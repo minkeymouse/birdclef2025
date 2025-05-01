@@ -19,7 +19,7 @@ import yaml
 
 # ───────────────────────────── CLI ─────────────────────────────
 p = argparse.ArgumentParser(description="Limit each species to ≤ cap% of rows")
-p.add_argument("--cap",  type=float, default=0.03,
+p.add_argument("--cap",  type=float, default=0.02,
                help="maximum share per species (0-1, default 0.05)")
 p.add_argument("--dry-run", action="store_true",
                help="preview only – don’t delete files / rewrite CSV")
