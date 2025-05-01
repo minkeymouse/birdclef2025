@@ -7,7 +7,7 @@ Shared by train_efficientnet.py and train_regnety.py.
 Classes:
 - BirdClefDataset   — loads mel-spectrogram chunks and soft-label vectors from metadata.
 - create_dataloader — builds a PyTorch DataLoader with optional WeightedRandomSampler.
-- train_model      — generic training loop with Soft Cross-Entropy and sample weighting,
+- train_model      — generic training loop with CE or Focal loss and sample weighting,
                      saving best checkpoints by loss (imported from metrics module).
 """
 from __future__ import annotations
@@ -33,6 +33,16 @@ from src.train.loss import get_criterion
 
 __all__ = ["BirdClefDataset", "create_dataloader", "train_model"]
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Choose your loss here: "cross_entropy" or "focal_loss_bce"
+LOSS_TYPE = "cross_entropy"
+# If using focal_loss_bce, you can also adjust these:
+FOCAL_ALPHA    = 0.25
+FOCAL_GAMMA    = 2
+BCE_WEIGHT     = 0.6
+FOCAL_WEIGHT   = 1.4
+REDUCTION_MODE = "mean"
+# ──────────────────────────────────────────────────────────────────────────────
 
 class BirdClefDataset(Dataset):
     """Dataset for BirdCLEF: loads mel-spectrograms and label vectors from metadata."""
@@ -140,12 +150,6 @@ def create_dataloader(
     )
 
 
-def _soft_ce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    """Soft Cross-Entropy loss for probability targets."""
-    log_prob = torch.log_softmax(logits, dim=1)
-    return -(targets * log_prob).sum(dim=1)
-
-
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
@@ -153,19 +157,24 @@ def train_model(
     config: dict,
     device: torch.device,
 ) -> List[str]:
-    """Train model, save best checkpoint by loss, and return their paths."""
-    epochs = int(config["training"]["epochs"])
-    opt_cfg = config.get("optimizer", {})
-    lr = float(opt_cfg.get("lr", 1e-3))
-    wd = float(opt_cfg.get("weight_decay", 0.0))
+    """
+    Train the model, save the best checkpoint (by validation loss), and return its path.
+    Loss function is chosen via the module‐level LOSS_TYPE constant.
+    """
+    # ———————— optimizer & scheduler setup ————————
+    epochs   = int(config["training"]["epochs"])
+    opt_cfg  = config.get("optimizer", {})
+    lr       = float(opt_cfg.get("lr", 1e-3))
+    wd       = float(opt_cfg.get("weight_decay", 0.0))
     opt_type = opt_cfg.get("type", "adamw").lower()
+
     optimizer = (
         optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
         if opt_type == "adamw"
         else optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     )
 
-    sch_cfg = config.get("scheduler", {})
+    sch_cfg   = config.get("scheduler", {})
     scheduler = None
     if sch_cfg.get("type") == "CosineAnnealingLR":
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -174,71 +183,88 @@ def train_model(
             eta_min=float(sch_cfg.get("eta_min", 1e-6)),
         )
 
-    criterion = get_criterion(alpha=0.25,
-        gamma=2,
-        reduction="mean",
-        bce_weight=0.6,
-        focal_weight=1.4
+    # ———————— instantiate loss criterion ————————
+    criterion = get_criterion(
+        loss_type=LOSS_TYPE,
+        alpha=FOCAL_ALPHA,
+        gamma=FOCAL_GAMMA,
+        reduction=REDUCTION_MODE,
+        bce_weight=BCE_WEIGHT,
+        focal_weight=FOCAL_WEIGHT,
     )
-    best_loss: float = float("inf")
+
+    # ———————— training loop ————————
+    best_loss: float       = float("inf")
     best_ckpt: Optional[str] = None
     mdir = Path(config["paths"]["models_dir"])
     mdir.mkdir(parents=True, exist_ok=True)
-    arch = config.get("current_arch", "model")
+    arch   = config.get("current_arch", "model")
     run_id = config.get("current_run", 1)
 
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
+        total_train = 0.0
+
         for x, y, w in train_loader:
             x, y, w = x.to(device), y.to(device), w.to(device)
             optimizer.zero_grad()
-            raw = criterion(model(x), y)
-            loss = (raw * w).mean()
+            raw_loss = criterion(model(x), y)
+            loss     = (raw_loss * w).mean()
             loss.backward()
             optimizer.step()
-            total_loss += loss.item() * x.size(0)
+            total_train += loss.item() * x.size(0)
+
         if scheduler:
             scheduler.step()
-        avg_loss = total_loss / len(train_loader.dataset)
+        avg_train_loss = total_train / len(train_loader.dataset)
 
+        # ———————— validation loop ————————
         model.eval()
-        val_loss_tot, preds, gts = 0.0, [], []
+        total_val, preds, gts = 0.0, [], []
+
         with torch.no_grad():
             for x, y, w in val_loader:
-                x, y, w = x.to(device), y.to(device), w.to(device)
-                logits = model(x)
-                raw_val = criterion(logits, y)
-                val_loss_tot += (raw_val * w).mean().item() * x.size(0)
+                x, y, w    = x.to(device), y.to(device), w.to(device)
+                logits     = model(x)
+                raw_val    = criterion(logits, y)
+                total_val += (raw_val * w).mean().item() * x.size(0)
                 preds.append(torch.softmax(logits, dim=1).cpu().numpy())
                 gts.append(y.cpu().numpy())
 
-        val_loss = val_loss_tot / len(val_loader.dataset)
-        y_pred = np.vstack(preds)
-        y_true = np.vstack(gts)
+        avg_val_loss = total_val / len(val_loader.dataset)
+        y_pred       = np.vstack(preds)
+        y_true       = np.vstack(gts)
 
-        val_auc = macro_auc_score(y_true, y_pred)
+        # ———————— metrics & checkpointing ————————
+        val_auc  = macro_auc_score(y_true, y_pred)
         val_prec = macro_precision_score(y_true, y_pred)
+
         print(
             f"Epoch {epoch}/{epochs} | "
-            f"train loss {avg_loss:.4f} | val loss {val_loss:.4f} | "
+            f"train loss {avg_train_loss:.4f} | val loss {avg_val_loss:.4f} | "
             f"AUC {val_auc:.4f} | Precision {val_prec:.4f}"
         )
 
-        fname = f"{arch}_run{run_id}_epoch{epoch}_loss{val_loss:.4f}_{int(time.time())}.pth"
-        fpath = mdir / fname
-        # if this epoch is better than any before, drop the old and save new
-        if val_loss < best_loss - 1e-6:
-            if best_ckpt is not None:
-                try: os.remove(best_ckpt)
-                except OSError: pass
-            torch.save(
-                {"model_state_dict": model.state_dict(), "class_map": config.get("class_map")},
-                str(fpath),
-            )
-            best_loss = val_loss
-            best_ckpt   = str(fpath)
-            print(f"  → new best checkpoint: {fpath} (val loss {val_loss:.4f})")
+        ckpt_name = (
+            f"{arch}_run{run_id}_epoch{epoch}"
+            f"_loss{avg_val_loss:.4f}_{int(time.time())}.pth"
+        )
+        ckpt_path = mdir / ckpt_name
 
-    return [best_ckpt] if best_ckpt is not None else []
+        if avg_val_loss < best_loss - 1e-6:
+            if best_ckpt:
+                try:
+                    os.remove(best_ckpt)
+                except OSError:
+                    pass
+            torch.save(
+                {"model_state_dict": model.state_dict(),
+                 "class_map": config.get("class_map")},
+                str(ckpt_path),
+            )
+            best_loss = avg_val_loss
+            best_ckpt = str(ckpt_path)
+            print(f"  → new best checkpoint: {ckpt_path} (val loss {avg_val_loss:.4f})")
+
+    return [best_ckpt] if best_ckpt else []
 
