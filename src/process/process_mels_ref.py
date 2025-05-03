@@ -1,68 +1,81 @@
-#!/usr/bin/env python3
-"""
-process_initial.py – Generate high-confidence initial training chunks for BirdCLEF-2025.
 
-Pipeline
---------
-1. Read **process.yaml** for paths and hyper-parameters.
-2. Filter `train.csv` to recordings that satisfy:
-   • rating ≥ selection.golden_rating (default 5)
-   • zero secondary labels when selection.require_single_label is true.
-3. For each qualifying recording:
-   a. Deduplicate by MD5 hash of the raw waveform.
-   b. Trim leading/trailing silence.
-   c. Ensure ≥ audio.min_duration by cyclic-padding.
-   d. Slide a 10-second window with 5-second hop:
-      – Skip if too silent or contains human speech.
-      – Save mel-spectrogram and 1-hot label vector.
-      – Record metadata with weight = `labeling.golden_label_weight`.
-4. Persist updated `audio_hashes.txt` and `train_metadata.csv`.
-"""
-from __future__ import annotations
-import hashlib
-import logging
-import sys
-from pathlib import Path
-from typing import List
+class Config:
+ 
+    DEBUG_MODE = False
+    
+    OUTPUT_DIR = '/kaggle/working/'
+    DATA_ROOT = '/kaggle/input/birdclef-2025'
+    FS = 32000
+    
+    # Mel spectrogram parameters
+    N_FFT = 1024
+    HOP_LENGTH = 512
+    N_MELS = 128
+    FMIN = 50
+    FMAX = 14000
+    
+    TARGET_DURATION = 5.0
+    TARGET_SHAPE = (256, 256)  
+    
+    N_MAX = 50 if DEBUG_MODE else None  
 
-import librosa
-import numpy as np
-import pandas as pd
-import yaml
+config = Config()
 
-project_root = Path(__file__).resolve().parents[2]
-config_path = project_root / "config" / "process.yaml"
-sys.path.insert(0, str(project_root))
-from src.utils import utils
+print("Starting audio processing...")
+print(f"{'DEBUG MODE - Processing only 50 samples' if config.DEBUG_MODE else 'FULL MODE - Processing all samples'}")
+start_time = time.time()
 
-with open(config_path, "r", encoding="utf-8") as f:
-    CFG = yaml.safe_load(f)
-paths_cfg = CFG["paths"]
-audio_cfg = CFG["audio"]
-chunk_cfg = CFG["chunking"]
-mel_cfg = CFG["mel"]
-sel_cfg = CFG["selection"]
-label_cfg = CFG["labeling"]
-dedup_cfg = CFG["deduplication"]
+all_bird_data = {}
+errors = []
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("process_gold")
+for i, row in tqdm(working_df.iterrows(), total=total_samples):
+    if config.N_MAX is not None and i >= config.N_MAX:
+        break
+    
+    try:
+        audio_data, _ = librosa.load(row.filepath, sr=config.FS)
 
-AUDIO_DIR = Path(paths_cfg["audio_dir"])
-PROCESSED_DIR = Path(paths_cfg["processed_dir"])
-MEL_DIR = PROCESSED_DIR / "mels"
-LABEL_DIR = PROCESSED_DIR / "labels"
-MEL_DIR.mkdir(parents=True, exist_ok=True)
-LABEL_DIR.mkdir(parents=True, exist_ok=True)
-METADATA_CSV = Path(paths_cfg["train_metadata"])
-TRAIN_CSV = Path(paths_cfg["train_csv"])
-HASH_FILE = PROCESSED_DIR / "audio_hashes.txt"
+        target_samples = int(config.TARGET_DURATION * config.FS)
 
-class_list, class_map = utils.load_taxonomy(paths_cfg.get("taxonomy_csv"), TRAIN_CSV)
-NUM_CLASSES = len(class_list)
-seen_hashes: set[str] = set()
-if HASH_FILE.exists():
-    seen_hashes.update(HASH_FILE.read_text().splitlines())
+        if len(audio_data) < target_samples:
+            n_copy = math.ceil(target_samples / len(audio_data))
+            if n_copy > 1:
+                audio_data = np.concatenate([audio_data] * n_copy)
+
+        start_idx = max(0, int(len(audio_data) / 2 - target_samples / 2))
+        end_idx = min(len(audio_data), start_idx + target_samples)
+        center_audio = audio_data[start_idx:end_idx]
+
+        if len(center_audio) < target_samples:
+            center_audio = np.pad(center_audio, 
+                                 (0, target_samples - len(center_audio)), 
+                                 mode='constant')
+
+        mel_spec = audio2melspec(center_audio)
+
+        if mel_spec.shape != config.TARGET_SHAPE:
+            mel_spec = cv2.resize(mel_spec, config.TARGET_SHAPE, interpolation=cv2.INTER_LINEAR)
+
+        all_bird_data[row.samplename] = mel_spec.astype(np.float32)
+        
+    except Exception as e:
+        print(f"Error processing {row.filepath}: {e}")
+        errors.append((row.filepath, str(e)))
+
+end_time = time.time()
+print(f"Processing completed in {end_time - start_time:.2f} seconds")
+print(f"Successfully processed {len(all_bird_data)} files out of {total_samples} total")
+print(f"Failed to process {len(errors)} files")
+
+
+
+
+
+
+
+
+
+
 
 df = pd.read_csv(TRAIN_CSV)
 golden_rating = sel_cfg["golden_rating"]
@@ -160,3 +173,4 @@ meta_df.to_csv(METADATA_CSV, index=False)
 
 with HASH_FILE.open("w") as f:
     f.write("\n".join(sorted(seen_hashes)))
+
