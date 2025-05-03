@@ -119,7 +119,7 @@ for i, row in iterator:
     path       = row.filepath
     fname      = row.filename
     sec_labels = parse_secondary(row.secondary_labels)
-    file_weight = file_weight = float(row.rating) / 5.0
+    file_weight = float(row.rating) / 5.0
 
     # build weighted one-hot
     onehot = np.zeros(num_classes, dtype=np.float32)
@@ -168,7 +168,8 @@ for i, row in iterator:
             np.save(label_path, onehot)
 
             meta_rows.append({
-                "filename":   fname,
+                "chunk_id": str(chunk_id),
+                "filename":   str(fname),
                 "end_sec":    round(ptr / audio_cfg["sample_rate"], 3),
                 "mel_path":   str(m_path),
                 "label_path": str(label_path),

@@ -1,110 +1,124 @@
 #!/usr/bin/env python3
 """
-dataloader.py – dataset, sampler, and training loop utilities
+`dataloader.py` – dataset, sampler, and training loop utilities
 ============================================================
-Shared by train_efficientnet.py and train_regnety.py.
+Shared by `train_efficientnet.py` and `train_regnety.py`.
 
 Classes:
-- BirdClefDataset   — loads mel-spectrogram chunks and soft-label vectors from metadata.
-- collatefn
-- create_dataloader — builds a PyTorch DataLoader with optional WeightedRandomSampler.
+- `BirdClefDataset`   — loads mel-spectrogram chunks, labels, and chunk IDs from metadata.
+- `create_dataloader` — builds a PyTorch DataLoader with optional `WeightedRandomSampler`.
 """
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import cv2
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import random
 
-__all__ = ["BirdClefDataset", "create_dataloader", "train_model"]
+__all__ = ["BirdClefDataset", "create_dataloader", "collate_fn"]
 
 class BirdClefDataset(Dataset):
-    """Dataset for BirdCLEF: loads mel-spectrograms and label vectors from metadata."""
+    """Dataset for BirdCLEF: loads mel-spectrograms, labels, and chunk IDs from metadata."""
 
     def __init__(
         self,
-        label2id,
-        metadata_df,
-        num_classes,
+        label2id: Dict[str, int],
+        metadata_df: pd.DataFrame,
+        num_classes: int,
         *,
         mode: str = "train"
     ) -> None:
         self.df = metadata_df.reset_index(drop=True)
+        if "weight" not in self.df.columns:
+            raise KeyError("metadata_df must contain a 'weight' column for sampling.")
+        if "chunk_id" not in self.df.columns:
+            raise KeyError("metadata_df must contain a 'chunk_id' column for identification.")
         self.sample_weights = self.df["weight"].astype(float).tolist()
-        self.mel_shape = (256, 256)
         self.label2id = label2id
         self.num_classes = num_classes
         self.mode = mode
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.df)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
-        mel = np.load(row["mel_path"])
+        chunk_id = row["chunk_id"]
+
+        mel = np.load(row["mel_path"])  # (H, W) or (1, H, W)
+        # ensure channel dim = 1
+        if mel.ndim == 2:
+            mel = mel[np.newaxis, ...]
+
         label = np.load(row["label_path"]).astype(np.float32)
+
         if self.mode == "train":
             mel = self.apply_spec_augmentations(mel)
 
         return {
-            "melspec": torch.tensor(mel, dtype=torch.float32),
-            "label":    torch.tensor(label, dtype=torch.float32),
-            "weight":   torch.tensor(self.sample_weights[idx], dtype=torch.float32),
-            "filename": row["filename"],
+            "mel": torch.tensor(mel, dtype=torch.float32),
+            "label": torch.tensor(label, dtype=torch.float32),
+            "weight": torch.tensor(self.sample_weights[idx], dtype=torch.float32),
+            "chunk_id": chunk_id,
         }
-    
-    def apply_spec_augmentations(self, spec):
-        """Apply augmentations to spectrogram"""
-        # Time masking (horizontal stripes)
+
+    def apply_spec_augmentations(self, spec: np.ndarray) -> np.ndarray:
+        """Simple SpecAugment: time/freq masking + brightness/contrast."""
+        # spec shape: (1, freq_bins, time_steps)
+        # time mask
         if random.random() < 0.5:
-            num_masks = random.randint(1, 3)
-            for _ in range(num_masks):
-                width = random.randint(5, 20)
-                start = random.randint(0, spec.shape[2] - width)
-                spec[0, :, start:start+width] = 0
-        
-        # Frequency masking (vertical stripes)
+            t = spec.shape[2]
+            for _ in range(random.randint(1, 3)):
+                width = random.randint(5, min(20, t // 2))
+                start = random.randint(0, t - width)
+                spec[0, :, start:start + width] = 0
+        # freq mask
         if random.random() < 0.5:
-            num_masks = random.randint(1, 3)
-            for _ in range(num_masks):
-                height = random.randint(5, 20)
-                start = random.randint(0, spec.shape[1] - height)
-                spec[0, start:start+height, :] = 0
-        
-        # Random brightness/contrast
+            f = spec.shape[1]
+            for _ in range(random.randint(1, 3)):
+                height = random.randint(5, min(20, f // 2))
+                start = random.randint(0, f - height)
+                spec[0, start:start + height, :] = 0
+        # brightness/contrast
         if random.random() < 0.5:
             gain = random.uniform(0.8, 1.2)
             bias = random.uniform(-0.1, 0.1)
             spec = spec * gain + bias
-            spec = torch.clamp(spec, 0, 1) 
-            
+            spec = np.clip(spec, 0.0, 1.0)
         return spec
 
-    def _weights(self):
+    def _weights(self) -> List[float]:
         return self.sample_weights
 
-def collate_fn(batch):
+
+def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """Collate examples into batch, stacking tensors and collecting chunk IDs."""
     batch = [b for b in batch if b]
-    keys  = batch[0].keys()
-    result = {k: [] for k in keys}
+    keys = batch[0].keys()
+    out: Dict[str, list] = {k: [] for k in keys}
     for b in batch:
         for k, v in b.items():
-            result[k].append(v)
-    # Stack tensors
-    for k in ["mel", "label", "weight"]:
-        if k in result:
-            result[k] = torch.stack(result[k])
-    return result
+            out[k].append(v)
+    # stack tensors
+    out["mel"] = torch.stack(out["mel"])
+    out["label"] = torch.stack(out["label"])
+    out["weight"] = torch.stack(out["weight"])
+    # chunk_id remains as List[str]
+    return out
 
-def create_dataloader(dataset, batch_size, num_workers=None, pin_memory=True):
+
+def create_dataloader(
+    dataset: BirdClefDataset,
+    batch_size: int,
+    num_workers: Optional[int] = None,
+    pin_memory: bool = True
+) -> DataLoader:
+    """Build DataLoader with WeightedRandomSampler for imbalanced data."""
     if num_workers is None:
         num_workers = 0 if os.name == "nt" else 4
     sampler = WeightedRandomSampler(
@@ -120,4 +134,3 @@ def create_dataloader(dataset, batch_size, num_workers=None, pin_memory=True):
         pin_memory=pin_memory,
         collate_fn=collate_fn,
     )
-

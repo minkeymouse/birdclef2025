@@ -238,19 +238,18 @@ def get_criterion(cfg):
         
     return criterion
 
-def run_training(df, cfg):
-    """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
+def run_training(metadata_df, cfg):
 
     taxonomy_df = taxonomy_df
     num_classes = num_classes
-    metadata = metadata_df
+    df = metadata_df
         
     skf = StratifiedKFold(n_splits=cfg["n_fold"], shuffle=True, random_state=cfg["seed"])
     
     best_scores = []
     
-    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['primary_label'])):
-        if fold not in cfg["selected_folds:
+    for fold, (train_idx, val_idx) in enumerate(skf.split(:
+        if fold not in cfg["selected_folds"]:
             continue
             
         print(f'\n{"="*30} Fold {fold} {"="*30}')
@@ -261,14 +260,14 @@ def run_training(df, cfg):
         print(f'Training set: {len(train_df)} samples')
         print(f'Validation set: {len(val_df)} samples')
         
-        train_dataset = BirdClefDataset(train_df, cfg, spectrograms=spectrograms, mode='train')
-        val_dataset = BirdClefDataset(val_df, cfg, spectrograms=spectrograms, mode='valid')
+        train_dataset = BirdClefDataset(metadata, label2id, train_df, num_classes, mode='train')
+        val_dataset = BirdClefDataset(metadata, label2id, val_df, num_classes, mode='valid')
         
         train_loader = DataLoader(
             train_dataset, 
-            batch_size=cfg["batch_size, 
+            batch_size=cfg["batch_size"], 
             shuffle=True, 
-            num_workers=cfg["num_workers,
+            num_workers=cfg["num_workers"],
             pin_memory=True,
             collate_fn=collate_fn,
             drop_last=True
@@ -276,23 +275,23 @@ def run_training(df, cfg):
         
         val_loader = DataLoader(
             val_dataset, 
-            batch_size=cfg["batch_size, 
+            batch_size=cfg["batch_size"], 
             shuffle=False, 
-            num_workers=cfg["num_workers,
+            num_workers=cfg["num_workers"],
             pin_memory=True,
             collate_fn=collate_fn
         )
         
-        model = BirdCLEF_EFFICIENTNET(cfg).to(cfg["device)
+        model = BirdCLEF_EFFICIENTNET(cfg).to(cfg["device"])
         optimizer = get_optimizer(model, cfg)
         criterion = get_criterion(cfg)
         
-        if cfg["scheduler == 'OneCycleLR':
+        if cfg["scheduler"] == 'OneCycleLR':
             scheduler = lr_scheduler.OneCycleLR(
                 optimizer,
-                max_lr=cfg["lr,
+                max_lr=cfg["lr"],
                 steps_per_epoch=len(train_loader),
-                epochs=cfg["epochs,
+                epochs=cfg["epochs"],
                 pct_start=0.1
             )
         else:
@@ -301,19 +300,19 @@ def run_training(df, cfg):
         best_auc = 0
         best_epoch = 0
         
-        for epoch in range(cfg["epochs):
-            print(f"\nEpoch {epoch+1}/{cfg["epochs}")
+        for epoch in range(cfg["epochs"]):
+            print(f"\nEpoch {epoch+1}/{cfg["epochs"]}")
             
             train_loss, train_auc = train_one_epoch(
                 model, 
                 train_loader, 
                 optimizer, 
                 criterion, 
-                cfg["device,
+                cfg["device"],
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
             )
             
-            val_loss, val_auc = validate(model, val_loader, criterion, cfg["device)
+            val_loss, val_auc = validate(model, val_loader, criterion, cfg["device"])
 
             if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
                 if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
@@ -350,7 +349,7 @@ def run_training(df, cfg):
     print("\n" + "="*60)
     print("Cross-Validation Results:")
     for fold, score in enumerate(best_scores):
-        print(f"Fold {cfg["selected_folds[fold]}: {score:.4f}")
+        print(f"Fold {cfg["selected_folds"][fold]}: {score:.4f}")
     print(f"Mean AUC: {np.mean(best_scores):.4f}")
     print("="*60)
 
@@ -358,16 +357,9 @@ if __name__ == "__main__":
     import time
     
     print("\nLoading training data...")
-    train_df = pd.read_csv(cfg["train_csv)
-    taxonomy_df = pd.read_csv(cfg["taxonomy_csv)
 
     print("\nStarting training...")
-    print(f"LOAD_DATA is set to {cfg["LOAD_DATA}")
-    if cfg["LOAD_DATA:
-        print("Using pre-computed mel spectrograms from NPY file")
-    else:
-        print("Will generate spectrograms on-the-fly during training")
     
-    run_training(train_df, cfg)
+    run_training(, cfg)
     
     print("\nTraining complete!")
