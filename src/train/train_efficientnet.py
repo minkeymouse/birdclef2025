@@ -1,365 +1,258 @@
 #!/usr/bin/env python3
 """
-train_efficientnet.py — (re-)train EfficientNet-B0 ensemble from pretrained or previous checkpoints
-===========================================================================================
+train_efficientnet.py — (re-)train EfficientNet-B0 ensemble with soft labels (BCEWithLogits only)
+======================================================================================================================
 
-* Each run (1‥N) **must** have an existing checkpoint whose filename starts with
-  `{model_name}_run{run_id}_`; unless `--pretrained` is passed, in which case we
-  initialize from the timm pretrained model zoo.
-* `--pretrained` will skip checkpoint resumption and use pretrained weights.
-* Configuration (dataset, model, training, paths) is read from `config/train.yaml`.
-
-Usage
------
-```bash
-python -m src.train.train_efficientnet -c config/train.yaml [--pretrained]
-```
+* Uses timm for model instantiation.
+* Strictly uses BCEWithLogitsLoss for all soft-label training (no CE fallback).
+* Supports optional MixUp on soft-label vectors.
 """
-from __future__ import annotations
-
 import argparse
 import sys
-from pathlib import Path
-from typing import List
-import tqdm
+import time
+import gc
 import random
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
-import yaml
-
-import timm
-
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import roc_auc_score
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
+import timm
+import yaml
+from sklearn.model_selection import StratifiedKFold
+from tqdm import tqdm
 
 # ----------------------------------------------------------------------------
 # Project imports
 # ----------------------------------------------------------------------------
 project_root = Path(__file__).resolve().parents[2]
-config_path  = project_root / "config" / "train.yaml"
 sys.path.insert(0, str(project_root))
 from src.train.dataloader import BirdClefDataset, collate_fn, create_dataloader
-from src.train.train_utils import train_one_epoch, validate, calculate_auc
+from src.train.train_utils import train_one_epoch, validate
 
+# ----------------------------------------------------------------------------
+# Load configuration
+# ----------------------------------------------------------------------------
+config_path = project_root / "config" / "train.yaml"
 with open(config_path, "r", encoding="utf-8") as f:
-    CFG = yaml.safe_load(f)
+    full_cfg = yaml.safe_load(f)
+cfg = full_cfg["efficientnet"]
 
-efficientnet_cfg = CFG["efficientnet"]
-efficientnet_cfg = Path(efficientnet_cfg)
+models_dir = project_root / "models"
+models_dir.mkdir(parents=True, exist_ok=True)
 
-# ─── Load metadata ─────────────────────────────────────────
-print("Loading taxonomy data…")
-taxonomy_df = pd.read_csv("data/birdclef/taxonomy.csv")
-species_class_map = dict(zip(taxonomy_df["primary_label"], taxonomy_df["class_name"]))
+# reproducibility
+random.seed(cfg.get("seed", 42))
+np.random.seed(cfg.get("seed", 42))
+torch.manual_seed(cfg.get("seed", 42))
+torch.cuda.manual_seed_all(cfg.get("seed", 42))
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
-print("Loading original metadata...")
-train_df = pd.read_csv("data/birdclef/train.csv")
+device = torch.device(cfg.get("device", "cuda") if torch.cuda.is_available() else "cpu")
 
-# Build your label2id mapping
-label_list   = sorted(train_df["primary_label"].unique().tolist())
-label2id     = {lab: i for i, lab in enumerate(label_list)}
-num_classes  = len(label_list)
-print(f"Found {num_classes} unique species labels")
-metadata_df = pd.read_csv("data/birdclef/DATABASE/train_metadata.csv")
-
-def latest_ckpt(run_id: int, ckpt_root: Path, model_name: str) -> Path:
-    pattern = f"{model_name}_run{run_id}_*.pth"
-    ckpts = sorted(ckpt_root.glob(pattern))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoint matching '{pattern}' in {ckpt_root}")
-    return ckpts[-1]
-
-def set_seed(seed=42):
-    """
-    Set seed for reproducibility
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-set_seed()
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Train EfficientNet-B0 ensemble, optionally from pretrained weights"
-    )
-    p.add_argument(
-        "--pretrained", action="store_true",
-        help="Initialize models with timm pretrained weights instead of resuming checkpoints"
-    )
-    return p.parse_args()
-
+# ----------------------------------------------------------------------------
+# Model definition with soft-label BCE and optional MixUp
+# ----------------------------------------------------------------------------
 class BirdCLEF_EFFICIENTNET(nn.Module):
-    def __init__(self, cfg):
+    def __init__(
+        self,
+        model_name: str,
+        in_chans: int,
+        num_classes: int,
+        pretrained: bool = True,
+        mixup_alpha: float = 0.0,
+    ):
         super().__init__()
-        self.cfg = efficientnet_cfg
-        
-        taxonomy_df = taxonomy_df
-        cfg["num_classes"] = num_classes
-        
+        self.mixup_alpha = mixup_alpha
+        self.mixup_enabled = mixup_alpha > 0.0
         self.backbone = timm.create_model(
-            cfg["name"],
-            pretrained=cfg["pretrained"],
-            in_chans=cfg["in_channels"],
-            drop_rate=0.2,
-            drop_path_rate=0.2
+            model_name,
+            pretrained=pretrained,
+            in_chans=in_chans,
+            num_classes=num_classes,
         )
-        
-        backbone_out = self.backbone.classifier.in_features
-        self.backbone.classifier = nn.Identity()
-        
-        self.pooling = nn.AdaptiveAvgPool2d(1)
-            
-        self.feat_dim = backbone_out
-        
-        self.classifier = nn.Linear(backbone_out, cfg["num_classes"])
-        
-        self.mixup_enabled = hasattr(cfg, 'mixup_alpha') and cfg["mixup_alpha > 0"]
-        if self.mixup_enabled:
-            self.mixup_alpha = cfg["mixup_alpha"]
-            
-    def forward(self, x, targets=None):
-    
+
+    def forward(self, x: torch.Tensor, targets: torch.Tensor = None):
         if self.training and self.mixup_enabled and targets is not None:
-            mixed_x, targets_a, targets_b, lam = self.mixup_data(x, targets)
-            x = mixed_x
-        else:
-            targets_a, targets_b, lam = None, None, None
-        
-        features = self.backbone(x)
-        
-        if isinstance(features, dict):
-            features = features['features']
-            
-        if len(features.shape) == 4:
-            features = self.pooling(features)
-            features = features.view(features.size(0), -1)
-        
-        softmax = self.classifier(features)
-        
-        if self.training and self.mixup_enabled and targets is not None:
-            loss = self.mixup_criterion(F.cross_entropy, 
-                                       softmax, targets_a, targets_b, lam)
-            return softmax, loss
-            
-        return softmax
-    
-    def mixup_data(self, x, targets):
-        """Applies mixup to the data batch"""
-        batch_size = x.size(0)
+            lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+            idx = torch.randperm(x.size(0), device=x.device)
+            x = lam * x + (1 - lam) * x[idx]
+            y_a, y_b = targets, targets[idx]
+            logits = self.backbone(x)
+            loss = lam * F.binary_cross_entropy_with_logits(logits, y_a) \
+                   + (1 - lam) * F.binary_cross_entropy_with_logits(logits, y_b)
+            return logits, loss
+        logits = self.backbone(x)
+        return logits
 
-        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+# ----------------------------------------------------------------------------
+# Optimizer, scheduler, criterion factory
+# ----------------------------------------------------------------------------
+def get_optimizer(model: nn.Module, cfg: dict) -> optim.Optimizer:
+    opt = cfg.get("optimizer", "AdamW")
+    lr  = cfg.get("lr", 1e-3)
+    wd  = cfg.get("weight_decay", 0.0)
+    if opt == 'Adam':
+        return optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    if opt == 'AdamW':
+        return optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    if opt == 'SGD':
+        return optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+    raise ValueError(f"Unsupported optimizer: {opt}")
 
-        indices = torch.randperm(batch_size).to(x.device)
 
-        mixed_x = lam * x + (1 - lam) * x[indices]
-        
-        return mixed_x, targets, targets[indices], lam
-    
-    def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
-        """Applies mixup to the loss function"""
-        return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-    
-def get_optimizer(model, cfg):
-  
-    if cfg["optimizer"] == 'Adam':
-        optimizer = optim.Adam(
-            model.parameters(),
-            lr=cfg["lr"],
-            weight_decay=cfg["weight_decay"]
-        )
-    elif cfg["optimizer"] == 'AdamW':
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=cfg["lr"],
-            weight_decay=cfg["weight_decay"]
-        )
-    elif cfg["optimizer"] == 'SGD':
-        optimizer = optim.SGD(
-            model.parameters(),
-            lr=cfg["lr"],
-            momentum=0.9,
-            weight_decay=cfg["weight_decay"]
-        )
-    else:
-        raise NotImplementedError(f"Optimizer {cfg["optimizer"]} not implemented")
-        
-    return optimizer
-
-def get_scheduler(optimizer, cfg):
-   
-    if cfg["scheduler"] == 'CosineAnnealingLR':
-        scheduler = lr_scheduler.CosineAnnealingLR(
+def get_scheduler(optimizer: optim.Optimizer, cfg: dict):
+    sch = cfg.get("scheduler", None)
+    if sch == 'CosineAnnealingLR':
+        return lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=cfg["T_max"],
-            eta_min=cfg["min_lr"]
+            T_max=cfg.get("T_max", cfg.get("epochs", 50)),
+            eta_min=cfg.get("eta_min", 0.0),
         )
-    elif cfg["scheduler"] == 'ReduceLROnPlateau':
-        scheduler = lr_scheduler.ReduceLROnPlateau(
+    if sch == 'ReduceLROnPlateau':
+        return lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=0.5,
             patience=2,
-            min_lr=cfg["min_lr"],
-            verbose=True
+            min_lr=cfg.get("eta_min", 0.0),
+            verbose=True,
         )
-    elif cfg["scheduler"] == 'StepLR':
-        scheduler = lr_scheduler.StepLR(
+    if sch == 'StepLR':
+        return lr_scheduler.StepLR(
             optimizer,
-            step_size=cfg["epochs"] // 3,
-            gamma=0.5
+            step_size=max(1, cfg.get("epochs", 20) // 3),
+            gamma=0.5,
         )
-    elif cfg["scheduler"] == 'OneCycleLR':
-        scheduler = None  
-    else:
-        scheduler = None
-        
-    return scheduler
+    return None
 
-def get_criterion(cfg):
- 
-    if cfg["criterion"] == 'CE':
-        criterion = nn.CrossEntropyLoss()
-    else:
-        raise NotImplementedError(f"Criterion {cfg["criterion"]} not implemented")
-        
-    return criterion
 
-def run_training(metadata_df, cfg):
+def get_criterion(cfg: dict):
+    # Always use soft-label BCEWithLogits
+    return nn.BCEWithLogitsLoss()
 
-    taxonomy_df = taxonomy_df
-    num_classes = num_classes
-    df = metadata_df
-        
-    skf = StratifiedKFold(n_splits=cfg["n_fold"], shuffle=True, random_state=cfg["seed"])
-    
+# ----------------------------------------------------------------------------
+# Training over stratified folds
+# ----------------------------------------------------------------------------
+def run_training():
+    train_csv = project_root / "data" / "birdclef" / "train.csv"
+    meta_csv  = project_root / "data" / "birdclef" / "DATABASE" / "train_metadata.csv"
+    train_df    = pd.read_csv(train_csv)
+    metadata_df = pd.read_csv(meta_csv)
+
+    label_list = sorted(train_df["primary_label"].unique())
+    label2id   = {lab: i for i, lab in enumerate(label_list)}
+    num_classes = len(label_list)
+
+    metadata_df["primary_label"] = metadata_df["filename"].map(
+        train_df.set_index("filename")["primary_label"]
+    )
+    y = metadata_df["primary_label"].map(label2id).values
+
+    skf = StratifiedKFold(
+        n_splits=cfg.get("n_fold", 5), shuffle=True,
+        random_state=cfg.get("seed", 42)
+    )
     best_scores = []
-    
-    for fold, (train_idx, val_idx) in enumerate(skf.split(:
-        if fold not in cfg["selected_folds"]:
+
+    args = parse_args()
+    pretrained_flag = args.pretrained or cfg.get("pretrained", True)
+
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(metadata_df, y)):
+        if fold not in cfg.get("selected_folds", list(range(cfg.get("n_fold", 5)))):
             continue
-            
-        print(f'\n{"="*30} Fold {fold} {"="*30}')
-        
-        train_df = df.iloc[train_idx].reset_index(drop=True)
-        val_df = df.iloc[val_idx].reset_index(drop=True)
-        
-        print(f'Training set: {len(train_df)} samples')
-        print(f'Validation set: {len(val_df)} samples')
-        
-        train_dataset = BirdClefDataset(metadata, label2id, train_df, num_classes, mode='train')
-        val_dataset = BirdClefDataset(metadata, label2id, val_df, num_classes, mode='valid')
-        
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=cfg["batch_size"], 
-            shuffle=True, 
-            num_workers=cfg["num_workers"],
-            pin_memory=True,
-            collate_fn=collate_fn,
-            drop_last=True
+        train_meta = metadata_df.iloc[tr_idx].reset_index(drop=True)
+        val_meta   = metadata_df.iloc[va_idx].reset_index(drop=True)
+        print(f"\n===== Fold {fold} =====")
+        train_ds = BirdClefDataset(label2id, train_meta, num_classes, mode='train')
+        val_ds   = BirdClefDataset(label2id, val_meta, num_classes, mode='valid')
+        train_loader = create_dataloader(
+            train_ds, cfg.get("batch_size",32), cfg.get("num_workers",4), pin_memory=True
         )
-        
         val_loader = DataLoader(
-            val_dataset, 
-            batch_size=cfg["batch_size"], 
-            shuffle=False, 
-            num_workers=cfg["num_workers"],
-            pin_memory=True,
+            val_ds, batch_size=cfg.get("batch_size",32), shuffle=False,
+            num_workers=cfg.get("num_workers",4), pin_memory=True,
             collate_fn=collate_fn
         )
-        
-        model = BirdCLEF_EFFICIENTNET(cfg).to(cfg["device"])
+
+        model     = BirdCLEF_EFFICIENTNET(
+            cfg["name"], cfg.get("in_channels",1),
+            num_classes, pretrained=pretrained_flag,
+            mixup_alpha=cfg.get("mixup_alpha",0.0)
+        ).to(device)
         optimizer = get_optimizer(model, cfg)
+        scheduler = get_scheduler(optimizer, cfg)
         criterion = get_criterion(cfg)
-        
-        if cfg["scheduler"] == 'OneCycleLR':
-            scheduler = lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=cfg["lr"],
-                steps_per_epoch=len(train_loader),
-                epochs=cfg["epochs"],
-                pct_start=0.1
-            )
-        else:
-            scheduler = get_scheduler(optimizer, cfg)
-        
-        best_auc = 0
-        best_epoch = 0
-        
-        for epoch in range(cfg["epochs"]):
-            print(f"\nEpoch {epoch+1}/{cfg["epochs"]}")
-            
+
+        best_auc, best_epoch = 0.0, 0
+
+        start_epoch = 0
+
+        ckpt_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
+        if ckpt_path.exists() and cfg["pretrained"] == False:
+            state = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(state['model_state_dict'])
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            if state.get('scheduler_state_dict') is not None:
+                scheduler.load_state_dict(state['scheduler_state_dict'])
+            start_epoch = state['epoch']
+            print(f"Resuming fold {fold} from epoch {start_epoch}")
+
+        for epoch in range(start_epoch, cfg.get("epochs",20)):
+            print(f"Epoch {epoch+1}/{int(cfg['epochs'])}")
             train_loss, train_auc = train_one_epoch(
-                model, 
-                train_loader, 
-                optimizer, 
-                criterion, 
-                cfg["device"],
+                model, train_loader, optimizer, criterion, device,
                 scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
             )
-            
-            val_loss, val_auc = validate(model, val_loader, criterion, cfg["device"])
+            val_loss, val_auc = validate(model, val_loader, criterion, device)
 
-            if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
+            if scheduler and not isinstance(scheduler, lr_scheduler.OneCycleLR):
                 if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
                     scheduler.step(val_loss)
                 else:
                     scheduler.step()
 
-            print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
-            print(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
-            
             if val_auc > best_auc:
-                best_auc = val_auc
-                best_epoch = epoch + 1
-                print(f"New best AUC: {best_auc:.4f} at epoch {best_epoch}")
-
-                torch.save({
+                best_auc, best_epoch = val_auc, epoch+1
+                ckpt = {
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'epoch': epoch,
+                    'epoch': epoch+1,
                     'val_auc': val_auc,
-                    'train_auc': train_auc,
-                    'cfg': cfg
-                }, f"model_fold{fold}.pth")
-        
+                }
+                save_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
+                torch.save(ckpt, save_path)
+
         best_scores.append(best_auc)
-        print(f"\nBest AUC for fold {fold}: {best_auc:.4f} at epoch {best_epoch}")
-        
-        # Clear memory
-        del model, optimizer, scheduler, train_loader, val_loader
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-    print("\n" + "="*60)
-    print("Cross-Validation Results:")
-    for fold, score in enumerate(best_scores):
-        print(f"Fold {cfg["selected_folds"][fold]}: {score:.4f}")
+        torch.cuda.empty_cache(); gc.collect()
+
+    # summary
+    for f, score in zip(cfg.get("selected_folds",[]), best_scores):
+        print(f"Fold {f}: {score:.4f}")
     print(f"Mean AUC: {np.mean(best_scores):.4f}")
-    print("="*60)
+
+# ----------------------------------------------------------------------------
+# CLI entry point
+# ----------------------------------------------------------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train EfficientNet-B0 ensemble with soft labels (BCE only)"
+    )
+    parser.add_argument(
+        "--pretrained", action="store_true",
+        help="Init from timm pretrained weights"
+    )
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    import time
-    
-    print("\nLoading training data...")
-
-    print("\nStarting training...")
-    
-    run_training(, cfg)
-    
-    print("\nTraining complete!")
+    start = time.time()
+    print("Starting training with soft labels...")
+    run_training()
+    print(f"Done in {(time.time()-start)/60:.2f} min.")

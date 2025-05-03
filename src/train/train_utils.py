@@ -1,158 +1,104 @@
-
-import logging
-import random
-import gc
-import time
-import cv2
-import math
-import warnings
-from pathlib import Path
-
 import numpy as np
-import pandas as pd
-from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
-import librosa
-
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from torch.optim import lr_scheduler
-from torch.utils.data import Dataset, DataLoader
-
-import tqdm
-
-import timm
+from tqdm import tqdm
 
 def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
+    """
+    Train the model for one epoch using Binary CrossEntropyLoss and optional mixup support.
+
+    Args:
+        model: torch.nn.Module (forward(x, targets=None) may return (logits, loss) if mixup is enabled)
+        loader: DataLoader yielding batches with keys 'mel' and 'label'
+        optimizer: torch optimizer
+        device: torch.device
+        scheduler: optional torch.scheduler (e.g., OneCycleLR)
+
+    Returns:
+        avg_loss: float
+        avg_auc: float
+    """
     model.train()
     losses = []
     all_targets = []
     all_outputs = []
-    
-    pbar = tqdm(enumerate(loader), total=len(loader), desc="Training")
-    
-    for step, batch in pbar:
-    
-        if isinstance(batch['melspec'], list):
-            batch_outputs = []
-            batch_losses = []
-            
-            for i in range(len(batch['melspec'])):
-                inputs = batch['melspec'][i].unsqueeze(0).to(device)
-                target = batch['label'][i].unsqueeze(0).to(device)
-                
-                optimizer.zero_grad()
-                output = model(inputs)
-                loss = criterion(output, target)
-                loss.backward()
-                
-                batch_outputs.append(output.detach().cpu())
-                batch_losses.append(loss.item())
-            
-            optimizer.step()
-            outputs = torch.cat(batch_outputs, dim=0).numpy()
-            loss = np.mean(batch_losses)
-            targets = batch['label'].numpy()
-            
+
+    for batch in tqdm(loader, desc="Training", leave=False):
+        inputs = batch['mel'].to(device)
+        targets = batch['label'].to(device)
+
+        optimizer.zero_grad()
+        # Forward: always pass targets (model may ignore if mixup is disabled)
+        result = model(inputs, targets)
+        if isinstance(result, tuple):
+            logits, loss = result
         else:
-            inputs = batch['melspec'].to(device)
-            targets = batch['label'].to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            
-            if isinstance(outputs, tuple):
-                outputs, loss = outputs  
-            else:
-                loss = criterion(outputs, targets)
-                
-            loss.backward()
-            optimizer.step()
-            
-            outputs = outputs.detach().cpu().numpy()
-            targets = targets.detach().cpu().numpy()
-        
-        if scheduler is not None and isinstance(scheduler, lr_scheduler.OneCycleLR):
+            logits = result
+            loss = criterion(logits, targets)
+
+        loss.backward()
+        optimizer.step()
+        if isinstance(scheduler, lr_scheduler.OneCycleLR):
             scheduler.step()
-            
-        all_outputs.append(outputs)
-        all_targets.append(targets)
-        losses.append(loss if isinstance(loss, float) else loss.item())
-        
-        pbar.set_postfix({
-            'train_loss': np.mean(losses[-10:]) if losses else 0,
-            'lr': optimizer.param_groups[0]['lr']
-        })
-    
-    all_outputs = np.concatenate(all_outputs)
-    all_targets = np.concatenate(all_targets)
-    auc = calculate_auc(all_targets, all_outputs)
-    avg_loss = np.mean(losses)
-    
-    return avg_loss, auc
+
+        # Compute probabilities for AUC
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        all_outputs.append(probs)
+        all_targets.append(targets.cpu().numpy())
+        losses.append(loss.item())
+
+    # Aggregate
+    all_outputs = np.concatenate(all_outputs, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    avg_loss = float(np.mean(losses))
+    avg_auc = calculate_auc(all_targets, all_outputs)
+    return avg_loss, avg_auc
+
 
 def validate(model, loader, criterion, device):
-   
+    """
+    Evaluate the model on validation data.
+
+    Returns:
+        avg_loss: float
+        avg_auc: float
+    """
     model.eval()
     losses = []
     all_targets = []
     all_outputs = []
-    
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Validation"):
-            if isinstance(batch['melspec'], list):
-                batch_outputs = []
-                batch_losses = []
-                
-                for i in range(len(batch['melspec'])):
-                    inputs = batch['melspec'][i].unsqueeze(0).to(device)
-                    target = batch['label'][i].unsqueeze(0).to(device)
-                    
-                    output = model(inputs)
-                    loss = criterion(output, target)
-                    
-                    batch_outputs.append(output.detach().cpu())
-                    batch_losses.append(loss.item())
-                
-                outputs = torch.cat(batch_outputs, dim=0).numpy()
-                loss = np.mean(batch_losses)
-                targets = batch['label'].numpy()
-                
-            else:
-                inputs = batch['melspec'].to(device)
-                targets = batch['label'].to(device)
-                
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
-                outputs = outputs.detach().cpu().numpy()
-                targets = targets.detach().cpu().numpy()
-            
-            all_outputs.append(outputs)
-            all_targets.append(targets)
-            losses.append(loss if isinstance(loss, float) else loss.item())
-    
-    all_outputs = np.concatenate(all_outputs)
-    all_targets = np.concatenate(all_targets)
-    
-    auc = calculate_auc(all_targets, all_outputs)
-    avg_loss = np.mean(losses)
-    
-    return avg_loss, auc
 
-def calculate_auc(targets, outputs):
-  
-    num_classes = targets.shape[1]
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validation", leave=False):
+            inputs = batch['mel'].to(device)
+            targets = batch['label'].to(device)
+
+            logits = model(inputs)
+            loss = criterion(logits, targets)
+
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_outputs.append(probs)
+            all_targets.append(targets.cpu().numpy())
+            losses.append(loss.item())
+
+    all_outputs = np.concatenate(all_outputs, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+    avg_loss = float(np.mean(losses))
+    avg_auc = calculate_auc(all_targets, all_outputs)
+    return avg_loss, avg_auc
+
+
+def calculate_auc(targets: np.ndarray, outputs: np.ndarray) -> float:
+    """
+    Compute macro-average ROC-AUC for multiclass predictions.
+    """
+    num_classes = outputs.shape[1]
     aucs = []
-    
-    probs = 1 / (1 + np.exp(-outputs))
-    
-    for i in range(num_classes):
-        
-        if np.sum(targets[:, i]) > 0:
-            class_auc = roc_auc_score(targets[:, i], probs[:, i])
-            aucs.append(class_auc)
-    
-    return np.mean(aucs) if aucs else 0.0
+    for cls in range(num_classes):
+        # Binary ground truth for class cls
+        gt = (targets[:, cls] > 0).astype(int)
+        if np.unique(gt).shape[0] == 2:
+            aucs.append(roc_auc_score(gt, outputs[:, cls]))
+    return float(np.mean(aucs)) if aucs else 0.0
