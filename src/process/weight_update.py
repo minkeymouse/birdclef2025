@@ -4,7 +4,7 @@ import pandas as pd
 # — PARAMETERS —————————————————————————————————————————————————————
 TRAIN_CSV    = "data/birdclef/train.csv"       # path to your train.csv
 META_CSV     = "data/birdclef/DATABASE/train_metadata.csv"  # path to your existing metadata
-THRESHOLD    = 50   # species with fewer than 50 examples are “rare” (adjust as needed)
+THRESHOLD    = 100   # species with fewer than 50 examples are “rare” (adjust as needed)
 # — END PARAMETERS ——————————————————————————————————————————————————
 
 # 1) Load train.csv and compute species frequencies
