@@ -21,25 +21,56 @@ import argparse
 import sys
 from pathlib import Path
 from typing import List
+import tqdm
+import random
 
 import numpy as np
 import pandas as pd
 import torch
 import yaml
-from torch import nn
+
 import timm
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader
 
 # ----------------------------------------------------------------------------
 # Project imports
 # ----------------------------------------------------------------------------
 project_root = Path(__file__).resolve().parents[2]
+config_path  = project_root / "config" / "train.yaml"
 sys.path.insert(0, str(project_root))
-from src.train.dataloader import BirdClefDataset, create_dataloader, train_model  # noqa: E402
-from src.utils import utils 
+from src.train.dataloader import BirdClefDataset, collate_fn, create_dataloader
+from src.train.train_utils import train_one_epoch, validate, calculate_auc
 
-# ----------------------------------------------------------------------------
-# Helper — locate newest checkpoint for a given run
-# ----------------------------------------------------------------------------
+with open(config_path, "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
+
+efficientnet_cfg = CFG["efficientnet"]
+efficientnet_cfg = Path(efficientnet_cfg)
+
+# ─── Load metadata ─────────────────────────────────────────
+print("Loading taxonomy data…")
+taxonomy_df = pd.read_csv("data/birdclef/taxonomy.csv")
+species_class_map = dict(zip(taxonomy_df["primary_label"], taxonomy_df["class_name"]))
+
+print("Loading original metadata...")
+train_df = pd.read_csv("data/birdclef/train.csv")
+
+# Build your label2id mapping
+label_list   = sorted(train_df["primary_label"].unique().tolist())
+label2id     = {lab: i for i, lab in enumerate(label_list)}
+num_classes  = len(label_list)
+print(f"Found {num_classes} unique species labels")
+metadata_df = pd.read_csv("data/birdclef/DATABASE/train_metadata.csv")
+
 def latest_ckpt(run_id: int, ckpt_root: Path, model_name: str) -> Path:
     pattern = f"{model_name}_run{run_id}_*.pth"
     ckpts = sorted(ckpt_root.glob(pattern))
@@ -47,17 +78,23 @@ def latest_ckpt(run_id: int, ckpt_root: Path, model_name: str) -> Path:
         raise FileNotFoundError(f"No checkpoint matching '{pattern}' in {ckpt_root}")
     return ckpts[-1]
 
-# ----------------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------------
+def set_seed(seed=42):
+    """
+    Set seed for reproducibility
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed()
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train EfficientNet-B0 ensemble, optionally from pretrained weights"
-    )
-    p.add_argument(
-        "--config", "-c", type=Path,
-        default=project_root / "config" / "train.yaml",
-        help="Path to YAML training configuration"
     )
     p.add_argument(
         "--pretrained", action="store_true",
@@ -65,108 +102,272 @@ def parse_args() -> argparse.Namespace:
     )
     return p.parse_args()
 
-# ----------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------
-def main() -> None:
-    args = parse_args()
-    with open(args.config, "r", encoding="utf-8") as f:
-        CFG = yaml.safe_load(f)
-
-    # Sections
-    dataset_cfg = CFG["dataset"]
-    model_cfg   = CFG["model"]
-    training_cfg= CFG["training"]
-    paths_cfg   = CFG["paths"]
-
-    # Identify EfficientNet entry
-    eff_cfg    = next(
-        a for a in model_cfg.get("architectures", [])
-        if a.get("name", "").lower().startswith("efficientnet")
-    )
-    model_name = eff_cfg["name"]
-    num_runs   = int(eff_cfg.get("num_models", 1))
-
-    # Load metadata & taxonomy
-    df_meta = pd.read_csv(dataset_cfg["train_metadata"], dtype=str, low_memory=False)
-    if dataset_cfg.get("include_pseudo", False):
-        pseudo = Path(dataset_cfg["train_metadata"]).with_name("soundscape_metadata.csv")
-        if pseudo.is_file():
-            df_meta = pd.concat([df_meta, pd.read_csv(pseudo, dtype=str)], ignore_index=True)
-    if dataset_cfg.get("include_synthetic", False):
-        synth = Path(dataset_cfg["train_metadata"]).with_name("synthetic_metadata.csv")
-        if synth.is_file():
-            df_meta = pd.concat([df_meta, pd.read_csv(synth, dtype=str)], ignore_index=True)
-
-    _, class_map = utils.load_taxonomy(
-        paths_cfg.get("taxonomy_csv"), dataset_cfg.get("train_csv")
-    )
-
-    # Train/validation split
-    val_frac  = float(training_cfg.get("val_fraction", 0.1))
-    seed_base = int(training_cfg.get("seed", 42))
-    df_val    = df_meta.sample(frac=val_frac, random_state=seed_base)
-    df_train  = df_meta.drop(df_val.index).reset_index(drop=True)
-    df_val    = df_val.reset_index(drop=True)
-
-    # Datasets & loaders
-    mel_shape  = tuple(dataset_cfg.get("target_shape", [256, 256]))
-    batch_size = int(training_cfg.get("batch_size", 32))
-    num_workers= int(training_cfg.get("num_workers", 4))
-
-    train_ds = BirdClefDataset(df_train, class_map, mel_shape=mel_shape, augment=True)
-    val_ds   = BirdClefDataset(df_val,   class_map, mel_shape=mel_shape, augment=False)
-
-    train_loader = create_dataloader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader   = create_dataloader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    # Hardware
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
-
-    # Checkpoint dir
-    ckpt_root = project_root / paths_cfg.get("models_dir", "models")
-    ckpt_root.mkdir(parents=True, exist_ok=True)
-
-    saved_ckpts: List[str] = []
-    for run_id in range(1, num_runs + 1):
-        torch.manual_seed(seed_base + run_id)
-        np.random.seed(seed_base + run_id)
-
-        # Build model (with or without pretrained weights)
-        model = timm.create_model(
-            model_name,
-            pretrained=args.pretrained,
-            in_chans=3,
-            num_classes=len(class_map),
-            drop_rate=float(training_cfg.get("drop_rate", 0.0)),
-            drop_path_rate=float(training_cfg.get("drop_path_rate", 0.0)),
+class BirdCLEF_EFFICIENTNET(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = efficientnet_cfg
+        
+        taxonomy_df = taxonomy_df
+        cfg["num_classes"] = num_classes
+        
+        self.backbone = timm.create_model(
+            cfg["name"],
+            pretrained=cfg["pretrained"],
+            in_chans=cfg["in_channels"],
+            drop_rate=0.2,
+            drop_path_rate=0.2
         )
-
-        # Resume or initialize
-        if args.pretrained:
-            print(f"✔ Initialized {model_name} run {run_id} with pretrained weights")
+        
+        backbone_out = self.backbone.classifier.in_features
+        self.backbone.classifier = nn.Identity()
+        
+        self.pooling = nn.AdaptiveAvgPool2d(1)
+            
+        self.feat_dim = backbone_out
+        
+        self.classifier = nn.Linear(backbone_out, cfg["num_classes"])
+        
+        self.mixup_enabled = hasattr(cfg, 'mixup_alpha') and cfg["mixup_alpha > 0"]
+        if self.mixup_enabled:
+            self.mixup_alpha = cfg["mixup_alpha"]
+            
+    def forward(self, x, targets=None):
+    
+        if self.training and self.mixup_enabled and targets is not None:
+            mixed_x, targets_a, targets_b, lam = self.mixup_data(x, targets)
+            x = mixed_x
         else:
-            ckpt_path = latest_ckpt(run_id, ckpt_root, model_name)
-            state = torch.load(ckpt_path, map_location="cpu")
-            model.load_state_dict(state.get("model_state_dict", state), strict=False)
-            print(f"✔ Resumed {model_name} run {run_id} from {ckpt_path.name}")
+            targets_a, targets_b, lam = None, None, None
+        
+        features = self.backbone(x)
+        
+        if isinstance(features, dict):
+            features = features['features']
+            
+        if len(features.shape) == 4:
+            features = self.pooling(features)
+            features = features.view(features.size(0), -1)
+        
+        softmax = self.classifier(features)
+        
+        if self.training and self.mixup_enabled and targets is not None:
+            loss = self.mixup_criterion(F.cross_entropy, 
+                                       softmax, targets_a, targets_b, lam)
+            return softmax, loss
+            
+        return softmax
+    
+    def mixup_data(self, x, targets):
+        """Applies mixup to the data batch"""
+        batch_size = x.size(0)
 
-        model.to(device)
+        lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
 
-        # Trainer context
-        CFG["current_arch"] = model_name
-        CFG["current_run"]  = run_id
-        CFG["class_map"]    = class_map
+        indices = torch.randperm(batch_size).to(x.device)
 
-        # Train and collect new checkpoints
-        ckpts = train_model(model, train_loader, val_loader, CFG, device)
-        saved_ckpts.extend(ckpts)
+        mixed_x = lam * x + (1 - lam) * x[indices]
+        
+        return mixed_x, targets, targets[indices], lam
+    
+    def mixup_criterion(self, criterion, pred, y_a, y_b, lam):
+        """Applies mixup to the loss function"""
+        return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+    
+def get_optimizer(model, cfg):
+  
+    if cfg["optimizer"] == 'Adam':
+        optimizer = optim.Adam(
+            model.parameters(),
+            lr=cfg["lr"],
+            weight_decay=cfg["weight_decay"]
+        )
+    elif cfg["optimizer"] == 'AdamW':
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=cfg["lr"],
+            weight_decay=cfg["weight_decay"]
+        )
+    elif cfg["optimizer"] == 'SGD':
+        optimizer = optim.SGD(
+            model.parameters(),
+            lr=cfg["lr"],
+            momentum=0.9,
+            weight_decay=cfg["weight_decay"]
+        )
+    else:
+        raise NotImplementedError(f"Optimizer {cfg["optimizer"]} not implemented")
+        
+    return optimizer
 
-    # Summary
-    print("\nTraining complete — saved checkpoints:")
-    for ck in saved_ckpts:
-        print(f" • {ck}")
+def get_scheduler(optimizer, cfg):
+   
+    if cfg["scheduler"] == 'CosineAnnealingLR':
+        scheduler = lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cfg["T_max"],
+            eta_min=cfg["min_lr"]
+        )
+    elif cfg["scheduler"] == 'ReduceLROnPlateau':
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=2,
+            min_lr=cfg["min_lr"],
+            verbose=True
+        )
+    elif cfg["scheduler"] == 'StepLR':
+        scheduler = lr_scheduler.StepLR(
+            optimizer,
+            step_size=cfg["epochs"] // 3,
+            gamma=0.5
+        )
+    elif cfg["scheduler"] == 'OneCycleLR':
+        scheduler = None  
+    else:
+        scheduler = None
+        
+    return scheduler
+
+def get_criterion(cfg):
+ 
+    if cfg["criterion"] == 'CE':
+        criterion = nn.CrossEntropyLoss()
+    else:
+        raise NotImplementedError(f"Criterion {cfg["criterion"]} not implemented")
+        
+    return criterion
+
+def run_training(df, cfg):
+    """Training function that can either use pre-computed spectrograms or generate them on-the-fly"""
+
+    taxonomy_df = taxonomy_df
+    num_classes = num_classes
+    metadata = metadata_df
+        
+    skf = StratifiedKFold(n_splits=cfg["n_fold"], shuffle=True, random_state=cfg["seed"])
+    
+    best_scores = []
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['primary_label'])):
+        if fold not in cfg["selected_folds:
+            continue
+            
+        print(f'\n{"="*30} Fold {fold} {"="*30}')
+        
+        train_df = df.iloc[train_idx].reset_index(drop=True)
+        val_df = df.iloc[val_idx].reset_index(drop=True)
+        
+        print(f'Training set: {len(train_df)} samples')
+        print(f'Validation set: {len(val_df)} samples')
+        
+        train_dataset = BirdClefDataset(train_df, cfg, spectrograms=spectrograms, mode='train')
+        val_dataset = BirdClefDataset(val_df, cfg, spectrograms=spectrograms, mode='valid')
+        
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=cfg["batch_size, 
+            shuffle=True, 
+            num_workers=cfg["num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            drop_last=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=cfg["batch_size, 
+            shuffle=False, 
+            num_workers=cfg["num_workers,
+            pin_memory=True,
+            collate_fn=collate_fn
+        )
+        
+        model = BirdCLEF_EFFICIENTNET(cfg).to(cfg["device)
+        optimizer = get_optimizer(model, cfg)
+        criterion = get_criterion(cfg)
+        
+        if cfg["scheduler == 'OneCycleLR':
+            scheduler = lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=cfg["lr,
+                steps_per_epoch=len(train_loader),
+                epochs=cfg["epochs,
+                pct_start=0.1
+            )
+        else:
+            scheduler = get_scheduler(optimizer, cfg)
+        
+        best_auc = 0
+        best_epoch = 0
+        
+        for epoch in range(cfg["epochs):
+            print(f"\nEpoch {epoch+1}/{cfg["epochs}")
+            
+            train_loss, train_auc = train_one_epoch(
+                model, 
+                train_loader, 
+                optimizer, 
+                criterion, 
+                cfg["device,
+                scheduler if isinstance(scheduler, lr_scheduler.OneCycleLR) else None
+            )
+            
+            val_loss, val_auc = validate(model, val_loader, criterion, cfg["device)
+
+            if scheduler is not None and not isinstance(scheduler, lr_scheduler.OneCycleLR):
+                if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_loss)
+                else:
+                    scheduler.step()
+
+            print(f"Train Loss: {train_loss:.4f}, Train AUC: {train_auc:.4f}")
+            print(f"Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
+            
+            if val_auc > best_auc:
+                best_auc = val_auc
+                best_epoch = epoch + 1
+                print(f"New best AUC: {best_auc:.4f} at epoch {best_epoch}")
+
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'epoch': epoch,
+                    'val_auc': val_auc,
+                    'train_auc': train_auc,
+                    'cfg': cfg
+                }, f"model_fold{fold}.pth")
+        
+        best_scores.append(best_auc)
+        print(f"\nBest AUC for fold {fold}: {best_auc:.4f} at epoch {best_epoch}")
+        
+        # Clear memory
+        del model, optimizer, scheduler, train_loader, val_loader
+        torch.cuda.empty_cache()
+        gc.collect()
+    
+    print("\n" + "="*60)
+    print("Cross-Validation Results:")
+    for fold, score in enumerate(best_scores):
+        print(f"Fold {cfg["selected_folds[fold]}: {score:.4f}")
+    print(f"Mean AUC: {np.mean(best_scores):.4f}")
+    print("="*60)
 
 if __name__ == "__main__":
-    main()
+    import time
+    
+    print("\nLoading training data...")
+    train_df = pd.read_csv(cfg["train_csv)
+    taxonomy_df = pd.read_csv(cfg["taxonomy_csv)
+
+    print("\nStarting training...")
+    print(f"LOAD_DATA is set to {cfg["LOAD_DATA}")
+    if cfg["LOAD_DATA:
+        print("Using pre-computed mel spectrograms from NPY file")
+    else:
+        print("Will generate spectrograms on-the-fly during training")
+    
+    run_training(train_df, cfg)
+    
+    print("\nTraining complete!")

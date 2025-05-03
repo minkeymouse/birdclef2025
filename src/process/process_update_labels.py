@@ -21,8 +21,7 @@ import pandas as pd
 import torch
 import yaml
 from torch.utils.data import DataLoader, Dataset
-import torchvision     # for EfficientNet
-import timm            # for RegNetY
+import timm
 
 # ──────────────────── CLI ────────────────────
 p = argparse.ArgumentParser()

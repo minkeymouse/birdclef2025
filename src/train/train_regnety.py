@@ -39,9 +39,22 @@ from src.train.dataloader import (
     BirdClefDataset,
     create_dataloader,
     train_model,
-    LOSS_TYPE,
 )
 from src.utils import utils
+
+project_root = Path(__file__).resolve().parents[2]
+config_path  = project_root / "config" / "train.yaml"
+sys.path.insert(0, str(project_root))
+from src.train.dataloader import BirdClefDataset, create_dataloader, train_model
+from src.utils import utils 
+
+with open(config_path, "r", encoding="utf-8") as f:
+    CFG = yaml.safe_load(f)
+
+dataset_cfg = CFG["dataset"]
+dataset_cfg = Path(dataset_cfg)
+regnety_cfg = CFG["regnety"]
+regnety_cfg = Path(regnety_cfg)
 
 # ----------------------------------------------------------------------------
 # Helper — locate newest checkpoint for a given run

@@ -173,6 +173,11 @@ def resize_mel(
     arr = np.asarray(img).astype(np.float32) / 255.0
     return arr * (hi - lo) + lo
 
+def parse_secondary(s) -> List[str]:
+    if pd.isna(s) or s in ["", "[]", "['']"]:
+        return []
+    return ast.literal_eval(s)
+
 
 # ----------------------------------------------------------------------------
 # Silence & Voice Detection
