@@ -5,6 +5,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import List
+import ast
 
 import math
 import cv2
@@ -15,155 +16,150 @@ import numpy as np
 import pandas as pd
 import yaml
 import tqdm
-import ast
 
 project_root = Path(__file__).resolve().parents[2]
-config_path = project_root / "config" / "process.yaml"
+config_path  = project_root / "config" / "process.yaml"
 sys.path.insert(0, str(project_root))
 from src.utils import utils
 
+# ─── Load configs ──────────────────────────────────────────
 with open(config_path, "r", encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 paths_cfg = CFG["paths"]
 audio_cfg = CFG["audio"]
-sel_cfg = CFG["selection"]
-label_cfg = CFG["labeling"]
 debug_cfg = CFG["debug"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("process_gold")
 
-print(f"Debug mode: {'ON' if debug_cfg.enabled else 'OFF'}")
-print(f"Max samples to process: {debug_cfg.N_MAX if debug_cfg.N_MAX is not None else 'ALL'}")
+print(f"Debug mode: {'ON' if debug_cfg["enabled"] else 'OFF'}")
+print(f"Max samples to process: {debug_cfg["N_MAX"] if debug_cfg["N_MAX"] is not None else 'ALL'}")
 
-print("Loading taxonomy data...")
-taxonomy_df = pd.read_csv(f'{paths_cfg.DATA_ROOT}/taxonomy.csv')
+# ─── Load metadata ─────────────────────────────────────────
+print("Loading taxonomy data…")
+taxonomy_df = pd.read_csv(f'{paths_cfg["DATA_ROOT"]}/taxonomy.csv')
+# Map species string → class name (if needed)
 species_class_map = dict(zip(taxonomy_df['primary_label'], taxonomy_df['class_name']))
-print("Loading training metadata...")
-train_df = pd.read_csv(f'{paths_cfg.DATA_ROOT}/train.csv')
 
-label_list = sorted(train_df['primary_label'].unique())
-label_id_list = list(range(len(label_list)))
-label2id = dict(zip(label_list, label_id_list))
-id2label = dict(zip(label_id_list, label_list))
+print("Loading training metadata…")
+train_df = pd.read_csv(f'{paths_cfg["DATA_ROOT"]}/train.csv')
 
-print(f'Found {len(label_list)} unique species')
+# Build your label2id mapping from unique primary_label values:
+label_list = sorted(train_df['primary_label'].unique().tolist())
+label2id   = {label: idx for idx, label in enumerate(label_list)}
+num_classes = len(label_list)
+print(f"Found {num_classes} unique species labels")
+
+# ─── Subset & prep DataFrame ───────────────────────────────
 working_df = train_df[['primary_label', 'secondary_labels', 'rating', 'filename']].copy()
-working_df['primary_label'] = working_df.primary_label.map(label2id)
-working_df['secondary_labels'] = working_df.secondary_labels
-working_df['filepath'] = working_df.filename
-working_df['class'] = working_df.primary_label.map(lambda x: species_class_map.get(x, 'Unknown'))
-total_samples = min(len(working_df), debug_cfg.N_MAX or len(working_df))
+working_df['filepath'] = paths_cfg["DATA_ROOT"] + '/train_audio/' + working_df['filename']
 
+total_samples = min(len(working_df), debug_cfg["N_MAX"] or len(working_df))
+print(f"Will process up to {total_samples} samples")
+
+# ─── Utils ─────────────────────────────────────────────────
 def audio2melspec(audio_data):
+    """Convert a 1D waveform to a normalized mel-spectrogram."""
     if np.isnan(audio_data).any():
-        mean_signal = np.nanmean(audio_data)
-        audio_data = np.nan_to_num(audio_data, nan=mean_signal)
+        audio_data = np.nan_to_num(audio_data, nan=np.nanmean(audio_data))
 
-    mel_spec = librosa.feature.melspectrogram(
+    m = librosa.feature.melspectrogram(
         y=audio_data,
-        sr=audio_cfg.sample_rate,
-        n_fft=audio_cfg.n_fft,
-        hop_length=audio_cfg.HOP_LENGTH,
-        n_mels=audio_cfg.N_MELS,
-        fmin=audio_cfg.FMIN,
-        fmax=audio_cfg.FMAX,
+        sr=audio_cfg["sample_rate"],
+        n_fft=audio_cfg["n_fft"],
+        hop_length=audio_cfg["hop_length"],
+        n_mels=audio_cfg["n_mels"],
+        fmin=audio_cfg["fmin"],
+        fmax=audio_cfg["fmax"],
         power=2.0
     )
-
-    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-    mel_spec_norm = (mel_spec_db - mel_spec_db.min()) / (mel_spec_db.max() - mel_spec_db.min() + 1e-8)
-    
-    return mel_spec_norm
+    m_db = librosa.power_to_db(m, ref=np.max)
+    return (m_db - m_db.min()) / (m_db.max() - m_db.min() + 1e-8)
 
 def parse_secondary(s):
-    if pd.isna(s):
+    if pd.isna(s) or s in ['', "[]", "['']"]:
         return []
-    elif isinstance(s, str):
-        return ast.literal_eval(s)
-    else:
-        return [s]
+    return ast.literal_eval(s)
 
-print("Starting audio processing...")
-print(f"{'DEBUG MODE - Processing only 50 samples' if config.DEBUG_MODE else 'FULL MODE - Processing all samples'}")
-start_time = time.time()
-
-train_duration = audio_cfg.train_duration
-train_hop = audio_cfg.train_chunk_hop
+# ─── Main processing ────────────────────────────────────────
+print("Starting audio processing…")
 meta_rows: List[dict] = []
-
-chunk_samples = int(train_duration * audio_cfg.sample_rate)
-hop_samples = int(train_hop * audio_cfg.sample_rate)
-
 errors = []
 
-for i, row in tqdm(working_df.iterrows(), total=total_samples):
-    print(f"Processing {i+1}/{total_samples}: {row.filename}")
-    if debug_cfg.N_MAX is not None and i >= debug_cfg.N_MAX:
+for i, row in tqdm.tqdm(working_df.iterrows(), total=total_samples):
+    if debug_cfg["enabled"] and i >= debug_cfg["N_MAX"]:
         break
 
     fname = row.filename
-    audio_path = paths_cfg.audio_dir / fname
-    secondaries = parse_secondary(row.secondary_labels)
-    onehot = np.zeros(len(label_list), dtype=np.float32)
-    pid = label2id[row.primary_label]
+    path  = row.filepath
+    sec_labels = parse_secondary(row.secondary_labels)
+    file_weight = (row.rating - 5) / (5 - row.rating)
+    # Build your weighted one-hot vector
+    onehot = np.zeros(num_classes, dtype=np.float32)
+    pid    = label2id[row.primary_label]      # primary is already the raw value
     onehot[pid] = 1.0
+    for sl in sec_labels:
+        if sl in label2id:
+            onehot[label2id[sl]] = 0.3
 
-    for sec in secondaries:
-        if sec in label2id:
-            onehot[label2id[sec]] = 0.3
-
-    rating = row.rating
-
-    if not audio_path.exists():
-        log.warning("Missing file: %s", fname)
+    # Load & chunk the audio
+    if not os.path.exists(path):
+        log.warning("Missing file: %s", path)
         continue
 
     try:
-        audio_data, _ = librosa.load(row.filepath, sr=audio_cfg.sample_rate)
-        audio_data, _ = librosa.effects.trim(audio_data, top_db=audio_cfg.trim_top_db)
-        if audio_data.size == 0:
+        wav, _ = librosa.load(path, sr=audio_cfg["sample_rate"])
+        wav, _ = librosa.effects.trim(wav, top_db=audio_cfg["trim_top_db"])
+        if wav.size == 0:
             continue
-        if audio_data.size < audio_cfg.train_duration:
-            reps = int(np.ceil(audio_cfg.train_duration / audio_data.size))
-            audio_data = np.tile(audio_data, reps)[:audio_cfg.train_duration]
-        
-        total = len(audio_data)
-        ptr = 0
-        while ptr + audio_cfg.train_duration <= total:
-            chunk = audio_data[ptr : ptr + audio_cfg.train_duration]
-            ptr += train_hop
-            if utils.is_silent(chunk, db_thresh=audio_cfg.silence_thresh_db):
-                continue
-            if utils.contains_voice(chunk, audio_cfg.sample_rate):
-                continue
-            m = audio2melspec(chunk)
 
-            if m.shape != audio_cfg.target_shape:
-                m = cv2.resize(m, audio_cfg.target_shape, interpolation=cv2.INTER_LINEAR)
-            
+        # If too short, tile/pad to exactly `train_duration`
+        dur_samples = int(audio_cfg["train_duration"] * audio_cfg["sample_rate"])
+        if wav.size < dur_samples:
+            reps = int(math.ceil(dur_samples / wav.size))
+            wav = np.tile(wav, reps)[:dur_samples]
+
+        ptr = 0
+        hop = int(audio_cfg["train_chunk_hop"] * audio_cfg["sample_rate"])
+        while ptr + dur_samples <= wav.size:
+            chunk = wav[ptr : ptr + dur_samples]
+            ptr += hop
+
+            # Skip silent or speech‐detected chunks if needed
+            if utils.is_silent(chunk, db_thresh=audio_cfg["silence_thresh_db"]):
+                continue
+            if utils.contains_voice(chunk, audio_cfg["sample_rate"]):
+                continue
+
+            # Convert to mel-spec, resize, save
+            m = audio2melspec(chunk)
+            if m.shape != tuple(audio_cfg["target_shape"]):
+                m = cv2.resize(m, tuple(audio_cfg["target_shape"]), interpolation=cv2.INTER_LINEAR)
             m = m.astype(np.float32)
 
-            chunk_id = utils.hash_chunk_id(fname, ptr / audio_cfg.sample_rate)
-
-            m_path = paths_cfg.mel_dir / f"{chunk_id}.npy"
-            label_path = paths_cfg.label_dir / f"{chunk_id}.npy"
+            chunk_id    = utils.hash_chunk_id(fname, ptr / audio_cfg["sample_rate"])
+            m_path      = paths_cfg["mel_dir"]   / f"{chunk_id}.npy"
+            label_path  = paths_cfg["label_dir"] / f"{chunk_id}.npy"
 
             np.save(m_path, m)
             np.save(label_path, onehot)
-        
+
+            meta_rows.append(
+                {
+                    "filename": fname,
+                    "end_sec": round(ptr / audio_cfg["sample_rate"], 3),
+                    "mel_path": str(m_path),
+                    "label_path": str(label_path),
+                    "weight": float(file_weight),
+                }
+            )
+
     except Exception as e:
-        print(f"Error processing {row.filepath}: {e}")
-        errors.append((row.filepath, str(e)))
+        errors.append((path, str(e)))
 
+meta_df = pd.DataFrame(meta_rows)
+meta_df.to_csv(paths_cfg["meta_data"], index=False)
 end_time = time.time()
-print(f"Processing completed in {end_time - start_time:.2f} seconds")
-print(f"Successfully processed {len(working_df)} files out of {total_samples} total")
-print(f"Failed to process {len(errors)} files")
-
-
-
-
-
-
-
+print(f"Encountered {len(errors)} errors")
+print(errors)
+print(f"Saved {len(meta_rows)} chunks to metadata, {len(errors)} errors")
