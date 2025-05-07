@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-train_regnety.py — (re‑)train RegNetY-0.8GF ensemble with soft labels (BCEWithLogits only)
-==========================================================================================
+train_regnety.py — (re-)train RegNetY-0.8GF ensemble with soft labels (BCEWithLogits only)
 
-* Uses timm for model instantiation (RegNetY ensemble).
-* Strictly uses BCEWithLogitsLoss for soft-label training (no CE fallback).
+* Uses timm for model instantiation.
+* Strictly uses BCEWithLogitsLoss for soft-label training.
 * Supports optional MixUp on soft-label vectors.
-* Performs stratified K-fold cross-validation, saving best checkpoint per fold.
+* Automatically resumes from saved checkpoints unless --pretrained is passed.
 """
 import argparse
-import sys
 import time
 import gc
 import random
@@ -94,7 +92,7 @@ class BirdCLEF_REGNETY(nn.Module):
         return logits
 
 # ----------------------------------------------------------------------------
-# Factory functions
+# Optimizer, scheduler, criterion factories
 # ----------------------------------------------------------------------------
 def get_optimizer(model: nn.Module, cfg: dict) -> optim.Optimizer:
     opt = cfg.get("optimizer", "AdamW")
@@ -120,17 +118,13 @@ def get_scheduler(optimizer: optim.Optimizer, cfg: dict):
     if sch == 'ReduceLROnPlateau':
         return lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',
-            factor=0.5,
-            patience=2,
-            min_lr=cfg.get("eta_min", 0.0),
-            verbose=True,
+            mode='min', factor=0.5, patience=2,
+            min_lr=cfg.get("eta_min", 0.0), verbose=True
         )
     if sch == 'StepLR':
         return lr_scheduler.StepLR(
             optimizer,
-            step_size=max(1, cfg.get("epochs", 100) // 3),
-            gamma=0.5,
+            step_size=max(1, cfg.get("epochs", 20)//3), gamma=0.5
         )
     return None
 
@@ -142,87 +136,74 @@ def get_criterion(cfg: dict):
 # Training over stratified folds
 # ----------------------------------------------------------------------------
 def run_training():
-    # load CSVs
+    # Load training metadata
     train_csv = project_root / "data" / "birdclef" / "train.csv"
     meta_csv  = project_root / "data" / "birdclef" / "DATABASE" / "train_metadata.csv"
-    train_df    = pd.read_csv(train_csv)
+    train_df  = pd.read_csv(train_csv)
     metadata_df = pd.read_csv(meta_csv)
 
-    # build label2id mapping
-    label_list = sorted(train_df["primary_label"].unique())
-    label2id   = {lab: i for i, lab in enumerate(label_list)}
-    num_classes = len(label_list)
-
-    # attach labels for stratification
-    metadata_df["primary_label"] = metadata_df["filename"].map(
-        train_df.set_index("filename")["primary_label"]
+    # Stratification label via argmax over soft labels
+    metadata_df["label_id"] = metadata_df["label_path"].apply(
+        lambda p: int(np.load(p).argmax())
     )
-    y = metadata_df["primary_label"].map(label2id).values
+    y = metadata_df["label_id"].values
 
-    # StratifiedKFold
     skf = StratifiedKFold(
         n_splits=cfg.get("n_fold", 5), shuffle=True,
-        random_state=cfg.get("seed", seed)
+        random_state=seed
     )
     best_scores = []
 
-    # CLI parser for pretrained flag
     args = parse_args()
-    pretrained_flag = args.pretrained or cfg.get("pretrained", True)
-
-    # Loop folds
     for fold, (tr_idx, va_idx) in enumerate(skf.split(metadata_df, y)):
-        if fold not in cfg.get("selected_folds", list(range(cfg.get("n_fold",5)))):
+        if fold not in cfg.get("selected_folds", list(range(cfg.get("n_fold", 5)))):
             continue
-        print(f"\n===== Fold {fold} =====")
+
+        ckpt_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
+        if args.pretrained:
+            pretrained_flag = True
+        else:
+            pretrained_flag = not ckpt_path.exists()
+
+        print(f"\n===== Fold {fold} (pretrained={pretrained_flag}) =====")
+
         train_meta = metadata_df.iloc[tr_idx].reset_index(drop=True)
         val_meta   = metadata_df.iloc[va_idx].reset_index(drop=True)
 
-        # DataLoader
-        train_ds = BirdClefDataset(label2id, train_meta, num_classes, mode='train')
-        val_ds   = BirdClefDataset(label2id, val_meta,   num_classes, mode='valid')
+        # DataLoaders
         train_loader = create_dataloader(
-            train_ds,
-            batch_size=cfg.get("batch_size",32),
-            num_workers=cfg.get("num_workers",4),
-            pin_memory=True
+            BirdClefDataset(label2id := {lab:i for i,lab in enumerate(sorted(train_df['primary_label'].unique()))}, train_meta, len(label2id), mode='train'),
+            batch_size=cfg.get("batch_size",64), num_workers=cfg.get("num_workers",4), pin_memory=True
         )
         val_loader = DataLoader(
-            val_ds,
-            batch_size=cfg.get("batch_size",32),
-            shuffle=False,
-            num_workers=cfg.get("num_workers",4),
-            pin_memory=True,
-            collate_fn=collate_fn,
+            BirdClefDataset(label2id, val_meta, len(label2id), mode='valid'),
+            batch_size=cfg.get("batch_size",64), shuffle=False,
+            num_workers=cfg.get("num_workers",4), pin_memory=True,
+            collate_fn=collate_fn
         )
 
-        # Model
+        # Build model, optimizer, scheduler, criterion
         model = BirdCLEF_REGNETY(
-            cfg.get("name","regnety_008"),
-            cfg.get("in_channels",1),
-            num_classes,
-            pretrained=pretrained_flag,
-            mixup_alpha=cfg.get("mixup_alpha",0.0)
+            cfg["name"], cfg.get("in_channels",1), len(label2id),
+            pretrained=pretrained_flag, mixup_alpha=cfg.get("mixup_alpha",0.0)
         ).to(device)
         optimizer = get_optimizer(model, cfg)
         scheduler = get_scheduler(optimizer, cfg)
         criterion = get_criterion(cfg)
 
-        best_auc, best_epoch = 0.0, 0
-
+        # Resume if checkpoint exists
         start_epoch = 0
-
-        ckpt_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
-        if ckpt_path.exists() and cfg["pretrained"] == False:
+        if ckpt_path.exists() and not args.pretrained:
             state = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(state['model_state_dict'])
             optimizer.load_state_dict(state['optimizer_state_dict'])
-            if state.get('scheduler_state_dict') is not None:
-                scheduler.load_state_dict(state['scheduler_state_dict'])
-            start_epoch = state['epoch']
-            print(f"Resuming fold {fold} from epoch {start_epoch}")
+            if (sd := state.get('scheduler_state_dict')) is not None:
+                scheduler.load_state_dict(sd)
+            start_epoch = state.get('epoch', 0)
+            print(f"Resumed fold {fold} at epoch {start_epoch}")
 
-        for epoch in range(start_epoch, cfg.get("epochs",20)):
+        best_auc = 0.0
+        for epoch in range(start_epoch, int(cfg.get("epochs",100))):
             print(f"Epoch {epoch+1}/{int(cfg['epochs'])}")
             train_loss, train_auc = train_one_epoch(
                 model, train_loader, optimizer, criterion, device,
@@ -230,7 +211,6 @@ def run_training():
             )
             val_loss, val_auc = validate(model, val_loader, criterion, device)
 
-            # scheduler step
             if scheduler and not isinstance(scheduler, lr_scheduler.OneCycleLR):
                 if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
                     scheduler.step(val_loss)
@@ -238,21 +218,19 @@ def run_training():
                     scheduler.step()
 
             if val_auc > best_auc:
-                best_auc, best_epoch = val_auc, epoch+1
-                ckpt = {
+                best_auc = val_auc
+                torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                     'epoch': epoch+1,
-                    'val_auc': val_auc,
-                }
-                save_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
-                torch.save(ckpt, save_path)
+                    'val_auc': val_auc
+                }, ckpt_path)
 
         best_scores.append(best_auc)
         torch.cuda.empty_cache(); gc.collect()
 
-    # Summary
+    # CV summary
     print("\n===== CV Results =====")
     for f, score in zip(cfg.get("selected_folds",[]), best_scores):
         print(f"Fold {f}: {score:.4f}")
@@ -262,17 +240,13 @@ def run_training():
 # CLI entry point
 # ----------------------------------------------------------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train RegNetY ensemble with soft labels (BCE only)"
-    )
-    parser.add_argument(
-        "--pretrained", action="store_true",
-        help="Init from timm pretrained weights"
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Train RegNetY ensemble with resume support")
+    p.add_argument("--pretrained", action="store_true",
+                   help="Ignore existing checkpoints and init from pretrained weights")
+    return p.parse_args()
 
 if __name__ == "__main__":
-    start = time.time()
+    t0 = time.time()
     print("Starting RegNetY training with soft labels...")
     run_training()
-    print(f"Done in {(time.time()-start)/60:.2f} min.")
+    print(f"Done in {(time.time()-t0)/60:.2f} min.")

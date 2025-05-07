@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 train_efficientnet.py — (re-)train EfficientNet-B0 ensemble with soft labels (BCEWithLogits only)
-======================================================================================================================
 
 * Uses timm for model instantiation.
-* Strictly uses BCEWithLogitsLoss for all soft-label training (no CE fallback).
+* Strictly uses BCEWithLogitsLoss for soft-label training (no CE fallback).
 * Supports optional MixUp on soft-label vectors.
+* Automatically resumes from saved checkpoints unless --pretrained is passed.
 """
 import argparse
 import sys
@@ -47,10 +47,11 @@ models_dir = project_root / "models"
 models_dir.mkdir(parents=True, exist_ok=True)
 
 # reproducibility
-random.seed(cfg.get("seed", 42))
-np.random.seed(cfg.get("seed", 42))
-torch.manual_seed(cfg.get("seed", 42))
-torch.cuda.manual_seed_all(cfg.get("seed", 42))
+seed = cfg.get("seed", 42)
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
@@ -79,6 +80,7 @@ class BirdCLEF_EFFICIENTNET(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor = None):
+        # Supports in-model MixUp if enabled
         if self.training and self.mixup_enabled and targets is not None:
             lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
             idx = torch.randperm(x.size(0), device=x.device)
@@ -92,7 +94,7 @@ class BirdCLEF_EFFICIENTNET(nn.Module):
         return logits
 
 # ----------------------------------------------------------------------------
-# Optimizer, scheduler, criterion factory
+# Optimizer, scheduler, criterion factories
 # ----------------------------------------------------------------------------
 def get_optimizer(model: nn.Module, cfg: dict) -> optim.Optimizer:
     opt = cfg.get("optimizer", "AdamW")
@@ -134,77 +136,86 @@ def get_scheduler(optimizer: optim.Optimizer, cfg: dict):
 
 
 def get_criterion(cfg: dict):
-    # Always use soft-label BCEWithLogits
     return nn.BCEWithLogitsLoss()
 
 # ----------------------------------------------------------------------------
 # Training over stratified folds
 # ----------------------------------------------------------------------------
 def run_training():
+    # Load training metadata
     train_csv = project_root / "data" / "birdclef" / "train.csv"
     meta_csv  = project_root / "data" / "birdclef" / "DATABASE" / "train_metadata.csv"
-    train_df    = pd.read_csv(train_csv)
+    train_df  = pd.read_csv(train_csv)
     metadata_df = pd.read_csv(meta_csv)
 
-    label_list = sorted(train_df["primary_label"].unique())
-    label2id   = {lab: i for i, lab in enumerate(label_list)}
-    num_classes = len(label_list)
-
-    metadata_df["primary_label"] = metadata_df["filename"].map(
-        train_df.set_index("filename")["primary_label"]
+    # Compute integer label_id for stratification (handles all chunks, including pseudo)
+    metadata_df["label_id"] = metadata_df["label_path"].apply(
+        lambda p: int(np.load(p).argmax())
     )
-    y = metadata_df["primary_label"].map(label2id).values
+    y = metadata_df["label_id"].values
 
+    # Stratified K-fold
     skf = StratifiedKFold(
         n_splits=cfg.get("n_fold", 5), shuffle=True,
-        random_state=cfg.get("seed", 42)
+        random_state=seed
     )
     best_scores = []
 
     args = parse_args()
-    pretrained_flag = args.pretrained or cfg.get("pretrained", True)
-
     for fold, (tr_idx, va_idx) in enumerate(skf.split(metadata_df, y)):
         if fold not in cfg.get("selected_folds", list(range(cfg.get("n_fold", 5)))):
             continue
+
+        ckpt_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
+        # Determine fresh vs resume
+        if args.pretrained:
+            pretrained_flag = True
+        else:
+            pretrained_flag = not ckpt_path.exists()
+
+        print(f"\n===== Fold {fold} (pretrained={pretrained_flag}) =====")
+
+        # Split metadata
         train_meta = metadata_df.iloc[tr_idx].reset_index(drop=True)
         val_meta   = metadata_df.iloc[va_idx].reset_index(drop=True)
-        print(f"\n===== Fold {fold} =====")
-        train_ds = BirdClefDataset(label2id, train_meta, num_classes, mode='train')
-        val_ds   = BirdClefDataset(label2id, val_meta, num_classes, mode='valid')
+
+        # DataLoaders with weighted sampling
         train_loader = create_dataloader(
-            train_ds, cfg.get("batch_size",32), cfg.get("num_workers",4), pin_memory=True
+            BirdClefDataset(label2id := {lab:i for i,lab in enumerate(sorted(train_df['primary_label'].unique()))}, train_meta, len(train_meta.columns)),
+            batch_size=cfg.get("batch_size", 32),
+            num_workers=cfg.get("num_workers", 4),
+            pin_memory=True
         )
         val_loader = DataLoader(
-            val_ds, batch_size=cfg.get("batch_size",32), shuffle=False,
-            num_workers=cfg.get("num_workers",4), pin_memory=True,
+            BirdClefDataset(label2id, val_meta, len(val_meta.columns), mode='valid'),
+            batch_size=cfg.get("batch_size", 32), shuffle=False,
+            num_workers=cfg.get("num_workers", 4), pin_memory=True,
             collate_fn=collate_fn
         )
 
-        model     = BirdCLEF_EFFICIENTNET(
+        # Build model, optimizer, scheduler, criterion
+        model = BirdCLEF_EFFICIENTNET(
             cfg["name"], cfg.get("in_channels",1),
-            num_classes, pretrained=pretrained_flag,
+            len(label2id), pretrained=pretrained_flag,
             mixup_alpha=cfg.get("mixup_alpha",0.0)
         ).to(device)
         optimizer = get_optimizer(model, cfg)
         scheduler = get_scheduler(optimizer, cfg)
         criterion = get_criterion(cfg)
 
-        best_auc, best_epoch = 0.0, 0
-
+        # Resume from checkpoint if available and not forcing fresh start
         start_epoch = 0
-
-        ckpt_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
-        if ckpt_path.exists() and cfg["pretrained"] == False:
+        if ckpt_path.exists() and not args.pretrained:
             state = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(state['model_state_dict'])
             optimizer.load_state_dict(state['optimizer_state_dict'])
-            if state.get('scheduler_state_dict') is not None:
-                scheduler.load_state_dict(state['scheduler_state_dict'])
-            start_epoch = state['epoch']
-            print(f"Resuming fold {fold} from epoch {start_epoch}")
+            if (sd := state.get('scheduler_state_dict')) is not None:
+                scheduler.load_state_dict(sd)
+            start_epoch = state.get('epoch', 0)
+            print(f"Resumed fold {fold} at epoch {start_epoch}")
 
-        for epoch in range(start_epoch, cfg.get("epochs",20)):
+        best_auc = 0.0
+        for epoch in range(start_epoch, int(cfg.get("epochs", 100))):
             print(f"Epoch {epoch+1}/{int(cfg['epochs'])}")
             train_loss, train_auc = train_one_epoch(
                 model, train_loader, optimizer, criterion, device,
@@ -218,22 +229,22 @@ def run_training():
                 else:
                     scheduler.step()
 
+            # Save best
             if val_auc > best_auc:
-                best_auc, best_epoch = val_auc, epoch+1
-                ckpt = {
+                best_auc = val_auc
+                torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
                     'epoch': epoch+1,
-                    'val_auc': val_auc,
-                }
-                save_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
-                torch.save(ckpt, save_path)
+                    'val_auc': val_auc
+                }, ckpt_path)
 
         best_scores.append(best_auc)
         torch.cuda.empty_cache(); gc.collect()
 
-    # summary
+    # CV summary
+    print("\n===== CV Results =====")
     for f, score in zip(cfg.get("selected_folds",[]), best_scores):
         print(f"Fold {f}: {score:.4f}")
     print(f"Mean AUC: {np.mean(best_scores):.4f}")
@@ -243,16 +254,16 @@ def run_training():
 # ----------------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train EfficientNet-B0 ensemble with soft labels (BCE only)"
+        description="Train EfficientNet-B0 ensemble with self-training resume support"
     )
     parser.add_argument(
         "--pretrained", action="store_true",
-        help="Init from timm pretrained weights"
+        help="Ignore existing fold checkpoints and initialize from pretrained weights"
     )
     return parser.parse_args()
 
 if __name__ == "__main__":
     start = time.time()
-    print("Starting training with soft labels...")
+    print("Starting EfficientNet training with soft labels...")
     run_training()
     print(f"Done in {(time.time()-start)/60:.2f} min.")
