@@ -3,7 +3,7 @@
 train_efficientnet.py — (re-)train EfficientNet-B0 ensemble with soft labels (BCEWithLogits only)
 
 * Uses timm for model instantiation.
-* Strictly uses BCEWithLogitsLoss for soft-label training (no CE fallback).
+* Strictly uses BCEWithLogitsLoss for soft-label training.
 * Supports optional MixUp on soft-label vectors.
 * Automatically resumes from saved checkpoints unless --pretrained is passed.
 """
@@ -80,7 +80,6 @@ class BirdCLEF_EFFICIENTNET(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, targets: torch.Tensor = None):
-        # Supports in-model MixUp if enabled
         if self.training and self.mixup_enabled and targets is not None:
             lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
             idx = torch.randperm(x.size(0), device=x.device)
@@ -142,13 +141,18 @@ def get_criterion(cfg: dict):
 # Training over stratified folds
 # ----------------------------------------------------------------------------
 def run_training():
-    # Load training metadata
+    # Load data
     train_csv = project_root / "data" / "birdclef" / "train.csv"
     meta_csv  = project_root / "data" / "birdclef" / "DATABASE" / "train_metadata.csv"
     train_df  = pd.read_csv(train_csv)
     metadata_df = pd.read_csv(meta_csv)
 
-    # Compute integer label_id for stratification (handles all chunks, including pseudo)
+    # Build label2id mapping and count classes
+    label_list = sorted(train_df["primary_label"].unique())
+    label2id   = {lab: i for i, lab in enumerate(label_list)}
+    num_classes = len(label2id)
+
+    # Stratification label via argmax of soft labels
     metadata_df["label_id"] = metadata_df["label_path"].apply(
         lambda p: int(np.load(p).argmax())
     )
@@ -167,7 +171,7 @@ def run_training():
             continue
 
         ckpt_path = models_dir / f"{cfg['name']}_fold{fold}_best.pth"
-        # Determine fresh vs resume
+        # Decide whether to init pretrained or resume
         if args.pretrained:
             pretrained_flag = True
         else:
@@ -179,31 +183,31 @@ def run_training():
         train_meta = metadata_df.iloc[tr_idx].reset_index(drop=True)
         val_meta   = metadata_df.iloc[va_idx].reset_index(drop=True)
 
-        # DataLoaders with weighted sampling
+        # DataLoaders
         train_loader = create_dataloader(
-            BirdClefDataset(label2id := {lab:i for i,lab in enumerate(sorted(train_df['primary_label'].unique()))}, train_meta, len(train_meta.columns)),
+            BirdClefDataset(label2id, train_meta, num_classes, mode='train'),
             batch_size=cfg.get("batch_size", 32),
             num_workers=cfg.get("num_workers", 4),
             pin_memory=True
         )
         val_loader = DataLoader(
-            BirdClefDataset(label2id, val_meta, len(val_meta.columns), mode='valid'),
+            BirdClefDataset(label2id, val_meta, num_classes, mode='valid'),
             batch_size=cfg.get("batch_size", 32), shuffle=False,
             num_workers=cfg.get("num_workers", 4), pin_memory=True,
             collate_fn=collate_fn
         )
 
-        # Build model, optimizer, scheduler, criterion
+        # Instantiate model, optimizer, scheduler, criterion
         model = BirdCLEF_EFFICIENTNET(
-            cfg["name"], cfg.get("in_channels",1),
-            len(label2id), pretrained=pretrained_flag,
-            mixup_alpha=cfg.get("mixup_alpha",0.0)
+            cfg["name"], cfg.get("in_channels", 1),
+            num_classes, pretrained=pretrained_flag,
+            mixup_alpha=cfg.get("mixup_alpha", 0.0)
         ).to(device)
         optimizer = get_optimizer(model, cfg)
         scheduler = get_scheduler(optimizer, cfg)
         criterion = get_criterion(cfg)
 
-        # Resume from checkpoint if available and not forcing fresh start
+        # Resume from checkpoint if available
         start_epoch = 0
         if ckpt_path.exists() and not args.pretrained:
             state = torch.load(ckpt_path, map_location=device)
@@ -229,7 +233,7 @@ def run_training():
                 else:
                     scheduler.step()
 
-            # Save best
+            # Save best checkpoint
             if val_auc > best_auc:
                 best_auc = val_auc
                 torch.save({
@@ -243,9 +247,9 @@ def run_training():
         best_scores.append(best_auc)
         torch.cuda.empty_cache(); gc.collect()
 
-    # CV summary
+    # Cross-validation summary
     print("\n===== CV Results =====")
-    for f, score in zip(cfg.get("selected_folds",[]), best_scores):
+    for f, score in zip(cfg.get("selected_folds", []), best_scores):
         print(f"Fold {f}: {score:.4f}")
     print(f"Mean AUC: {np.mean(best_scores):.4f}")
 

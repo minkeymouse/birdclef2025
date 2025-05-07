@@ -13,6 +13,9 @@ import numpy as np
 import pandas as pd
 import yaml
 import cv2
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.utils import utils
 
 # Project root and config
 project_root = Path(__file__).resolve().parents[2]
@@ -121,7 +124,7 @@ for ogg_path in ogg_files:
             zeros = np.zeros(num_classes, dtype=np.float32)
             np.save(label_path, zeros)
 
-            weight = 0.5
+            weight = CFG["labeling"]["pseudo_label_weight"]
             meta_rows.append({
                 "chunk_id": str(chunk_id),
                 "filename": str(rel_fname),
