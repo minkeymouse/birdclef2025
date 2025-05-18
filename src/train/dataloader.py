@@ -51,11 +51,13 @@ class BirdClefDataset(Dataset):
         chunk_id = row["chunk_id"]
 
         mel = np.load(row["mel_path"])  # (H, W) or (1, H, W)
+        mel = np.nan_to_num(mel, nan=0.0)
         # ensure channel dim = 1
         if mel.ndim == 2:
             mel = mel[np.newaxis, ...]
 
         label = np.load(row["label_path"]).astype(np.float32)
+        label = np.nan_to_num(label, nan=0.0)
 
         if self.mode == "train":
             mel = self.apply_spec_augmentations(mel)
