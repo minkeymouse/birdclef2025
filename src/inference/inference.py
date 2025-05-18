@@ -40,13 +40,30 @@ def load_ensemble(models_dir: Path, num_classes: int, device: torch.device) -> l
             arch = 'efficientnet_b0'
         elif "regnety" in name:
             arch = 'regnety_008'
+        elif "focal" in name:
+            arch = 'efficientnet_b0'
         else:
             logger.warning("Skipping unknown checkpoint: %s", ckpt.name)
             continue
 
         model = InferenceModel(arch, in_chans=1, num_classes=num_classes).to(device)
-        state = torch.load(ckpt, map_location=device)
-        model.load_state_dict(state['model_state_dict'])
+        # load the raw state_dict
+        bundle = torch.load(ckpt, map_location=device, weights_only=False)
+        sd     = bundle['model_state_dict']
+
+        # strip only the DDP "module." and then re-prefix under backbone
+        cleaned = {}
+        for k, v in sd.items():
+
+            k2 = k.replace("module.", "")
+
+            if k2.startswith("backbone."):
+                cleaned[k2] = v
+            else:
+                cleaned[f"backbone.{k2}"] = v
+
+        # now these keys exactly match what InferenceModel.backbone expects
+        model.load_state_dict(cleaned)
         model.eval()
         models.append(model)
         logger.info("Loaded checkpoint: %s as %s", ckpt.name, arch)

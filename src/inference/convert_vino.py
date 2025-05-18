@@ -4,11 +4,17 @@ import openvino as ov
 from openvino.runtime import serialize
 from pathlib import Path
 import pandas as pd
+import numpy as np
 
 # ── 0) Prerequisites ────────────────────────────────────────
 # Make sure you have the OpenVINO dev package for model conversion:
 #    pip install --upgrade openvino-dev
 # ────────────────────────────────────────────────────────────
+
+torch.serialization.add_safe_globals([
+    np.core.multiarray.scalar,
+    np.dtype
+])
 
 print("Loading taxonomy data…")
 taxonomy_df = pd.read_csv("data/birdclef/taxonomy.csv")
@@ -29,6 +35,8 @@ for ckpt in CHECKPOINT_DIR.glob("*.pth"):
         arch = "efficientnet_b0"
     elif "regnety_008" in fold_name:
         arch = "regnety_008"
+    elif "focal" in fold_name:
+        arch = "efficientnet_b0"
     else:
         print(f"Skipping unknown arch in {fold_name}")
         continue
@@ -42,7 +50,7 @@ for ckpt in CHECKPOINT_DIR.glob("*.pth"):
     model.eval()
 
     # 2) Load and clean state dict
-    state = torch.load(ckpt, map_location="cpu")
+    state = torch.load(ckpt, map_location="cpu", weights_only=False)
     sd = state.get("model_state_dict", state)
     cleaned = {}
     for k, v in sd.items():
