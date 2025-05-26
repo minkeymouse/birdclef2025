@@ -32,6 +32,61 @@ models_dir = project_root / "models"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("inference")
 
+from typing import Union
+
+def apply_power_to_low_ranked_cols(
+    p: np.ndarray,
+    top_k: int = 30,
+    exponent: Union[int, float] = 2,
+    inplace: bool = True
+) -> np.ndarray:
+    """
+    Rank columns by their column‑wise maximum and raise every column whose
+    rank falls below `top_k` to a given power.
+
+    Parameters
+    ----------
+    p : np.ndarray
+        A 2‑D array of shape **(n_chunks, n_classes)**.
+
+        - **n_chunks** is the number of fixed‑length time chunks obtained
+          after slicing the input audio (or other sequential data).  
+          *Example:* In the BirdCLEF `test_soundscapes` set, each file is
+          60 s long. If you extract non‑overlapping 5 s windows,  
+          `n_chunks = 60 s / 5 s = 12`.
+        - **n_classes** is the number of classes being predicted.
+        - Each element `p[i, j]` is the score or probability of class *j*
+          in chunk *i*.
+
+    top_k : int, default=30
+        The highest‑ranked columns (by their maximum value) that remain
+        unchanged.
+
+    exponent : int or float, default=2
+        The power applied to the selected low‑ranked columns  
+        (e.g. `2` squares, `0.5` takes the square root, `3` cubes).
+
+    inplace : bool, default=True
+        If `True`, modify `p` in place.  
+        If `False`, operate on a copy and leave the original array intact.
+
+    Returns
+    -------
+    np.ndarray
+        The transformed array. It is the same object as `p` when
+        `inplace=True`; otherwise, it is a new array.
+
+    """
+    if not inplace:
+        p = p.copy()
+
+    # Identify columns whose max value ranks below `top_k`
+    tail_cols = np.argsort(-p.max(axis=0))[top_k:]
+
+    # Apply the power transformation to those columns
+    p[:, tail_cols] = p[:, tail_cols] ** exponent
+    return p
+
 def load_ensemble(models_dir: Path, num_classes: int, device: torch.device) -> list:
     models = []
     for ckpt in sorted(models_dir.glob("*.pth")):
@@ -85,6 +140,12 @@ def update_labels_for_group(df_group: pd.DataFrame, models: list, device: torch.
     all_preds = np.stack(all_preds, axis=0)  # (M, T, C)
     M, T, C = all_preds.shape
     ensemble = all_preds.mean(axis=0)       # (T, C)
+    ensemble = apply_power_to_low_ranked_cols(
+        ensemble,
+        top_k = 30,
+        exponent=2,
+        inplace=True
+    )
 
     # Kalman Filter for probabilities
     kf = MultivariateBernoulliKalmanFilter(
