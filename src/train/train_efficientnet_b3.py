@@ -41,7 +41,7 @@ from src.train.train_utils import train_one_epoch, validate
 config_path = project_root / "config" / "train.yaml"
 with open(config_path, "r", encoding="utf-8") as f:
     full_cfg = yaml.safe_load(f)
-cfg = full_cfg["efficientnet"]
+cfg = full_cfg["efficientnetb3"]
 
 models_dir = project_root / "models"
 models_dir.mkdir(parents=True, exist_ok=True)
