@@ -32,9 +32,9 @@ for ckpt in CHECKPOINT_DIR.glob("*.pth"):
 
     # 1) Instantiate model architecture based on filename
     if "efficientnet_b0" in fold_name:
-        arch = "efficientnet_b0"
-    elif "regnety_008" in fold_name:
-        arch = "regnety_008"
+        arch = "efficientnet_b0.ra_in1k"
+    elif "efficientnet_b3" in fold_name:
+        arch = "efficientnet_b3.ra2_in1k"
     elif "focal" in fold_name:
         arch = "efficientnet_b0"
     else:
