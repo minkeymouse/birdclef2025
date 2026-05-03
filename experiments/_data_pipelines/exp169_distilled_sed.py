@@ -172,10 +172,12 @@ class MelExtractor(nn.Module):
         self.adb = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80)
 
     def forward(self, x):  # x: (B, T)
+        # Always run mel + dB in fp32 to avoid log10/clamp underflow.
+        x = x.float()
         m = self.adb(self.mel(x))                                # (B, M, T')
         # per-spec z-score
         mean = m.mean(dim=(1, 2), keepdim=True)
-        std = m.std(dim=(1, 2), keepdim=True).clamp(min=1e-5)
+        std = m.std(dim=(1, 2), keepdim=True).clamp(min=1e-3)
         m = (m - mean) / std
         return m.unsqueeze(1)                                    # (B, 1, M, T')
 
@@ -262,6 +264,14 @@ def hybrid_loss(clip_logits, framewise_logits, distill_emb, perch_emb, y):
 
 # ------------------------------------------------------------------- training
 def train_epoch(model, loader, opt, scaler, dev):
+    """Full fp32 (AMP disabled — fp16 mel/db underflows produced 70% NaN batches in v1).
+
+    The mel pipeline (MelSpectrogram + AmplitudeToDB) clamps to amin=1e-10 then
+    takes log10, which underflows in fp16 and propagates NaN through the rest
+    of the network. We keep everything in fp32 for stability; an EfficientNet-B0
+    forward+backward at batch=32, mel-256 fits comfortably in 32GB RTX 5090.
+    """
+    del scaler  # unused; kept for signature compatibility
     model.train()
     tot = 0.0; n = 0; nan_skip = 0
     bce_c_sum = 0.0; bce_f_sum = 0.0; mse_sum = 0.0
@@ -272,20 +282,18 @@ def train_epoch(model, loader, opt, scaler, dev):
         if not torch.isfinite(wav).all():
             wav = torch.nan_to_num(wav, 0.0, 1.0, -1.0)
         opt.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            clip_l, frame_l, demb = model(wav, training_aug=True)
-            loss, bc, bf, ms = hybrid_loss(clip_l, frame_l, demb, perch, y)
+        clip_l, frame_l, demb = model(wav, training_aug=True)
+        loss, bc, bf, ms = hybrid_loss(clip_l, frame_l, demb, perch, y)
         if not torch.isfinite(loss):
             nan_skip += 1
             continue
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
+        loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         if not torch.isfinite(gn):
             nan_skip += 1
             opt.zero_grad(set_to_none=True)
             continue
-        scaler.step(opt); scaler.update()
+        opt.step()
         tot += loss.item() * wav.size(0); n += wav.size(0)
         bce_c_sum += bc; bce_f_sum += bf; mse_sum += ms
     nb = max(1, len(loader))
@@ -304,8 +312,7 @@ def evaluate_ta(model, indices, wav_mm, primary_idx_full, n_cls, dev, batch=32, 
         sl = indices[i:i + batch]
         wavs = wav_mm[sl].astype(np.float32)
         x = torch.from_numpy(wavs).to(dev)
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            clip_l, _, _ = model(x)
+        clip_l, _, _ = model(x)
         p = torch.sigmoid(clip_l).float().cpu().numpy()
         preds[i:i + len(sl)] = p
         for k, gi in enumerate(sl):
@@ -332,8 +339,7 @@ def evaluate_ss(model, ss_indices, wav_mm, ss_labels_map, l2i, dev, batch=32):
         sl = ss_indices[i:i + batch]
         wavs = wav_mm[sl].astype(np.float32)
         x = torch.from_numpy(wavs).to(dev)
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            clip_l, _, _ = model(x)
+        clip_l, _, _ = model(x)
         p = torch.sigmoid(clip_l).float().cpu().numpy()
         preds[i:i + len(sl)] = p
         for k, gi in enumerate(sl):
@@ -452,7 +458,7 @@ def main():
 
         opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs - WARMUP), eta_min=1e-5)
-        scaler = torch.amp.GradScaler("cuda")
+        scaler = None  # AMP disabled — fp16 mel underflow caused NaN cascade in v1
 
         fold_dir = OUT / f"fold{fold_id}"
         fold_dir.mkdir(parents=True, exist_ok=True)
