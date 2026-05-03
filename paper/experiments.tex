@@ -1,17 +1,23 @@
 % =====================================================================
-% STATE NOTE (added 2026-05-02):
-% This file is the formal paper draft and currently covers exp3–exp39 +
-% LB ladder up to v12 (LB 0.929). Subsequent work (exp40–exp156, LB
-% submissions v17–v51 culminating in v33 LB 0.932 and v51 baseline
-% reset 0.917 after Kaggle test refresh) lives in:
-%   - paper/exp_current.tex   running working notes (last touched
-%                              2026-04-27; stops near v36)
-%   - CLAUDE.md "CURRENT STATE"  authoritative ladder + invariants
+% STATE NOTE (updated 2026-05-04):
+% This file is the formal paper draft. It now covers:
+%   - exp3-exp39, LB ladder v6-v12 (up to LB 0.929)
+%   - The four-month plateau at v33 = LB 0.932 (Sec. \ref{sec:plateau})
+%   - The public Mattia fork bringing LB to 0.941
+%     (Sec. \ref{sec:mattia-fork})
+%   - The Tucker SED training recipe: backbone distillation onto Perch
+%     with stop-gradient (Sec. \ref{sec:tucker-recipe})
+%   - Seven cognitive biases behind the plateau
+%     (Sec. \ref{sec:meta-lessons})
+%   - Forward plan for exp169 (Sec. \ref{sec:exp169-plan})
+% Other reference files:
+%   - paper/exp_current.tex   older running notes (stops near v36)
+%   - CLAUDE.md "CURRENT STATE"  authoritative LB ladder + invariants
 %   - experiments/README.md     code-side navigation
-% Author TODO before CLEF 2026-06-17 working-note deadline: port v17–v51
-% ladder, pseudo-label circular-distillation finding, AudioMAE foundation
-% swap (v49/v50 −0.022/−0.027), info-theoretic ceiling on optimization
-% (10× RL/DPO/SFT variants ≤ BCE), and synthetic-data exploration.
+% Author TODO before CLEF 2026-06-17 working-note deadline: port the
+% pseudo-label circular-distillation finding (v46), the AudioMAE
+% foundation swap (v49/v50 -0.022/-0.027), and the synthetic-data
+% domain-randomisation experiments (exp154-exp156).
 % =====================================================================
 
 \section{Experiments}
@@ -2358,3 +2364,341 @@ toward their neighbours (rather than the fixed-$\sigma$ Gaussian we
 use). These two passes operate on the final fused logits after the
 SED blend and are orthogonal to the decomposition above, so they
 are the natural next component to port.
+
+
+% =====================================================================
+\subsection{Plateau at LB 0.932: a four-month negative-result band}
+\label{sec:plateau}
+
+Between v12 (LB 0.929, 2026-04-21) and v33 (LB 0.932, 2026-04-26)
+three independent post-processing additions each contributed
+$+0.001$: replacing SED29 with exp50 (HGNetV2-B0 trained with
+2025 Colombia background mixing), increasing the SED blend weight
+from $0.20$ to $0.30$, and adding a file-max coherence prior with
+$\alpha = 0.10$. We then attempted to push past $0.932$ for four
+months. \emph{Every one of the seventeen subsequent LB submissions
+regressed by $-0.002$ to $-0.018$.}
+
+\paragraph{Failure modes.}
+Each regression matched one of three patterns: (i)~the
+modification duplicated existing site-conflated SED signal
+(four 27-class detector heads in v17/v18, four parallel SED
+variants in v36, all with Pearson $0.97$--$0.99$ against
+exp50); (ii)~the modification was trained or calibrated on
+the five-site labeled soundscape split and absorbed its acoustic
+fingerprint (the v34 mel-iVAE z-kNN, v22 site prior, v38--v41
+LOSO-site logistic-regression detectors, all with local
+$+0.005$ to $+0.069$ but LB $-0.012$ to $-0.018$); or (iii)~the
+modification reduced the existing site-invariance budget
+(v25, v36 dropped $W_{\text{Perch}}$ below $0.7$).
+
+\paragraph{Anti-correlation with same-site evaluation.}
+Higher $\text{val\_SS}$ became reliably anti-correlated with LB
+on margin moves: exp50 ($\text{val\_SS}=0.838$, LB $+0.001$),
+exp121 ($0.851$, $-0.012$), exp123 ($0.867$, $-0.014$),
+exp136b ($0.907$, $-0.018$). Leave-one-site-out cross-validation
+at $0.97$ was likewise invalidated by five LB submissions. The
+labeled soundscape split is drawn from the same five Pantanal
+sites as the public test, so any structure fitted on it encodes
+that site geometry, which the hidden test (a different Pantanal
+season) does not share.
+
+\paragraph{Information-theoretic ceiling on the loss family.}
+We tested approximately ten optimisation variants---focal,
+soft-AUC, contrastive, supervised contrastive, hard-mined BCE,
+preference-pair DPO at the embedding level, end-to-end audio
+DPO, and several reward-weighted SFT formulations---and \emph{all
+were dominated by plain BCE} on leave-one-site-out
+soundscape evaluation. The reason is that for multi-label
+classification with binary species labels the reward signal is
+already what BCE optimises; richer losses introduce false-negative
+noise (random negatives in DPO) or aggressive variance (focal at
+high $\gamma$) without adding information. Within the
+\emph{loss-only} subspace, BCE is essentially Bayes-optimal at
+this label resolution.
+
+\paragraph{What we wrote in our internal notes (and why it was wrong).}
+After the seventeenth regression we wrote ``inference-time lever
+space is exhausted'' and ``v33 is the structural ceiling.''
+Both statements were false, as the next subsection demonstrates:
+when a public 0.943 stack appeared in the discussion forum on
+2026-05-03, a direct fork reached LB $0.941$ on the first
+submission. The plateau was real; the structural-ceiling
+interpretation of it was a cognitive artefact, not a property
+of the pipeline. We catalogue seven specific biases that
+produced the artefact in
+Section~\ref{sec:meta-lessons}.
+
+
+% =====================================================================
+\subsection{Public 0.943 stack and the v57 fork (LB 0.941)}
+\label{sec:mattia-fork}
+
+On 2026-05-03 a public Kaggle notebook by \emph{mattiaangeli}
+(``birdclef-2026-0-943-better-blend'') appeared, itself a fork of
+\emph{vyankteshdwivedi}'s ProtoSSM kernel. The page header reported
+``best 0.943 V3, 0.941 V1 confirmed''. We forked the kernel
+verbatim, pushed it under our account, and on the first submission
+reached \textbf{LB 0.941}, a $+0.009$ gain over v33. We refer to
+this kernel below as the \emph{Mattia fork}.
+
+\paragraph{Pipeline.}
+Each one-minute soundscape file is split into twelve five-second
+windows. Stream~A produces, per window, a Perch~v2 ONNX embedding
+(1\,536-d) and 234 logits, which are passed through ProtoSSM~v4
+(state-space + cross-attention) and a residual second-pass
+correction, then through a PCA-based MLP probe, per-taxon
+temperature scaling, file-max$^{0.4}$ rank-aware scaling, adaptive
+$\delta$-smoothing, isotonic calibration, and a per-class
+$F_1$-tuned threshold. Stream~B is a five-fold ONNX SED ensemble
+distributed in the public dataset \texttt{tuckerarrants/bc2026-distilled-sed-public}
+(``Tucker SED'' below), trained at mel-256 / $f_\text{max}=16$\,kHz
+with per-spectrogram $z$-score input, output as 234 framewise
+probabilities. Both streams are converted to per-class rank
+percentiles and blended linearly with $W_\text{SED}=0.30$. Three
+conditional rescue rules then promote individual windows where
+(i)~Stream~A is high but Stream~B missed (``fake-only'' rule),
+(ii)~a $\pm 3$-window $t$-distribution context around a
+Stream~A peak is also high (``proto continuity''), or (iii)~a
+sharp Stream~B peak above $0.95$ coincides with low Stream~A
+(``SED local spike'').
+
+\paragraph{Component decomposition (exp165 ablation).}
+We ran the full Cartesian grid of \{SED choice\} $\times$
+\{linear, rank-percentile blend\} $\times$ \{none, fake-only,
+continuity, spike, all\} rescues against the labeled soundscapes,
+holding everything else fixed at the v33 Stream~A. The result is
+unambiguous (Table~\ref{tab:exp165}): the SED choice dominates the
+fusion architecture by an order of magnitude.
+
+\begin{table}[h]
+\centering
+\caption{Component ablation on labeled soundscapes (exp165).
+Reported as macro $\Delta$AUC against the v33 Stream-A-only baseline
+under linear blend at $W_\text{SED}=0.30$. Best A-profile in bold.}
+\label{tab:exp165}
+\begin{tabular}{llc}
+\hline
+SED choice (Stream B) & Fusion & macro $\Delta$AUC \\
+\hline
+exp50 (HGNet, BCE-only)         & linear  & $+0.008$ \\
+exp50 (HGNet, BCE-only)         & rank    & $+0.005$ \\
+Tucker fold-0                   & linear  & $+0.062$ \\
+\textbf{Tucker 5-fold ensemble} & \textbf{linear} & $\mathbf{+0.117}$ \\
+Tucker 5-fold ensemble          & rank    & $+0.078$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The fourteen-fold gap between exp50 ($+0.008$) and Tucker 5-fold
+($+0.117$) under \emph{the same fusion} is the single largest
+effect in our ablation history. The rescue rules add at most
+$+0.009$ on top of the linear-blend baseline; their main role in
+the public kernel is to compensate for the fact that the public
+Stream~A is uncalibrated raw Perch+ProtoSSM, whereas our v33
+Stream~A is already isotonic-calibrated and gauss-smoothed, so
+linear blend on our Stream~A outperforms rank-percentile blend
+($\rho_\text{spearman} = 0.991$ vs $0.40$).
+
+\paragraph{Dose ceiling at the Tucker single-SED level.}
+Submissions v58 and v59 swept the linear-blend dose at
+$W_\text{SED} = 0.30$ and $0.40$ on the v33 Stream~A. Local macro
+$\Delta$AUC scaled monotonically ($+0.117$ and $+0.131$) but the
+LB result saturated at $\le 0.941$, identical to the Mattia fork.
+This is the second instance of \emph{a Tucker single-SED ceiling
+that is independent of the fusion architecture}: every Stream~A
+$\,\cup\,$ Tucker pipeline we have evaluated reaches the same LB
+band. To progress beyond $0.941$ a second SED stream is required
+that is decorrelated from Tucker.
+
+
+% =====================================================================
+\subsection{The actual lever: backbone distillation onto Perch with stop-gradient}
+\label{sec:tucker-recipe}
+
+The Tucker SED is distributed as five ONNX checkpoints of an
+EfficientNet-B0 backbone, but the training recipe is also public:
+the same author published the training notebook
+\texttt{tuckerarrants/bc2026-distilled-sed} containing the full
+PyTorch source, configuration, and a numerical claim that the
+distillation alone is worth $+0.022$ macro AUC, citing a Hengck
+discussion thread. We summarise the recipe here because it
+explains an effect we had repeatedly missed.
+
+\paragraph{Architecture.}
+The model is a $\sim 4.88$\,M parameter network with three heads
+on top of an EfficientNet-B0 backbone:
+\begin{verbatim}
+backbone:    tf_efficientnet_b0.ns_jft_in1k   (NoisyStudent JFT-300M)
+spec:        n_mels=256, fmin=20, fmax=16000, per-spec z-score
+freq pool:   GeM (learnable p, init=3.0)
+bottleneck:  Linear(C -> 512) + ReLU + Dropout
+heads:
+  att         = Conv1d(512 -> 234, kernel=1)
+  cla         = Conv1d(512 -> 234, kernel=1)
+  distill_head = GAP + Linear(C -> 1536)
+\end{verbatim}
+The third head, \texttt{distill\_head}, projects the global-pooled
+backbone features into the 1\,536-d Perch~v2 embedding space.
+
+\paragraph{Forward pass and the stop-gradient.}
+Two halves of the forward pass are connected to the backbone
+\emph{differently}:
+\begin{verbatim}
+h            = backbone(mel)
+distill_emb  = GAP_Linear(h)               # gradient flows here
+h_cls        = h.detach()                  # ★ stop_gradient ★
+h_cls        = GeMFreq(h_cls)
+h_cls        = bottleneck(h_cls)
+norm_att     = softmax(tanh(att(h_cls)), dim=-1)
+framewise    = cla(h_cls)
+clip_logits  = (norm_att * framewise).sum(dim=2)
+\end{verbatim}
+The single line \texttt{h.detach()} is the lever. The
+classification heads operate on stop-gradient features, so the
+backbone is updated \emph{only} by the distillation loss. The
+classification heads see a frozen, Perch-aligned feature stream
+and learn an attention-based pooling on top; the backbone sees a
+single, well-conditioned objective (mimic Perch) and therefore
+converges to features that are smoother and more transferable
+across recording sites.
+
+\paragraph{Loss.}
+\begin{align*}
+\mathcal{L} &=
+0.5 \cdot \mathrm{BCE}(\text{clip\_logits}, y) \\
+&+\, 0.5 \cdot \mathrm{BCE}(\max_t \text{framewise}_t, y) \\
+&+\, \alpha_\text{distill} \cdot \mathrm{MSE}(\text{distill\_emb},
+   \text{Perch}(x))
+\end{align*}
+with $\alpha_\text{distill} = 1$. The Perch teacher is the public
+ONNX export, frozen.
+
+\paragraph{Training data.}
+The training data is exactly what we have: BirdCLEF~2026
+\texttt{train\_audio} (xeno-canto + iNaturalist) plus the labeled
+soundscape training portion. There is no external dataset.
+
+\paragraph{Why our prior ``Perch distillation'' did not work.}
+We had run several experiments labeled ``Perch distill'' between
+exp22 and exp28. Each of them placed a small head---a multilayer
+perceptron, a logistic regression, or a 1-D temporal stack---on
+top of \emph{frozen} Perch embeddings and trained the head on
+species labels. None of them updated a deep backbone, none of
+them used the backbone as the parameter that learns to mimic
+Perch, and none of them used a stop-gradient between distillation
+and classification. The Tucker recipe inverts this entirely: the
+\emph{backbone} is the parameter that learns Perch alignment, and
+the classification heads are a thin probe on top of the resulting
+features. The two configurations sound similar in English (``we
+trained a model with Perch'') but they are different in the only
+way that matters here---which parameters the gradient flows
+through.
+
+\paragraph{exp167: a control that isolates the preprocessing.}
+To rule out the trivial alternative that Tucker simply benefits
+from a higher mel resolution, we trained a clone of exp50
+(HGNetV2-B0, BCE-only) with Tucker's mel parameters
+(\texttt{n\_mels=256}, \texttt{fmin=20}, \texttt{fmax=16000},
+per-spectrogram $z$-score) and otherwise unchanged hyperparameters.
+The result was a local macro $\Delta$AUC of $+0.019$ when blended
+into v33 at $W=0.20$, compared with Tucker 5-fold's $+0.117$ at
+the same blend weight. The Pearson correlation between exp167 and
+exp50 predictions on labeled soundscapes was $0.978$, i.e.\ they
+remain in the same family. Mel resolution is a real but small
+lever; the rest of the gap is the distillation recipe.
+
+\paragraph{Tucker's own numerical claim.}
+The training notebook attributes $+0.022$ macro AUC to the
+distillation step alone, comparing an HGNet-B0 baseline trained
+without distillation ($0.876$) against the same architecture
+trained with the recipe above ($0.898$). This is consistent with
+our own ablation: switching Stream~B from exp50 to Tucker 5-fold
+moves the linear-blend macro $\Delta$AUC from $+0.008$ to
+$+0.117$, of which the larger fraction is plausibly the
+distillation recipe and the smaller fraction the five-fold
+ensemble and mel preprocessing.
+
+
+% =====================================================================
+\subsection{Meta-lessons: seven cognitive biases behind the four-month plateau}
+\label{sec:meta-lessons}
+
+The technical content of the previous three subsections is enough
+to write a working note. We none the less record here the
+\emph{cognitive} pattern that produced the plateau, because in our
+internal review it was both more decisive than any single
+technical decision and more easily transferable.
+
+\begin{enumerate}
+\item \textbf{Memory pessimism amplification.} Each negative LB
+result was logged as a hard rule (``never try $X$''), and the
+rules accumulated until the search space was effectively closed.
+There was no symmetric mechanism for retiring rules that turned
+out to be over-general.
+\item \textbf{Anti-correlation overgeneralisation.} The
+observation that same-site evaluation anti-correlates with LB
+\emph{on the seventeen specific levers we tried} was elevated to
+a universal property of the pipeline. In retrospect the
+anti-correlation was a symptom of the levers being site-fitted,
+not of the pipeline being broken.
+\item \textbf{External scan absent.} For four months we did not
+once read the public Kaggle discussion forum or the published
+top-scorer notebooks. When the Mattia notebook appeared on
+2026-05-03 it was visible the same day; the cost of finding it
+was zero relative to the cost of the seventeen failed
+submissions.
+\item \textbf{Falsifiable-bar enumeration trap.} The enumerated
+acceptance criteria (``$W_{\text{Perch}}$ $\ge 0.7$'', ``$\text{val\_SS}$
+must not increase'', ``orthogonal to file-max physics'') were
+internally consistent but jointly excluded any modification that
+involved retraining the SED, which is exactly where the
+remaining gain lives.
+\item \textbf{Specific-to-universal leap.} The negative result of
+exp22--exp28 (``Perch features $\to$ shallow probe failed'')
+was generalised to ``Perch distillation does not work in this
+pipeline.'' The Tucker recipe is a different instance of
+distillation (deep backbone, stop-gradient, MSE on the embedding
+itself) and was never tested.
+\item \textbf{Confirmation bias on the ceiling hypothesis.} Once
+``v33 is the ceiling'' became a working hypothesis, every
+regression was interpreted as confirmation, and the
+$+0.002$/step harm-reduction trend across v46$\to$v47$\to$v48
+(which was a clean monotonic improvement in a regression band)
+was discarded as noise rather than read as gradient
+information.
+\item \textbf{Memory churn.} New summary memories overwrote the
+nuance of older ones. By the time the seventeenth submission
+regressed, the memory base contained a flat list of failures
+without the detail required to distinguish ``failed because
+site-fitted'' from ``failed because under-dosed'' from ``failed
+because never actually retrained the SED.''
+\end{enumerate}
+
+The remediation we have adopted for the remaining month of the
+competition is a hard rule against ceiling language in any
+internal note, a periodic external scan of the public discussion
+forum, and a requirement that any rule older than two weeks be
+re-derived from at least one current experiment before it is
+allowed to block a new candidate.
+
+
+% =====================================================================
+\subsection{Forward plan: own distilled SED as a third orthogonal stream}
+\label{sec:exp169-plan}
+
+The Tucker single-SED LB ceiling at $0.941$ implies that further
+progress requires a Stream~B that is decorrelated from Tucker
+while preserving the same backbone-distillation property. The
+straightforward construction is to retrain the Tucker recipe with
+a different random seed on the same data and use the resulting
+five-fold ensemble as a third stream blended at low weight on top
+of the Mattia pipeline. This is exp169, currently in preparation.
+
+The expected gain over v57 is bounded above by the residual
+correlation between independently trained five-fold ensembles of
+the same architecture on the same data, which empirically lies
+in the range $0.85$--$0.92$ for SED-style models. A conservative
+estimate places the achievable LB in the $0.943$--$0.945$ band,
+consistent with both Mattia's reported $0.943$ V3 result and the
+spread observed in the public-leaderboard's top decile.
