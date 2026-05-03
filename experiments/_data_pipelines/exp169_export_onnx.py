@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Export exp169 5-fold ckpts to ONNX matching Tucker interface.
 
-Tucker SED ONNX interface (from notebooks/birdclef-2026-mattia-fork/lib/tucker_sed.py):
-  Input  : mel spectrogram (B, 1, n_mels=256, T) float32, externally preprocessed
-           (per-spec z-score, n_fft=2048, hop=512, fmin=20, fmax=16000).
-  Output : (B, 234) clip-level probabilities (sigmoid applied internally).
+Tucker SED ONNX interface (from notebooks/birdclef-2026-mattia-fork notebook
+cell that runs the SED stream):
+  Input  : mel spectrogram (B, 1, n_mels=256, T) float32, externally
+           preprocessed (per-spec z-score, n_fft=2048, hop=512, fmin=20,
+           fmax=16000).
+  Output : two tensors, both raw logits (no sigmoid):
+             clip_logits (B, 234)
+             framewise   (B, T, 234)   max-over-T computed by notebook
+           The notebook averages 0.5 * sigmoid(clip) + 0.5 * sigmoid(frame_max).
 
 We strip the audio->mel + spec_aug + distill_head from the training model
 so the export matches the inference interface 1-to-1.
@@ -39,18 +44,18 @@ class InferenceWrapper(nn.Module):
         self.att = full.att
         self.cla = full.cla
 
-    def forward(self, mel: torch.Tensor) -> torch.Tensor:
+    def forward(self, mel: torch.Tensor):
         h = self.backbone(mel)                     # (B, C, m', t')
-        # In inference there's no distillation head; SED branch only.
         h_cls = self.gem_freq(h)                   # (B, C, T)
         h_cls = h_cls.transpose(1, 2)
         h_cls = self.bottleneck(h_cls)
         h_cls = h_cls.transpose(1, 2)              # (B, 512, T)
         a = torch.tanh(self.att(h_cls))
         norm_att = torch.softmax(a, dim=-1)
-        framewise_logits = self.cla(h_cls)
-        clip_logits = (norm_att * framewise_logits).sum(dim=2)
-        return torch.sigmoid(clip_logits)
+        framewise = self.cla(h_cls)                # (B, n_cls, T)
+        clip_logits = (norm_att * framewise).sum(dim=2)            # (B, n_cls)
+        framewise_btc = framewise.transpose(1, 2).contiguous()     # (B, T, n_cls)
+        return clip_logits, framewise_btc
 
 
 def export_one(ckpt_path: Path, out_path: Path, n_cls: int = 234, t_dim: int = 313):
@@ -61,11 +66,18 @@ def export_one(ckpt_path: Path, out_path: Path, n_cls: int = 234, t_dim: int = 3
     wrap = InferenceWrapper(full).eval()
 
     dummy = torch.zeros(1, 1, N_MELS, t_dim)
+    # dynamo=False forces legacy single-file export (weights inline in .onnx).
+    # The new dynamo exporter writes external weights to <name>.onnx.data which
+    # complicates Kaggle dataset packaging.
     torch.onnx.export(
         wrap, dummy, str(out_path),
-        input_names=["mel"], output_names=["probs"],
-        dynamic_axes={"mel": {0: "batch", 3: "time"}, "probs": {0: "batch"}},
-        opset_version=17, do_constant_folding=True,
+        input_names=["mel"], output_names=["clip_logits", "framewise"],
+        dynamic_axes={
+            "mel": {0: "batch", 3: "time"},
+            "clip_logits": {0: "batch"},
+            "framewise": {0: "batch", 1: "frame_time"},
+        },
+        opset_version=17, do_constant_folding=True, dynamo=False,
     )
     sz = out_path.stat().st_size / 1024 / 1024
     print(f"  exported {out_path.name}  ({sz:.1f} MB)")

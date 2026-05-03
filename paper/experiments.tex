@@ -2702,3 +2702,90 @@ in the range $0.85$--$0.92$ for SED-style models. A conservative
 estimate places the achievable LB in the $0.943$--$0.945$ band,
 consistent with both Mattia's reported $0.943$ V3 result and the
 spread observed in the public-leaderboard's top decile.
+
+
+% =====================================================================
+\subsection{exp169 results: held-out validation and a fair comparison with Tucker}
+\label{sec:exp169-results}
+
+We trained five folds with the recipe of
+Section~\ref{sec:exp169-plan}. To fit a single-day compute window we
+used a single fixed five-second crop (centre-of-file) per training
+sample, fifteen epochs per fold instead of Tucker's twenty-five, and
+no positive-pair waveform mixup; everything else (backbone,
+distillation head, stop-gradient, $\alpha_\text{distill}=1$, mel-256
+preprocessing, loss weights) is identical.
+
+\paragraph{Per-fold validation.}
+Each fold reaches macro $\text{val\_TA} \in [0.969, 0.974]$ and
+macro $\text{val\_SS} \in [0.829, 0.847]$ on a strict file-level
+held-out split of eleven labeled-soundscape files. The fold-mean
+$\text{val\_SS} = 0.840$ matches our previous best single SED
+(exp50, $0.838$) and is well below the value-band of memorisation
+(see next paragraph).
+
+\paragraph{Disambiguating Tucker's reported $0.99$ score.}
+The natural comparison is to evaluate our exp169 five-fold ensemble
+against the public Tucker five-fold ensemble on the same eleven
+held-out files. The result is striking:
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Partition (rows) & Tucker macro & exp169 macro \\
+\midrule
+labeled-SS train (617)        & $0.9962$ & $0.9971$ \\
+labeled-SS held-out (122)     & $0.9966$ & $0.8432$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Both ensembles score above $0.99$ on the rows they were trained on,
+i.e.\ both are capable of memorising labeled soundscapes. The gap on
+the held-out 122 rows is then \emph{not} a measure of relative
+quality but a measure of which model trained on those files. The
+\texttt{tuckerarrants/bc2026-distilled-sed} training notebook
+includes the full \texttt{train\_soundscapes\_labels.csv} without
+any held-out split, so Tucker's $0.9966$ on the eleven files is a
+training-set score; exp169 held those eleven files out for the same
+reason exp50 did, and its $0.8432$ is the honest held-out figure.
+
+A consequence is that the same-site labeled-SS evaluation cannot
+distinguish quality between any two models that both trained on
+the labeled SS unless a common held-out split is constructed; in
+particular the apparent $+0.117$ macro $\Delta$AUC reported in
+exp165 for Tucker over exp50 (Sec.~\ref{sec:mattia-fork}) carries a
+training-set component that we cannot quantify without retraining
+Tucker out-of-fold.
+
+\paragraph{Decorrelation.}
+On the 122 held-out rows the prediction-level Pearson correlation
+between exp169-five-fold and Tucker-five-fold is $0.73$ flat,
+$0.57$ per-class mean, $0.61$ per-class median. The two ensembles
+are therefore meaningfully decorrelated despite sharing the
+recipe and most of the training data, and the residual correlation
+is in the range where ensembles typically gain $0.001$--$0.005$ in
+macro AUC on out-of-distribution test data.
+
+\paragraph{Suspected gap source: in-file random crop.}
+Tucker draws a fresh random five-second crop within each file at
+every epoch; over twenty-five epochs each file therefore yields
+many distinct training samples. Our centre-crop cache provides one
+sample per file. The exp169 training curve flattens at
+$\text{val\_SS} \approx 0.84$ around epoch eleven on every fold,
+which is consistent with running out of within-file diversity. A
+direct test of this hypothesis would re-cache multiple anchors per
+file (the storage overhead is small for embeddings; the disk cost
+for waveforms scales linearly with anchor count) and rerun a
+single fold. We mark this as the highest-confidence forward lever.
+
+\paragraph{LB submission strategy.}
+For the single LB slot available today the conservative play is to
+add exp169 to Stream B at low weight rather than replace Tucker.
+Concretely we modify the SED-cell of the Mattia fork to compute
+$\text{p}_\text{Tucker}$ as the mean over the five Tucker folds,
+$\text{p}_\text{exp169}$ as the mean over the five exp169 folds,
+and the Stream-B output as
+$0.75\,\text{p}_\text{Tucker} + 0.25\,\text{p}_\text{exp169}$.
+Under the labeled-SS-train Pearson and the assumption that the
+ensembles' test-time quality is comparable, the expected LB delta
+is in the range $-0.003$ to $+0.005$, with downside bounded by the
+Tucker-only baseline of $0.941$.
