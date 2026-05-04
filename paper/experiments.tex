@@ -2777,15 +2777,31 @@ file (the storage overhead is small for embeddings; the disk cost
 for waveforms scales linearly with anchor count) and rerun a
 single fold. We mark this as the highest-confidence forward lever.
 
-\paragraph{LB submission strategy.}
-For the single LB slot available today the conservative play is to
-add exp169 to Stream B at low weight rather than replace Tucker.
-Concretely we modify the SED-cell of the Mattia fork to compute
-$\text{p}_\text{Tucker}$ as the mean over the five Tucker folds,
-$\text{p}_\text{exp169}$ as the mean over the five exp169 folds,
-and the Stream-B output as
-$0.75\,\text{p}_\text{Tucker} + 0.25\,\text{p}_\text{exp169}$.
-Under the labeled-SS-train Pearson and the assumption that the
-ensembles' test-time quality is comparable, the expected LB delta
-is in the range $-0.003$ to $+0.005$, with downside bounded by the
-Tucker-only baseline of $0.941$.
+\paragraph{LB submission: exp169v2 alone, no Tucker weights.}
+Following an explicit directive that the leaderboard submission
+must use only weights we trained from scratch (and not Tucker's
+published checkpoints), we additionally retrained the recipe with
+random in-file anchors (three pre-cached Perch embeddings per file,
+sampled uniformly each epoch) and twenty epochs per fold; the
+five-fold mean $\text{val\_SS}$ rose from $0.840$ to $0.846$ and
+the mean $\text{val\_TA}$ from $0.971$ to $0.988$. We then patched
+the Mattia fork's Stream-B cell to load exclusively the five
+exp169v2 ONNX checkpoints from a separate dataset
+(\texttt{ultimatumgame/exp169-distilled-sed}); the Tucker dataset
+was removed from the kernel sources.
+
+The hidden-test result is \textbf{LB $\mathbf{0.938}$}, between
+the v33 baseline ($0.932$) and the Tucker-weights run
+($0.941$). Our recipe trained from scratch therefore captures
+$+0.006$ of Tucker's $+0.009$ gain, i.e.\ roughly two thirds of
+the Tucker contribution comes from the distillation-with-stop-gradient
+recipe itself rather than from the specific weights, and the
+remaining $0.003$ is attributable to training-quality differences
+(twenty-five vs.\ twenty epochs, in-loop random crop vs.\ three
+pre-cached anchors, possibly other Tucker hyperparameters that we
+were unable to read out of the public notebook).
+
+The result is consistent with the reading that for this
+competition the dominant lever is which loss the backbone is
+optimised against (Perch-embedding mimicking versus species BCE),
+not which checkpoint a fine recipe variant lands on.

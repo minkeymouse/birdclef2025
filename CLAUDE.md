@@ -2,13 +2,21 @@
 
 Guidance for Claude Code in this repository.
 
-## CURRENT STATE (2026-05-03 evening)
+## CURRENT STATE (2026-05-04)
 
-**Production: v57 = LB 0.941**. Kernel `ultimatumgame/birdclef-2026-mattia-fork`
-(direct fork of `mattiaangeli/birdclef-2026-0-943-better-blend`). Stack:
-Perch v2 + ProtoSSM v4 + Tucker 5-fold SED + MLP probe (PCA-Perch) +
-rank-percentile blend + 3 rescue rules + adaptive smoothing + per-class
-threshold + file_max^0.4 rank-aware scaling.
+**Production options:**
+1. **v57 = LB 0.941** (Tucker public weights). Mattia fork as-is.
+2. **v6 = LB 0.938** (own weights only, exp169v2). Mattia pipeline +
+   our 5-fold distilled SED replacing Tucker. Same kernel slug, with
+   `exp169-distilled-sed` dataset attached, `bc2026-distilled-sed-public`
+   dropped. **This is the integrity-preserving submission.**
+
+Forward levers (see `memory/project_exp169v2_lb_result.md`):
+25 epochs, EFB1/B2 backbone, multi-teacher distillation, K=5 anchors.
+
+Stack: Perch v2 + ProtoSSM v4 + (Tucker | exp169v2) 5-fold SED + MLP
+probe (PCA-Perch) + rank-percentile blend + 3 rescue rules + adaptive
+smoothing + per-class threshold + file_max^0.4 rank-aware scaling.
 
 **Local modular extract**: `notebooks/birdclef-2026-mattia-fork/lib/` —
 11 modules (config / data / perch / helpers / mlp_probe / rank_scale /
