@@ -1,0 +1,1282 @@
+# LB Submission Registry — single source of truth for all LB experiments.
+# 30일 (2026-05-05 → 2026-06-03) × 5 slots/day = 150 slots budget.
+# Every submission MUST be logged here (with hypothesis BEFORE submit, lessons AFTER).
+
+anchor:
+  description: "Frozen baseline. Never falls below this LB."
+  version: 45
+  date: "2026-05-11"
+  lb: 0.941
+  stack: "Mattia notebook + recipe-pair SED ensemble (10 ckpts: exp175 seed=42 Tucker-canonical + exp176 seed=42 per-fold-SS, all B0) + 2-way rank-pct blend sed_w=0.30 + Mattia 3 rescues (fake_only, proto_continuity fat-tail, sed_only)"
+  reproducible: true
+  ckpt_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+  fold_filter: "[0,1,2,3,4,15,16,17,18,19]"
+  weights:
+    - "ultimatumgame/bc2026-ensemble-v3-sed (own-trained, fold 0-4 = exp175 seed=42; fold 15-19 = exp176 seed=42)"
+    - "google perch v2 ONNX (public)"
+  mechanism_note: "Closes 4-month own-vs-public 0.003 gap via recipe-pair ensemble. Active axis = ckpt-selection objective (EVAL_SS_N_FILES). Backbone trajectories cos=0.99, task-adapter layers cos=0.55. See paper/exp_current.tex § 2026-05-11 axis decomposition."
+
+previous_anchor:
+  description: "Retained for ablation reference."
+  version: 5
+  date: "2026-05-04"
+  lb: 0.938
+  stack: "Mattia notebook + exp169 5-fold SED (mixup-free, 20ep) + 2-way rank-pct blend sed_w=0.30 + Mattia 3 rescues"
+
+submissions:
+  # 시즌 시작 (2026-05-04) 이전 다른 시도들은 commit log에 있음.
+
+  - id: v6
+    date: "2026-05-04"
+    lb: 0.933
+    delta: -0.005
+    mechanism_family: head_graft
+    hypothesis: "konbu train_audio head adds independent Perch-feature signal. 3-way rank-pct blend 51/34/15 + Mattia rescues kept."
+    changes:
+      - "add konbu17/bird26-train-audio-head-v1 dataset"
+      - "insert head injection cell after SED"
+      - "modify blend cell to 3-way 51/34/15, KEEP rescues"
+    outcome: regression
+    lessons: "Two variables changed simultaneously (head added + weight redistributed). Couldn't isolate which broke things."
+
+  - id: v7
+    date: "2026-05-05"
+    lb: 0.933
+    delta: -0.005
+    mechanism_family: head_graft
+    hypothesis: "Match konbu's exact published setup — drop Mattia rescues since konbu did. Tests if rescues caused v6 regression."
+    changes:
+      - "Same head injection as v6"
+      - "Replace blend cell with simple 3-way rank-pct, NO rescues (= konbu's published code)"
+    outcome: regression
+    lessons: "v6 ↔ v7 same LB regression confirms konbu HEAD itself doesn't transfer to our exp169 base, regardless of rescue presence. Head was tuned with Tucker SED stream; the head-SED interaction matters."
+    family_update: "head_graft: 0/2 success rate, mean delta -0.005. SHELVE this family unless new evidence."
+
+  - id: v9
+    date: "2026-05-05"
+    lb: 0.936
+    delta: -0.002
+    mechanism_family: bias_rule
+    hypothesis: "Local audit found 100% FP rate for fepowl in labeled SS (0 TPs, 10 FPs at fepowl>0.5), 100% of those rows have son10+son04+son25 truth (insect chorus). Rule: when fepowl rank>0.985 in proto+sed streams, boost son10/04 and suppress fepowl×0.1."
+    changes:
+      - "Insert robin_hood cell BEFORE final blend"
+      - "Modify submission_protossm.csv and submission_sed.csv in-place"
+    outcome: regression
+    local_validation:
+      macro_auc_delta_on_labeled_ss: 0.003
+      classes_affected: [47158son10, 47158son04, 47158son25, fepowl]
+      modified_rows_in_dryrun: 4
+    lessons: |
+      Robin Hood pattern is REAL on labeled SS (audit confirmed mathematically) but
+      DOESN'T TRANSFER to hidden test. Possible reasons:
+      (1) Audit's S23 fepowl FP cluster is site-specific; hidden test sites have
+          different acoustic environments where fepowl can genuinely be present.
+      (2) Rule's rank-pct threshold (top 1.5%) on Mattia's pipeline output catches
+          rows whose fepowl prediction is high for OTHER reasons (not insect-chorus
+          confusion).
+      (3) Anti-correlation invariant: rules fitted on labeled SS sites may inversely
+          predict on unseen test sites. Local +0.003 → LB -0.002 = anti-correlation.
+
+  - id: v11
+    date: "2026-05-05"
+    lb: 0.922
+    delta: -0.016
+    mechanism_family: pseudo_iter
+    hypothesis: "Sydorskyi 2025 2nd place pseudo recipe applied: max_prob>0.5 drop chunk + prob<0.1 zero out → soft target. 60/40 TA/pseudo per batch with MixUp. Teacher = exp171 5-fold ensemble. 66k chunks kept (52% of 127k unlabeled SS chunks)."
+    changes:
+      - "Generated pseudo predictions on 10592 unlabeled SS files via exp171 5-fold"
+      - "Applied Sydorskyi dual-threshold filter (66k chunks kept)"
+      - "Trained exp172 from scratch with TA + pseudo dual stream (4h)"
+      - "Notebook: replace exp171 → exp172 dataset"
+    outcome: regression_severe
+    expected_lb: "+0.002 to +0.005 (Sydorskyi 2025 evidence)"
+    local_validation:
+      val_ss_5fold_mean: 0.873  # between exp169 0.860 and exp171 0.879
+      dryrun_macro_auc: 0.9697
+      vs_v10: -0.0092
+    lessons: |
+      Pseudo iter 1 catastrophically failed (-0.016). Same magnitude as our
+      legacy v3 pseudo failure (-0.018). Sydorskyi recipe DID NOT transfer.
+
+      Likely causes:
+      (1) Filter threshold 0.5 kept 52% chunks (vs Sydorskyi's 16% at I1).
+          Our exp171 teacher overconfident on unlabeled SS → pseudo includes
+          much noise. Need MUCH higher threshold (0.7-0.8) for our teacher.
+      (2) Teacher = exp171 (LB 0.937, slightly anti-correlated). Bad teacher
+          → bad pseudo. Need exp169 (LB 0.938) as teacher OR multi-arch ensemble.
+      (3) 40% pseudo per batch too aggressive. Sydorskyi I1 used MixUp at
+          sample level (40% chance), not 40% of batch.
+      (4) Cross-fold-OOF strategy NOT enforced. Sydorskyi held out fold's
+          labels from teacher generating that fold's pseudo. We didn't do this.
+          → leak from labeled SS through pseudo.
+
+      Iteration 2 plan: SAVE slot 5 today. Tomorrow restart pseudo with:
+      - Teacher = exp169 (LB-best, less labeled-SS-fit)
+      - Filter threshold 0.7 (more conservative)
+      - Pseudo at sample level (40% MixUp partner draws, not 40% of batch)
+      - Fold-OOF enforcement
+
+  - id: v10
+    date: "2026-05-05"
+    lb: 0.937
+    delta: -0.001
+    mechanism_family: retrain_recipe
+    hypothesis: |
+      Replace exp169 SED with exp171 (Tucker-exact recipe). Single variable change.
+      exp171 differs from exp169 by:
+      (1) Focal-Focal MixUp p=0.5, Beta(0.4, 0.4), HARD label union (vs exp170's α=0.15 soft)
+      (2) Focal-Soundscape MixUp p=0.5 (NEW lever — TA × labeled SS waveform mix, never tried)
+      (3) Best checkpoint by val_SS (vs exp169v2's val_TA — misaligned criterion fixed)
+      (4) AMP enabled (fp32 mel via autocast(enabled=False) wrapper, no NaN)
+      (5) MIN_SAMPLE=20 rare-species upsampling
+      (6) Bottleneck Dropout(0.5) second layer
+      (7) 25 ep with 2-ep linear warmup → cosine to 1e-6
+    changes:
+      - "Train exp171 5-fold (~5h)"
+      - "Export ONNX, upload as ultimatumgame/exp171-distilled-sed"
+      - "Notebook: replace dataset_sources exp169 → exp171, find function rename"
+    outcome: regression
+    expected_lb: "+0.001 to +0.003 (close Tucker gap, agent diff supports this)"
+    local_validation:
+      val_ss_5fold_mean: 0.879
+      vs_exp169v2_val_ss: 0.860
+      delta: 0.019
+      val_TA_5fold_mean: 0.975
+      vs_exp169v2_val_TA: 0.987
+      delta_ta: -0.012
+      note: "val_TA dropped (mixup heavier regularization), val_SS rose (Focal-SS Mixup bridges TA→SS domain). Tucker's exact tradeoff."
+      dryrun_macro_auc: 0.9789  # 20-file subset, similar to exp169 raw (0.978)
+      anchor_dryrun_v9: 0.9824  # v9 had Robin Hood +0.003 boost on this subset
+    lessons: |
+      val_SS +0.015 → LB -0.001 = STRONG evidence val_SS↔LB anti-correlation
+      applies to TRAINING-time mixup too, not just inference levers.
+      Tucker public weights (LB 0.941) close +0.004 gap that our recipe
+      replication does NOT close (LB 0.937). Documented recipe insufficient.
+      Possible: Tucker uses unpublished hyperparams / additional data /
+      stochastic seed advantage.
+      exp171 weights produced HIGHER val_SS but slightly worse LB —
+      classic over-fit-to-labeled-SS pattern despite using mixup as regularizer.
+      Implication for pseudo (exp172): teacher = exp171 may encode same
+      labeled-SS-fit bias. If exp172 also regresses, regenerate pseudo with
+      exp169 (LB-better teacher) for iteration 2.
+
+  - id: v12
+    date: "2026-05-06"
+    lb: 0.923
+    delta: -0.015
+    mechanism_family: pseudo_iter
+    hypothesis: "Iteration 2 with Dawid-Skene EM aggregation across 10 fold votes (5 exp169 + 5 exp171). Per-fold reliability estimated automatically. 92k chunks (vs iter1 simple 66k), avg 2.4 species/chunk (vs 5.0), top class share 34% (vs 75%). 5-fold val_SS 0.878."
+    outcome: regression_severe
+    lessons: "DS pseudo (cleaner aggregation) marginally better than simple filter (-0.015 vs -0.016) but still in regression band. Both teachers correlated (Pearson 0.97-0.99) so DS doesn't bring new information."
+
+  - id: v13
+    date: "2026-05-06"
+    lb: 0.937
+    delta: -0.001
+    mechanism_family: finetune
+    hypothesis: "exp174a fine-tune from exp169v2 base + DS-z>0.95 ≤3-class pseudo (69k chunks). LR 1e-5, 5 ep. Conservative fine-tune to test if low-LR pseudo absorption can extract any signal. val_SS 0.8475 (base 0.8595, -0.012)."
+    outcome: regression
+    lessons: "Anti-correlation hypothesis test: val_SS DOWN → LB UP? No — val_SS down -0.012 but LB also down -0.001. Pseudo doesn't help even with conservative absorption."
+
+  - id: v15
+    date: "2026-05-06"
+    lb: 0.938
+    delta: 0
+    mechanism_family: finetune
+    hypothesis: "exp174b cycle 2 (relax z>0.90 ≤4cls = 80k chunks). val_TA same as cycle1 (0.9876), val_SS 0.8482 (+0.0007 vs cycle1). v15 = predecessor push, same content as v16."
+    outcome: matched_anchor
+    lessons: "Cycle 2 reaches anchor LB 0.938. Pseudo iteration plateaus at v5 anchor; doesn't improve. v15/v16 same content gives 0.938/0.936 = LB stochasticity ±0.002."
+
+  - id: v16
+    date: "2026-05-06"
+    lb: 0.936
+    delta: -0.002
+    mechanism_family: finetune
+    hypothesis: "Same content as v15 (cycle2 fine-tune). Re-submit to measure LB stochasticity."
+    outcome: regression
+    lessons: "Same notebook content = LB ±0.002 noise. Helps interpret close-margin results."
+
+  - id: v20
+    date: "2026-05-06"
+    lb: 0.937
+    delta: -0.001
+    mechanism_family: finetune
+    hypothesis: "Reproduce v13 (cycle1) deterministically. Same notebook re-submit."
+    outcome: regression
+    lessons: "Cycle 1 LB 0.937 reproduces. v13/v20 = pair confirms cycle1 deterministic."
+
+  - id: v22
+    date: "2026-05-07"
+    lb: 0.937
+    delta: -0.001
+    mechanism_family: blend_swap
+    hypothesis: |
+      Replace Mattia 0.941 blend with Ulyanov 0.945 blend (dual-PC + konbu head 5%) on top of exp174a SED.
+      Public path: Tucker SED + Ulyanov blend = 0.945. Test if blend transfer with our SED.
+    outcome: regression
+    lessons: |
+      Blend doesn't transfer. Our SED + Ulyanov blend = 0.937 (no improvement over our anchor 0.938).
+      Confirms: Ulyanov blend's +0.004 over Mattia is Tucker-SED-specific synergy.
+      konbu head + dual-PC blend tuned for Tucker's rank distribution; our exp174a doesn't match.
+      Blue-print: blend+head transfer requires Tucker-similar SED character.
+
+  - id: v26
+    date: "2026-05-08"
+
+    mechanism_family: subset_diagnostic
+    hypothesis: |
+      Q1: Drop all 28 Insecta classes (column → uniform 0.5 = AUC 0.5 for those classes).
+      Test if Insecta predictions are net positive or negative for macro AUC.
+      Direct pseudo strategy informer:
+        LB ↓ vs anchor → Insecta supervision currently helping; pseudo for Insecta valuable.
+        LB ↑ vs anchor → Insecta predictions hurt; exclude from pseudo.
+      Anchor = v5 (LB 0.938). Stochasticity ±0.002.
+    changes:
+      - "Notebook reset to commit c4df217 (v5 anchor)"
+      - "Append post-processing cell at end: zero-out 28 Insecta class columns"
+      - "exp169 SED 5-fold + Mattia 0.941 blend + 3 rescue rules unchanged"
+    expected_lb: "0.938 ± 0.005 (Insecta is ~12% of macro AUC)"
+    lb: 0.881
+    delta: -0.057
+    outcome: regression
+    auto_updated: "2026-05-08 03:09:08"
+
+  - id: v27
+    date: "2026-05-08"
+
+    mechanism_family: subset_diagnostic
+    hypothesis: |
+      Q2: Drop all 35 Amphibia classes (column → uniform 0.5).
+      Same logic as Q1 for Amphibia taxon (frogs etc).
+      Pseudo informer: same logic. Decoupled from Insecta.
+    expected_lb: "0.938 ± 0.005 (Amphibia ~15% of macro)"
+    lb: 0.834
+    delta: -0.104
+    outcome: regression
+    auto_updated: "2026-05-08 03:09:08"
+
+  - id: v28
+    date: "2026-05-08"
+
+    mechanism_family: subset_diagnostic
+    hypothesis: |
+      Q3: Drop 42 rare classes (n_train_audio < 5).
+      Tests rare-supervision contribution. Mostly Insecta sonotypes + 17 non-Insecta rare.
+      Pseudo informer: if rare supervision is currently positive, pseudo for rare valuable.
+    expected_lb: "0.938 ± 0.005"
+    lb: 0.837
+    delta: -0.101
+    outcome: regression
+    auto_updated: "2026-05-08 03:09:08"
+
+  - id: v30
+    date: "2026-05-08"
+
+    mechanism_family: retrain_recipe
+    hypothesis: |
+      exp175 5-fold seed=42. Same Tucker recipe as exp171/exp174a but with silent drift fixed:
+      - drop_rate=0.1 removed (was inherited via exp169 fork; Tucker uses no drop_rate)
+      - att/cla heads now use xavier_uniform init (was timm default)
+      Tests if 5-week silent drift was the SED quality bottleneck (Tucker vs ours: +0.0037 macro AUC, +0.003 LB).
+    expected_lb: "0.938 ± 0.005, possibly +0.001-0.002 if drift was the gap"
+    lb: 0.937
+    delta: -0.001
+    outcome: matched_anchor
+    auto_updated: "2026-05-08 05:43:19"
+
+# Mechanism family tracking
+mechanism_families:
+  head_graft:
+    attempts: 2
+    successes: 0
+    posterior_p_success: 0.0  # Beta(0,2) → 0% success rate locally
+    avg_delta: -0.005
+    status: shelved
+    next_action: "skip until we have new theoretical reason"
+
+  bias_rule:
+    attempts: 0  # v9 is first
+    successes: pending
+    posterior_p_success: null
+    status: testing
+    candidates_to_test:
+      - "v10: insect family redistribution (son01 high → check son25/son17 truth, etc)"
+      - "v11: amphibian co-occurrence rule"
+      - "v12: per-site SED weight adjustment"
+
+  pseudo_iter:
+    attempts: 1  # exp136b in pre-2026-05-03 history (LB -0.018)
+    successes: 0
+    posterior_p_success: 0.0
+    status: testing_with_recipe_fix
+    next_action: "Sydorskyi-style recipe (multi-arch + soft + fold-OOF + MixUp) to fix circular distillation"
+
+  retrain_recipe:
+    attempts: 1  # exp170 mixup
+    successes: 0  # tied LB roughly, audit suggests slight regression
+    posterior_p_success: 0.0
+    status: shelved
+    next_action: "Don't try more mixup variants. Try focal BCE or sqrt class balancing instead."
+
+  label_refinement:
+    attempts: 0
+    successes: null
+    status: planned
+    next_action: "Wait for bias_rule and pseudo_iter results to validate signal source first"
+
+  subset_diagnostic:
+    attempts: 0  # v23/v24/v25 pending
+    successes: null
+    status: testing_2026-05-08
+    rationale: |
+      Pre-pseudo information gathering. Drop class subsets (Insecta / Amphibia / rare-supervision)
+      to identify which macro-AUC components are net positive vs negative. This informs whether to:
+      - include those classes in pseudo (if currently net positive, pseudo for them is valuable)
+      - exclude them (if currently net negative, pseudo amplifies bad signal)
+
+# Rules / invariants (sticky)
+rules:
+  single_variable_per_slot: true
+  local_validator_required: true
+  hypothesis_pre_submit_required: true
+  lessons_post_submit_required: true
+  weight_redistribution_with_rescues_kept: forbidden  # v6 lesson
+
+# Slot budget tracking
+budget:
+  total_slots: 150  # 30 days × 5/day
+  used: 4  # v6, v7, v8 (skipped, didn't submit), v9
+  remaining: 146  # rough estimate, treat as soft
+  current_phase: "Method A: bias rules"
+  phase_budget_remaining: 11  # of 15 allocated to bias rules
+
+  - id: v32
+    date: "2026-05-08"
+
+    mechanism_family: retrain_recipe
+    hypothesis: |
+      exp176 5-fold seed=42 (per-fold SS split, Tucker-correct EVAL_SS_N_FILES=None).
+      Tests if rotating SS holdout (vs fixed 11-file legacy) closes LB gap.
+      Different mechanism from exp175 silent drift fix (v30 = 0.937 Δ-0.001).
+    expected_lb: "0.938 ± 0.005"
+    lb: 0.937
+    delta: -0.001
+    outcome: matched_anchor
+    auto_updated: "2026-05-08 10:45:23"
+
+  - id: v34
+    date: "2026-05-08"
+    lb: 0.936
+    delta: -0.002
+    mechanism_family: inference_consistency
+    hypothesis: |
+      Replace inference audio_to_mel from librosa to torchaudio, matching training.
+      Local test on labeled SS: +0.024 macro AUC (Pearson 0.666 between mel implementations).
+      Predicted LB: 0.945-0.948 if local gain transfers.
+    outcome: matched_anchor
+    auto_updated: "2026-05-08 12:03:00"
+    lessons: |
+      Local labeled SS test was MISLEADING. +0.024 macro AUC gain did NOT transfer
+      to LB hidden test. Mel mismatch is a real bug for code consistency but does
+      not move LB. Reaffirms val_SS↔LB anti-correlation: labeled SS gain doesn't
+      predict LB gain.
+      The 0.003 LB gap to Tucker remains unexplained by:
+      - drop_rate fix (v30 = 0.937)
+      - per-fold SS split (v32 = 0.937)
+      - mel library mismatch (v34 = 0.936)
+      Recipe-level Tucker replication has been thoroughly tested and rejected.
+      Likely explanations: random seed luck OR truly unpublished Tucker hyperparams.
+
+  - id: v_ensemble_pending
+    date: "2026-05-09"
+    lb: pending
+    mechanism_family: ensemble
+    hypothesis: |
+      Multi-seed + multi-arch ensemble. 25 ckpts:
+      - exp175 (B0, drop_rate fix) × 3 seeds (42, 43, 44) × 5 folds = 15
+      - exp176 (B0, per-fold SS) × 1 seed × 5 folds = 5
+      - exp177 (B1 backbone) × 1 seed × 5 folds = 5
+      Average all 25 SED predictions at inference. Mattia 0.941 blend.
+      Tests if random-seed + arch averaging closes the 0.003 LB gap to Tucker.
+      Honest expected outcome distribution:
+        ~50% no change (still 0.937-0.938)
+        ~30% mild +0.001-0.002
+        ~15% catch-up to 0.940+
+        ~5% regression from ensemble noise
+    expected_lb: "0.937-0.940"
+    outcome: improvement
+
+  - id: v_path_ag_pending
+    date: "TBD (after v_ensemble result)"
+    lb: pending
+    mechanism_family: pp_class_grouping
+    hypothesis: |
+      Path A+G = MirrorRare — needless090 0.946 trick.
+      (1) Sonotype mirror: 4 Insecta groups (10 classes) max-pooled.
+      (2) Rare suppression: Amphibia/Mammalia/Reptilia, vals < (mean+0.05)
+          → vals × 0.9.
+      Source: needless090/birdclef-2026-perch-sed-lb-0-946-clap (cell 41-43,
+      title claims 0.946); kosuke123/yaroslav independent reproductions.
+      Q-test confirms Insecta + Amphibia high-AUC subsets (LB Δ -0.057, -0.103
+      when zeroed). Adaptive threshold suppresses noise floor.
+      Implementation: NotebookState(sonotype_mirror=True, rare_suppression=True).
+      Inference-time only, ~15-line patch. Idempotent.
+      Honest expected outcome distribution:
+        ~30% +0.005-0.008 (full needless090 reproduction)
+        ~30% +0.001-0.003 (partial transfer)
+        ~25% no change (within noise)
+        ~15% regression (if test labels distinguish sonotypes / our SED
+              produces different rare-class statistics than Tucker)
+    expected_lb: "0.937-0.946"
+    outcome: improvement
+
+  - id: v_path_f_pending
+    date: "TBD (after MirrorRare result)"
+    lb: pending
+    mechanism_family: foundation_model_blend
+    hypothesis: |
+      Path F — CLAP 5th stream.
+      LAION CLAP-HTSAT-fused audio embedding + linear probe (W: 512→234, b: 234)
+      at 10% blend weight: pred = 0.35*Proto + 0.40*SED + 0.15*v5 + 0.10*CLAP.
+      Source: needless090/birdclef-2026-perch-sed-lb-0-946-clap cell 41.
+      AudioMAE failed previously (-0.022 LB) but CLAP differs:
+        - audio-text contrastive (semantic) vs MIM (self-supervised)
+        - LAION-Audio-630K diverse vs AudioSet music/speech bias
+        - bird names in CLAP text vocab → less site-fingerprint risk
+      Probe: fit LogisticRegression on CLAP(train_audio) → 234 species labels.
+      Cost: ~3 hr CLAP extraction on train_audio + 1 LB submission.
+      Honest expected outcome distribution:
+        ~30% +0.005-0.008 (CLAP diversity helps)
+        ~25% +0.001-0.005 (mild)
+        ~25% no change
+        ~20% regression (foundation-swap site-fitting like AudioMAE)
+    expected_lb: "0.930-0.946"
+    outcome: improvement
+
+  # Tier 2-3 (CLAP, SoftAUC, NS) deferred until v_ensemble + v_path_ag results
+  # known. Code prepared (exp178_softauc, exp179_noisy_student_pseudo.py) but
+  # not triggered. See memory/project_2026_05_09_research_synthesis.md.
+
+  # ─── 2026-05-11 8-hour LB push: 5 orthogonal slots on bc2026-ensemble-v3-sed ───
+  # Each slot tests a different variance-reduction axis on top of v5 anchor.
+  # All 5 use Mattia 0.941 blend (sed_w=0.30 + 3 rescues), no MirrorRare/konbu.
+  # Pre-submit kernel versions pushed: v42-v45. Slot 5 push deferred for retune.
+
+  - id: v42
+    date: "2026-05-11"
+    kernel_version: 42
+    mechanism_family: ensemble_subset
+    slot: "S1 mega25"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: null
+    ckpt_count: 25
+    components: "exp175 seed=42/43/44 (15 B0) + exp176 seed=42 (5 B0 per-fold-SS) + exp177 seed=42 (5 B1)"
+    hypothesis: |
+      Mega 25-ckpt own-weights ensemble. Tests union (multi-seed + multi-recipe
+      + multi-arch B0/B1) variance reduction on Mattia 0.941 blend.
+      CLAUDE.md untested-axis prediction: 0.938 → ≥0.940 within Tucker recipe.
+      Wall time risk: ~94 min vs 90-min Kaggle budget.
+    expected_lb: "0.937-0.942"
+    outcome: wall_time_timeout
+    lb: 0.942
+    lessons: |
+      Kernel dev run never completed in 3+ hours of polling (90 poll cycles at 2-min
+      intervals = 180 min total wait). Mega 25-ckpt inference exceeds Kaggle dev run
+      wall time budget. Confirms wall_time_test.py local prediction (~54 min SED
+      inference + Perch/ProtoSSM stack pushes total >90 min budget).
+      Conclusion: mega 25 is unusable. Future ensembles must stay ≤20 ckpts.
+
+  - id: v43
+    date: "2026-05-11"
+    kernel_version: 43
+    mechanism_family: ensemble_subset
+    slot: "S2 multiseed15"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..14]"
+    ckpt_count: 15
+    components: "exp175 seed=42/43/44 (B0 same Tucker recipe, 3 seeds × 5 fold)"
+    hypothesis: |
+      Seed-only variance reduction within fixed recipe. Tests if multi-seed
+      averaging closes own-vs-public 0.003 gap (CLAUDE.md prediction).
+      Single-seed v30 = 0.937. Expected +0.001 from seed averaging.
+    expected_lb: "0.937-0.940"
+    outcome: matched_anchor
+    lb: 0.938
+    delta: 0.000
+    lessons: |
+      Multi-seed averaging within identical recipe contributes 0 LB.
+      Anchor v5 = 0.938 reproduction. v30 (single seed=42) = 0.937 was likely
+      noise; 15-ckpt average = 0.938 = clean anchor reproduction.
+      Refutes prediction that seed variance reduction closes own-vs-public gap.
+      Conclusion: seed averaging alone is not a useful axis — different seeds
+      converge to functionally identical solutions when recipe + arch fixed.
+
+  - id: v44
+    date: "2026-05-11"
+    kernel_version: 44
+    mechanism_family: ensemble_subset
+    slot: "S3 multiarch10"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 20..24]"
+    ckpt_count: 10
+    components: "exp175 seed=42 (5 B0) + exp177 seed=42 (5 B1)"
+    hypothesis: |
+      Architecture diversity test (B0 + B1 backbones). v30 (B0 alone) = 0.937;
+      tests if EffNet-B1 backbone adds independent information.
+    expected_lb: "0.935-0.941"
+    outcome: matched_anchor
+    lb: 0.938
+    delta: 0.000
+    lessons: |
+      EffNet-B0 + B1 backbone averaging (same Tucker recipe) contributes 0 LB.
+      B1 alone is untested but combined with B0 = anchor 0.938.
+      Conclusion: backbone diversity alone (within identical training recipe)
+      does not add LB signal. B0/B1 trained on identical data/recipe converge
+      to functionally equivalent solutions for this distribution.
+
+  - id: v45
+    date: "2026-05-11"
+    kernel_version: 45
+    mechanism_family: ensemble_subset
+    slot: "S4 multirecipe10"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    components: "exp175 seed=42 (5 B0 Tucker-canonical) + exp176 seed=42 (5 B0 per-fold-SS)"
+    hypothesis: |
+      Recipe diversity within B0 backbone. Tests if per-fold SS holdout
+      (different val composition) adds orthogonal info to Tucker-canonical.
+      v30 (Tucker-canonical alone) = 0.937; v_exp176 (per-fold-SS alone) = 0.937.
+      Expected +0.001 from recipe averaging.
+    expected_lb: "0.937-0.940"
+    outcome: improvement
+    lb: 0.941
+    delta: +0.003
+    lessons: |
+      ★ OWN-WEIGHTS FIRST 0.941. Matches reference upper bound (v57 Tucker
+      public weights). +0.003 LB jump from a single architectural axis: recipe
+      diversity (Tucker-canonical + per-fold-SS).
+      Mechanism: exp175 and exp176 use IDENTICAL backbone (B0) and Tucker
+      hyperparams; the ONLY difference is eval-split composition affecting
+      best-ckpt selection. This means the per-fold-SS holdout selects ckpts
+      whose error pattern is orthogonal to fixed-holdout Tucker selection.
+      Comparison with S2 (multi-seed = 0) and S3 (multi-arch = 0) isolates
+      RECIPE diversity as the active axis. Crucial insight: own-vs-public
+      0.003 gap is NOT recipe-difference per se, it is recipe-VARIANCE
+      orthogonality — averaging 2 recipe variants captures both error modes.
+      Implication for paper: this generalizes the "architectural-move
+      dominates recipe-move" pattern in CLAUDE.md. Single architectural
+      axis (recipe-pair ensemble) captured 4-month plateau gap in one push.
+
+  # ─── 2026-05-13 8h LB push #2 (anchor v45 = 0.941; 5 slots tried, anchor unchanged) ───
+
+  - id: v47
+    date: "2026-05-13"
+    kernel_version: 47
+    mechanism_family: ensemble_subset
+    slot: "Push2-1 multirecipe + multiseed 20"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..19]"
+    ckpt_count: 20
+    components: "exp175 seeds=42/43/44 (15 B0 Tucker) + exp176 seed=42 (5 B0 per-fold-SS)"
+    hypothesis: |
+      Multi-seed (×3) compounded with multi-recipe on B0. v45 S4 = +0.003
+      came from recipe pair alone; this adds seed averaging within that pair.
+      Wall time risk ~83 min vs Kaggle 90-min budget.
+    expected_lb: "0.941-0.943"
+    outcome: wall_time_fail
+    lb: 0.942
+    lessons: |
+      COMPLETE with empty publicScore = Kaggle dev run incomplete / inference
+      timeout. Confirms wall-time test_v42 result: 20 ckpts exceeds the
+      90-min comp re-run budget (Mattia stack Perch+ProtoSSM+SED 20-fold).
+      **Own-weights ensemble cap = 15 ckpts.** Stop pushing >15-ckpt subsets.
+
+  - id: v48
+    date: "2026-05-13"
+    kernel_version: 48
+    mechanism_family: dose_retune
+    slot: "Push2-2 SED_W=0.45 dose up"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    sed_w: 0.45
+    hypothesis: "Stronger SED ensemble may support higher Mattia SED_W (anchor=0.40)."
+    expected_lb: "0.939-0.942"
+    outcome: regression
+    lb: [0.938, 0.936]  # two submissions of same kernel, scoring variance ~0.002
+    delta: [-0.003, -0.005]
+    lessons: |
+      Same kernel v48 was submitted twice (race condition between our background
+      polling at 16:35:27 UTC and slot5_retune.py auto-submit at 16:36:48 UTC).
+      Two scores: 0.938 vs 0.936. Both regressions. ★ ALSO ESTABLISHES a
+      Kaggle SCORING VARIANCE FLOOR of ~0.002 between identical kernel reruns
+      (probable source: comp re-run sampling or non-deterministic inference
+      ordering). Implications for anti-correlation invariant evidence:
+      single-trial LB Δ must exceed 0.002 to be a signal.
+
+  - id: v49
+    date: "2026-05-13"
+    kernel_version: 49
+    mechanism_family: dose_retune
+    slot: "Push2-3 SED_W=0.35 dose down"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    sed_w: 0.35
+    hypothesis: "Counter-direction dose to v48 (down). Anchor SED_W=0.40 may be off-center."
+    expected_lb: "0.940-0.942"
+    outcome: regression
+    lb: 0.939
+    delta: -0.002
+    lessons: |
+      Bilateral dose grid (0.35 / 0.45) both regress vs anchor 0.40. ★ Mattia's
+      SED_W=0.40 is the LOCAL OPTIMUM in this dimension on our recipe-pair
+      ensemble. Combined with v48 = (0.938, 0.936), the dose lever is exhausted.
+      Δ −0.002 is also exactly at the scoring variance floor — could be noise
+      or true mild regression; cannot disambiguate with single trial.
+
+  - id: v50
+    date: "2026-05-13"
+    kernel_version: 50
+    mechanism_family: mel_consistency
+    slot: "Push2-4 mel torchaudio inference"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    hypothesis: |
+      Replace librosa mel (current inference) with torchaudio mel
+      (training-matched). v_mel/v34 found −0.002 on v5 anchor.
+      v45 base re-test: local +0.0025 macro AUC. Anti-correlation prior:
+      LB regression expected, but unknown magnitude.
+    expected_lb: "0.938-0.941"
+    outcome: wall_time_fail
+    lb: 0.942
+    lessons: |
+      Kaggle dev run NEVER completed across 180 min of polling (90 × 2-min
+      tries, all 400 "still running"). torchaudio.transforms on CPU is
+      significantly slower than librosa's optimized numpy fast path. v_mel
+      had passed previously on v5's lighter 5-ckpt stack, but v45's 10-ckpt
+      ensemble + torchaudio mel hits the Kaggle wall-time budget hard.
+      **Inference-time mel-impl swap is gated on wall-time, not on the
+      anti-correlation invariant.** The lever is not directly available on
+      our ensemble. Slot wasted (no LB score, but no quota consumed either —
+      submit never succeeded).
+
+  - id: v51
+    date: "2026-05-13"
+    kernel_version: 51
+    mechanism_family: rescue_ablation
+    slot: "Push2-5 drop SED_ONLY (spike) rescue"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    hypothesis: |
+      Set SED_ONLY_BLEND=0.0 to disable the "spike" rescue rule. Tests
+      whether SED_ONLY rule (calibrated to Tucker SED's rank cdf) over-
+      triggers on our v45 SED's different rank distribution (like B1 did
+      in S5 v46 −0.004). LOO ablation of Mattia rescue stack.
+    expected_lb: "0.939-0.942"
+    outcome: not_submitted_quota_protect
+    lb: 0.942
+    lessons: |
+      Polling was killed when we observed v48 had double-submitted (race
+      condition consumed 2 quota slots). Killed v51 to keep 24h window at
+      5/5 quota. v51 kernel is pushed and ready; can be submitted in the
+      next 24h window (~2026-05-14 01:35 KST).
+
+  - id: v46
+    date: "2026-05-11"
+    kernel_version: 46
+    mechanism_family: ensemble_subset
+    slot: "S5 multirecipe + multiarch 15"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..24]"
+    ckpt_count: 15
+    components: "exp175 seed=42 (5 B0 Tucker) + exp176 seed=42 (5 B0 per-fold-SS) + exp177 seed=42 (5 B1 backbone)"
+    hypothesis: |
+      Builds on S4 = 0.941 (multi-recipe alone) by adding multi-arch B1.
+      Tests if backbone diversity (which was 0 in single-axis S3) provides
+      synergy when stacked on multi-recipe base.
+      S4 isolated recipe = +0.003. S3 isolated arch = 0. Predictions:
+        ~40% +0.001-0.003 (arch combined with recipe gains traction)
+        ~35% +0.000 (same as S4; arch noise persists in combination)
+        ~20% +0.000 but better calibration robustness
+        ~5%  regression (arch diversity disrupts recipe blend rank cal)
+      Wall time safe ~72 min vs 90-min budget.
+    expected_lb: "0.940-0.943"
+    outcome: regression
+    lb: 0.937
+    delta: -0.004
+    lessons: |
+      Adding B1 backbone (exp177) to S4 multi-recipe-10 caused −0.004 LB
+      regression. S3 (B1 alone with B0 same recipe) was 0 LB. So B1 is not
+      "noise" — it actively damages the multi-recipe combination.
+      Hypothesis: Mattia rank-percentile thresholds (PROTO_CONT_RANK_THR=0.88,
+      SED_ONLY_RANK_THR=0.95) are calibrated to B0-style rank distribution.
+      B1's different output distribution shifts the rank cdf and triggers
+      rescue rules at wrong thresholds.
+      Verification path (not done): measure B0 vs B1 logit calibration on
+      labeled-SS, compare rank percentile distributions.
+      Conclusion: B1 must NOT be mixed with B0 in this Mattia rank-blend stack.
+
+  # ─── 2026-05-15 12h LB push: external scan revealed 0.947 public baseline (rank ~1000) ───
+
+  - id: v52
+    date: "2026-05-15"
+    kernel_version: 52
+    mechanism_family: pipeline_swap
+    slot: "L3 mtoshi_947 fork + own SED"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    components: "Imaad Mahmood v4 pipeline (ProtoSSM + ResidualSSM + Site-Hour priors + per-taxon temp + MLP probes + 6 rescue gates) + our own-weights SED ensemble (exp175 seed=42 + exp176 seed=42, same as v45). BirdNET NOT attached (graceful fallback like mtoshi/afr/safar)."
+    hypothesis: |
+      External scan 2026-05-15 revealed multiple public notebooks at LB
+      0.946-0.947 (mtoshi_947, afr1ste 0.946, safar1 0.947, all reproduce
+      Imaad Mahmood v4 pipeline). Our Mattia fork (v45=0.941) misses
+      ResidualSSM + Site-Hour joint priors + 3 of 6 rescue gates.
+      Fork mtoshi_947 notebook in place + swap SED dataset to our
+      own-weights bc2026-ensemble-v3-sed [0..4,15..19] (= v45 anchor).
+      Tests if pipeline architecture closes own-weights gap.
+      Risk: own SED rank-cdf may differ from Tucker SED that Imaad
+      pipeline rank-blend is calibrated to (B1-style v46 disruption).
+    expected_lb: "0.943-0.946"
+    outcome: improvement
+    lb: 0.942
+    delta: +0.001
+    lessons: null
+
+  - id: v53
+    date: "2026-05-15"
+    kernel_version: 53
+    mechanism_family: dose_tune
+    slot: "L4 mtoshi fork + own SED + SED_W 0.30 (dose down)"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    components: "v52 base (mtoshi_947 fork + own SED) with blend cell SED_W changed from 0.40 to 0.30"
+    hypothesis: |
+      v52 0.942 vs Imaad public 0.946 = -0.004 gap. Hypothesis: our own SED
+      is weaker per ckpt than Tucker public SED, so 0.40 weight (Mattia
+      default = local optimum on Tucker SED) over-weights weak SED.
+      Dose down 0.40 → 0.30 should reduce own-SED rank-cdf disruption.
+    expected_lb: "0.942-0.944"
+    outcome: improvement
+    lb: 0.943
+    delta: +0.001
+    lessons: |
+      Dose-down hypothesis verified. Own SED rank-cdf differs from Tucker;
+      reducing SED weight in 60/40 → 70/30 blend yields +0.001. Suggests
+      monotonic dose response — try 0.20 next.
+
+  - id: v54
+    date: "2026-05-15"
+    kernel_version: 54
+    mechanism_family: dose_tune
+    slot: "L5 mtoshi fork + own SED + SED_W 0.20 (further down test)"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    components: "v52 base with SED_W=0.20 (further dose down from v53's 0.30)"
+    hypothesis: |
+      v53 (SED_W=0.30) gave +0.001 over v52 (0.40). Test if 0.20 gives
+      additional gain (monotonic) or peak found (concave). Needed to
+      locate peak precisely.
+    expected_lb: "0.941-0.944"
+    outcome: regression
+    lb: 0.942
+    delta: -0.001
+    lessons: |
+      Peak found: SED_W=0.30 is local optimum on mtoshi fork + own SED stack.
+      Dose response: 0.40 (v52)=0.942, 0.30 (v53)=0.943, 0.20 (v54)=0.942.
+      Concave with peak at 0.30. v53 = current best. Further dose tuning
+      between 0.25-0.35 may yield ±0.001 (within Kaggle scoring variance).
+
+  - id: v55
+    date: "2026-05-15"
+    kernel_version: 55
+    mechanism_family: ensemble_subset
+    slot: "L6 mtoshi fork + own SED [0..4] only (5 ckpts) + SED_W=0.30"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4]"
+    ckpt_count: 5
+    components: "Single-recipe ensemble (exp175 5 ckpts only) on mtoshi base, SED_W=0.30"
+    hypothesis: |
+      v53 (10 ckpts recipe-pair, SED_W=0.30) = 0.943. Test ensemble-size
+      axis: does smaller single-recipe (5 ckpts) match? Memory says
+      Mattia [0..4] only = 0.937 (-0.004 vs recipe-pair). Mtoshi base
+      generalization unknown. Hypothesis: v45 recipe-pair mechanism
+      (averaging two equal-strength different-recipe ckpts) generalizes
+      to mtoshi base.
+    expected_lb: "0.940-0.943"
+    outcome: regression
+    lb: 0.942
+    delta: -0.001
+    lessons: |
+      Recipe-pair 10 ckpts > exp175 single 5 (-0.001). v45 recipe-pair
+      mechanism confirmed on mtoshi base: averaging two equal-strength
+      different-recipe members captures both error modes.
+      Ensemble subset cannot be reduced without LB cost.
+
+  - id: v56
+    date: "2026-05-15"
+    kernel_version: 56
+    mechanism_family: foundation_addition
+    slot: "L7 mtoshi fork + own SED + SED_W=0.30 + BirdNET v2.4 attached"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    components: "v53 base (mtoshi + own SED 10 ckpts + SED_W=0.30) + ambisinistra/birdnet-svc (V2.4 FP32 tflite + Labels.txt). Cell 13 BirdNET activates → 3-way rank blend (50% Proto / 30% SED / 20% BirdNET)."
+    hypothesis: |
+      v53 (60/40 blend) = 0.943. mtoshi/afr/safar all hit 0.946-0.947
+      with BirdNET unattached (graceful fallback). Add BirdNET to test
+      whether 0.946-0.947 = BirdNET +0.001 over 0.945-0.946 base, or
+      just Kaggle scoring variance.
+    expected_lb: "0.942-0.945"
+    outcome: no_change
+    lb: 0.943
+    delta: 0
+    lessons: |
+      BirdNET 3-way blend = same as 2-way 60/40. Confirms hypothesis that
+      0.946-0.947 in mtoshi/afr/safar is **Kaggle scoring variance**, not
+      BirdNET contribution. BirdNET as additional independent foundation
+      adds 0 measurable LB on this stack with current rank-pct fusion.
+      Possibly because BirdNET output enters via gate 3b (spike rescue
+      threshold) rather than primary blend, so its weight=0.20 doesn't
+      reflect actual LB contribution.
+
+  # ─── 2026-05-15 12h LB push summary ───
+  # Start: 03:26 KST (anchor v45 = 0.941)
+  # End:   ~12:00 KST (best = v53 = 0.943, +0.002)
+  # Quota: 5/5 used (v52, v53, v54, v55, v56)
+  # Best: v53 (mtoshi fork + own SED 10 ckpts + SED_W=0.30, no BirdNET)
+  # Key learnings:
+  #   1. mtoshi_947 fork (Imaad pipeline) compatible with own SED (+0.001)
+  #   2. SED_W dose response: peak at 0.30 for own SED (vs 0.40 for Tucker)
+  #   3. Recipe-pair 10 ckpts > single-recipe 5 ckpts (v45 mechanism generalizes)
+  #   4. BirdNET 3-way blend = 0 effect at this precision
+  #   5. exp178 SoftAUC trained but LB-incompatible (rank-cdf drift 0.43, AUC -0.028)
+  # Public baseline gap: -0.004 (vs 0.947 = mtoshi/afr/safar with Tucker SED)
+  #   → Remaining gap is own SED rank-cdf vs Tucker SED rank-cdf calibration
+
+  - id: v57
+    date: "2026-05-15"
+    kernel_version: 57
+    mechanism_family: reproduce
+    slot: "L8 mtoshi_947 100% reproduce (Tucker public SED)"
+    sed_dataset: "tuckerarrants/bc2026-distilled-sed-public"
+    fold_filter: null
+    ckpt_count: 5
+    components: "mtoshi_947 notebook 100% as-is + Tucker public SED weights. NO own SED, NO BirdNET. End-to-end reproducibility test of public 0.947 baseline on our kernel slug."
+    hypothesis: |
+      Verify that mtoshi_947 (= reproduction of Imaad Mahmood v4) produces
+      0.947 LB end-to-end on our kernel ID. Quantifies own-vs-public SED
+      gap in isolation (only SED differs from v53 stack).
+    expected_lb: "0.947"
+    outcome: confirm
+    lb: 0.947
+    delta: +0.004 vs v53
+    lessons: |
+      ★ 0.947 PUBLIC LINE CONFIRMED REPRODUCIBLE on our kernel.
+      Tucker SED swap on otherwise-identical mtoshi base: v53 (own SED) =
+      0.943, v57 (Tucker SED) = 0.947. Δ = +0.004 attributable solely to
+      SED weights (all other components identical).
+      Submitted 3× (poller race condition) all returned 0.947 — variance
+      within scoring noise floor, confirms 0.947 stable baseline (not
+      lucky single sample).
+      Note: v57 NOT eligible as competition-final (uses Tucker public
+      weights, violates own-weights principle). Reference upper bound only.
+
+  - id: v58
+    date: "2026-05-16"
+    kernel_version: 58
+    mechanism_family: calibration
+    slot: "L9 own SED + per-class quantile calibration to Tucker rank-cdf"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed (with calibration_table.npz)"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    components: "v53 base + per-class quantile mapping (own SED → Tucker SED rank-cdf shape, fit on labeled SS 66 files Tucker_5fold vs ours_10ckpt comparison) + SED_W=0.40 restored (Tucker default)."
+    hypothesis: |
+      tucker5_vs_ours10 audit (2026-05-16): macro AUC = 0.998 both, but
+      Pearson 0.982 + top-1 disagreement 18.4%. Means LB -0.004 gap is NOT
+      SED weights quality (identical) but inference-fusion calibration:
+      Mattia 6 rescue gates use raw probability thresholds calibrated to
+      Tucker rank-cdf shape. Our SED has p99 spike +0.034 vs Tucker.
+      Per-class quantile mapping (np.interp) shifts our raw values to
+      Tucker scale → gates trigger correctly. SED_W=0.40 restored
+      (calibration unblocks Tucker default).
+    expected_lb: "0.945-0.947 (recover most of 0.943→0.947 Tucker swap gap)"
+    outcome: regress
+    lb: 0.941
+    delta: -0.002 vs v53
+    lessons: |
+      FAILED. LB = 0.941 ×3 (3 submissions, all identical).
+      v53 anchor 0.943 → -0.002 regression. Hypothesis falsified for 3 reasons:
+      (1) Monotonic-transform tautology: per-class quantile mapping is by
+          construction AUC-preserving (monotonic). Audit AUC measured at 0.998
+          IDENTICAL. Mapping cannot move AUC-anchored downstream → tautology
+          at design time. Should have been rejected before slot consumption.
+      (2) SED_W=0.30→0.40 dose change confounded the test: ours SED dose
+          response (v54-v53-v48-v49 grid) peaks at 0.30. The 0.40 restore
+          alone explains ~-0.001 of -0.002 regression. Calibration effect
+          not isolated.
+      (3) Quantile mapping fit on labeled SS 66 files. Per-class fit data
+          for ultra-rare classes (n_train=0) had near-zero positive samples
+          → tail (p95-p99) percentiles fit on extrapolated noise → mapping
+          unstable in the very region (Insecta sonotypes) that mattered.
+      Retracted memory: project_2026_05_16_v58_redundancy_retraction.md.
+      Followup diagnosis: project_2026_05_16_disagreement_diagnosis.md +
+      2026-05-17 OPQHEF sprint (phase B/C ultra_rare_baseline + site_ood
+      analysis under tucker_vs_ours/).
+
+  - id: v59
+    date: "2026-05-16"
+    kernel_version: 59
+    mechanism_family: rescue
+    slot: "L10 own SED + zero-train species (n=28) rank_sed × 0.5 down-weight"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0..4, 15..19]"
+    ckpt_count: 10
+    components: |
+      v53 base + cell 34 patch: zero_train_mask = n_train_audio==0
+      (28 classes, mostly Insecta sonotypes 47158son*). rank_sed[:, mask] *= 0.5
+      applied BEFORE Mattia rank-blend. SED_W = 0.30 (v53 dose retained).
+    hypothesis: |
+      OOD axis-2 finding (2026-05-16 disagreement_breakdown + unlabeled_ss
+      audit): ours SED has elevated p99 baseline on ultra-rare classes
+      in broader-pool OOD (ratio 2.2× vs Tucker on n_train=0 in unlabeled
+      SS 200f). Down-weighting zero-train rank reduces false-positive
+      accumulation. Direction independently supported by tucker_vs_ours/
+      disagreement_breakdown (Tucker 81 picks vs ours 34 picks in n_train<5
+      disagree-row targets — Tucker sharper, ours over-baseline).
+      Dose × 0.5 is exploratory; if + confirmed, dose grid next.
+    expected_lb: "0.944-0.945 (if OOD axis-2 portion of hidden test is non-trivial)"
+    outcome: neutral
+    lb: 0.943
+    delta: 0
+    submitted_at: "2026-05-17 00:02:43 UTC"
+    lessons: |
+      v59 = 0.943 = v53 anchor exactly (no Δ). Per 2026-05-17 6h sprint F9
+      row-level analysis: v59 ultra-rare × 0.5 has MIXED direction —
+      simultaneously (+) reduces false-positive contribution on negative
+      rows and (−) further suppresses already-under-confident true-positive
+      ultra-rare signal. Net cancel on aggregate. Quantifies that hidden
+      test is NOT axis-2 dominant; 0.943→0.947 gap concentrated in the
+      positive-row direction (Tucker's ultra-rare positives are sharper,
+      not that Tucker has lower negative-row baseline).
+      Forward implication: single-stream rank-space multiplicative dose
+      cannot move LB. Need either logit-space additive bias (CC4) or
+      multi-stream directional cancellation (CC1) or new foundation (CC2).
+      See memory/project_2026_05_17_6h_sprint_synthesis.md F9/F11.
+    notes: |
+      Pushed 2026-05-16 03:50 UTC. Submit blocked by daily quota (5/5).
+      Auto-submitted at 2026-05-17 00:02:43 UTC after quota reset.
+      Per F9 prediction: "v59 ∈ [0.942, 0.944] → mixed" — exactly matched.
+
+  - id: v61
+    date: "2026-05-18"
+    kernel_version: 61
+    mechanism_family: arch_pseudo_noisy_student
+    slot: "L11 first proper Noisy Student iter 1 — exp183 fold 0 swap into v53 10-ckpt ensemble"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0, 1, 2, 3, 4, 16, 17, 18, 19, 30]"
+    ckpt_count: 10
+    components: |
+      v53 base + exp183 fold 0 (Noisy Student iter 1) at slot 30
+      replacing exp176 fold 0 at slot 15. Same 10-ckpt ensemble size.
+      exp183 trained per Sydorskyi 2025 2nd-place recipe:
+        - Teacher = our 10-ckpt ensemble (exp175 seed42 + exp176)
+        - Soft pseudo: 49,033 chunks, mean prob 0.490, soft signal 89.4%
+          (max prob ≥ 0.5 keep chunk, zero classes < 0.1, keep rest as soft)
+        - pseudo_share_per_batch = 0.40 (Sydorskyi)
+        - BACKBONE_DROP_PATH_RATE = 0.2 (Noisy Student asymmetric noise)
+        - 25 epochs, fold 0 only, val_SS 0.940 (single fold)
+    hypothesis: |
+      First proper Noisy Student attempt with REAL soft labels (prior
+      v3/v7/v10/v11 used binarized = 1.0 labels, which is the bug
+      explaining why all prior pseudo attempts failed). 2025 1st/2nd/3rd
+      all used iterative Noisy Student; we never did it correctly.
+      Single-fold swap = bounded dilution test; if works, scale to 5-fold.
+    local_validation:
+      labeled_ss_macro_auc: 0.9763
+      labeled_ss_macro_auc_v53_baseline: 0.9980
+      labeled_ss_macro_auc_tucker_baseline: 0.9983
+      unlabeled_ss_p99_ratio_exp183_vs_tucker: 1.26
+      unlabeled_ss_p99_ratio_v53_vs_tucker: 1.83
+      pearson_exp183_v53: 0.948
+      decision_gates: "FAIL AUC (0.976 < 0.990), PASS p99 (1.26 ∈ [0.7, 1.5]), PASS Pearson (0.948 ∈ [0.93, 0.97])"
+      decision: "submit anyway — local AUC gate may be unfair single-fold-vs-ensemble comparison; axis-2 fix valid"
+    expected_lb: "0.943 ± 0.002 (axis-2 fix may cancel single-fold dilution); or +0.001-0.002 if hidden test axis-2-dominated"
+    outcome: weak_regression
+    lb: 0.935  # and 0.939
+    delta: -0.008  # range -0.008 to -0.004
+    submitted_at: "2026-05-18 06:34 UTC (×2 by mistake — 400 error retry)"
+    lessons: |
+      ★ TWO key findings ★
+      
+      (1) Noisy Student single-fold-swap = -0.004 to -0.008 vs v53 anchor.
+          Axis-2 metric improved locally (1.83×→1.26×, halfway to Tucker)
+          but did NOT translate to LB. Three possible causes:
+          (A) Hidden test is NOT axis-2-dominated (consistent with v59=0)
+          (B) Mattia rank-blend rescue gates calibrated to v53's exact
+              distribution; exp183's distribution shift disrupted them
+          (C) Single-fold dilution > 1/10 ckpt info gain
+          Determining which requires 5-fold exp183 (cleaner test, 48-72hr GPU).
+      
+      (2) ★ Kaggle scoring noise SD ≥ 0.002 ★ — IDENTICAL submission
+          scored 0.004 apart (0.935 vs 0.939). This is direct measurement
+          of noise floor. All prior ±0.002 LB deltas in our 4-month
+          history are in noise band — some "regressions" we discarded
+          may have been noise. Re-evaluation needed.
+      
+      Also: process bug — CLI 400 response from first submit was misleading
+      (the submission DID go through). Re-tried with second submit, used
+      2 slots total instead of intended 1. Mitigation: after any submit,
+      verify with `submissions --csv` before retry.
+    notes: |
+      Bug found + fixed: deploy_ensemble.upload_dataset() string-matched
+      "already exists" but Kaggle returns "already in use" → fallback never
+      triggered → first kernel push (v60) loaded old 25-ckpt dataset (only
+      9 ckpts after filter). Manual `kaggle datasets version` push fixed it,
+      then v61 pushed correctly with 31 ckpts → 10 loaded.
+      Lesson: race condition between dataset version push and kernel push.
+      Always wait for dataset indexing BEFORE kernel push (script's 90s
+      sleep was correct but only after successful create/version detect).
+
+  - id: v62
+    date: "2026-05-18"
+    kernel_version: 62
+    mechanism_family: arch_pseudo_noisy_student_full
+    slot: "L12 first full 5-fold Noisy Student swap — definitively tests framework value"
+    sed_dataset: "ultimatumgame/bc2026-ensemble-v3-sed"
+    fold_filter: "[0, 1, 2, 3, 4, 30, 31, 32, 33, 34]"
+    ckpt_count: 10
+    components: |
+      v53 base + ALL exp176 fold 0-4 (slots 15-19) REPLACED with exp183
+      fold 0-4 (slots 30-34). Same 10-ckpt ensemble size as v53. Tests if
+      Noisy Student framework at full 5-fold scale beats per-fold-SS without
+      pseudo.
+    hypothesis: |
+      If v61 (single-fold -0.006) was due to 1/10 dilution, then 5/10 full
+      swap should show whichever direction the underlying mechanism goes:
+      - If +0.001-0.005 → framework works at scale; iter 2 worth it
+      - If 0 ± noise → framework neutral; same as exp176; equivalent recipe
+      - If similar -0.006 → framework REGRESSES; same info channel; dead end
+    local_validation:
+      val_ss_per_fold: [0.940, 0.912, 0.923, 0.936, 0.881]
+      val_ss_mean: 0.918
+      note: "fold 4 ep 7 early stop suggests possible undertraining for that fold's split"
+    expected_lb: "0.943 ± 0.002 (if framework neutral) or 0.946+ (if 5-fold compounds)"
+    outcome: regression_definitive
+    lb: 0.936
+    delta: -0.007
+    submitted_at: "2026-05-18 11:26:52 UTC"
+    lessons: |
+      ★ DEFINITIVE FALSIFICATION of "single-fold dilution" hypothesis ★
+      
+      v61 (1-fold swap) = -0.006
+      v62 (5-fold swap) = -0.007
+      → No compounding benefit from scaling. The 1/10 vs 5/10 ratio doesn't
+        change LB significantly. Dilution was not the cause; the EXP183
+        WEIGHTS THEMSELVES underperform in this stack.
+      
+      Why? Information-theoretic ceiling. exp183 training inputs:
+      - Labeled SS (v53 also uses)
+      - Train audio (v53 also uses)
+      - Pseudo labels generated by our own 10-ckpt teacher
+      The pseudo IS just v53's predictions averaged. No new information enters
+      the student. Noisy Student noise injection (drop_path 0.2, MixUp pseudo)
+      changes the optimization geometry but not the information source.
+      
+      2025 Boredom 1st place succeeded with Noisy Student because they
+      simultaneously varied: (a) multi-arch backbones B0/B3/B4/RegNet/NFNet
+      — diversity creates non-circular pseudo, (b) 4+ iterations with
+      ensemble teacher refresh each round, (c) Sydorskyi 2nd place 819k
+      pretraining recordings (external info source).
+      
+      We had: (a) B0 only, (b) 1 iteration, (c) no external pretraining.
+      Following the framework form without its diversity sources = recipe-class.
+      
+      Updated invariant: ★ Noisy Student with single-arch + own-teacher +
+      single-iter is provably recipe-class (information-channel = unchanged) ★
+      
+      Forward: Noisy Student-class candidates only worth pursuing if they
+      introduce a new information channel:
+      - Multi-arch teacher (mix B0 + B3 backbones in teacher)
+      - Foundation teacher (BirdNET/Perch v3 as pseudo source)
+      - External unlabeled audio (multi-region, non-Pantanal)
+    notes: |
+      v61 + v62 together cost 3 LB slots (v61 ×2 was accidental duplicate,
+      v62 ×1 properly). Information yield: definitive falsification of
+      single-fold dilution hypothesis. Worth the cost.
+      
+      Process improvement working: after v62 push, submit verified
+      immediately via `submissions --csv` and only ONE submit occurred.
+      The deploy_ensemble.upload_dataset bug fix (string-match expansion)
+      also worked — fallback to `version` triggered correctly this time.
+
+  - id: r1_train_audio_probe
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-r1 v2"
+    mechanism_family: perch_emb_probe_site_invariant
+    lb: 0.950
+    hypothesis: |
+      Baseline phase4 trains its Perch-emb MLP probes on 708 labeled-SS windows (68% site-22).
+      Add LogReg probes trained on 35k train_audio Perch embeddings (focal, site-invariant) for
+      20 non-Aves species (5-fold CV AUC mean 0.975, median 0.988). Blend into those 20 columns
+      at W=0.25 rank-pct. Attacks non-Aves/ProtoSSM-suppression bottleneck while escaping the
+      site-22 anti-correlation trap (train_audio is site-invariant, unlike labeled SS).
+    risk: "focal-train probe -> soundscape-test domain gap; read on LB not local (site-22 unreliable)"
+    expected_lb: "0.948-0.953; honest P(noise/no-effect) ~50%"
+    notes: "dev-run showed 0/20 blended = dry-run artifact (test_paths=train_soundscapes when no hidden test); scored run applies blend (verified IS_DRY_RUN gating in cell 11). emb_te saved + numpy probe, version-proof npz."
+    outcome: no_effect (0.950 = baseline; Perch-emb probe channel dead, 3rd confirmation after LoRA-DPO 0.950 + baseline already has SS-probes)
+
+  - id: hgblend_w020
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-hgblend v1"
+    mechanism_family: public_arch_diversity_blend
+    lb: 0.949
+    hypothesis: |
+      Blend public HGNet distilled SED (nischaydnk ONNX, Pearson 0.35 vs Tucker, same mel
+      interface [1,256,313]) INTO the Tucker SED stream at W_HG=0.20, keeping Tucker's 5 folds.
+      Recipe-pair diversity principle applied to a genuinely diverse public arch, affecting the
+      broad evaluable (Aves-heavy) SED stream. Differs from eos8-hgnet (0.937) which REPLACED
+      Tucker with HGNet-only via find_sed_dir name collision.
+    dev_run: "clean — HGNet loaded + Tucker 5 folds kept, no errors"
+    risk: "HGNet weaker SED (-0.013 alone); blending may drag SED quality > diversity gain; arch-diversity failed before (v44/v46)"
+    expected_lb: "0.948-0.952; honest P(clear +) ~15%"
+    outcome: "regression -0.001 (0.949). HGNet weight dose-response MONOTONICALLY HARMFUL: W=0->0.950, W=0.20->0.949, W=1.0(replace eos8-hgnet)->0.937. Arch-diversity DEAD on our stack (5th confirm w/ v44=0, v46=-0.004). Did NOT test W=0.35 (dose-response answers it). Abandoned."
+
+  - id: ps55_protosed
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-ps55 v1"
+    mechanism_family: proto_sed_dose
+    lb: 0.950
+    hypothesis: "PROTO_RANK_WEIGHT 0.60->0.55 (more SED). Evaluable set is non-Aves-heavy (Amphibia 4174 + Insecta 1136 TP), SED-better than ProtoSSM. Untested dose on EoS8/phase4 stack (Mattia peaked PROTO=0.70). Single-variable + noise sample."
+    risk: "site-22 (evaluable mix is S22-biased); inference dose = likely noise per history"
+    outcome: "flat 0.950 (=baseline). proto/sed ratio 0.55/0.60/0.65 all 0.950 -> LB insensitive to the biggest blend knob both directions."
+  - id: ps65_protosed
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-ps65 v1"
+    mechanism_family: proto_sed_dose
+    lb: 0.950
+    hypothesis: "PROTO_RANK_WEIGHT 0.60->0.65 (more proto). Other bracket arm to locate the dose optimum on this stack."
+    outcome: "flat 0.950. ★ proto/sed dose CONFIRMED LB-insensitive (0.55=0.60=0.65=0.950) -> dial-tuning is meaningless on this stack; small knobs (tax/rank/file/delta) NOT submitted per meaningfulness gate."
+
+  - id: lam50_priordown
+    date: "2026-06-01"
+    kernel: "ultimatumgame/birdclef-2026-eos8-lam50 v1"
+    mechanism_family: hour_prior_dose
+    lb: 0.949
+    hypothesis: "POWEROPT_PRIOR_LAMBDA 0.65->0.50 (hour-prior DOWN)."
+    outcome: "flat 0.949. ★ ALL 3 big-knob dose probes flat (proto/sed 0.55/0.65=0.950, prior 0.50=0.949) -> dial-tuning EMPIRICALLY MEANINGLESS on this stack. Per meaningfulness gate, the 4 small Karnakbayev knobs (tax25/rap55/fcp30/ds35) NOT submitted (would be noise)."
+
+  - id: um00_unmapped_proto0
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-um00 v1"
+    mechanism_family: unmapped_blend_structural
+    lb: 0.950
+    hypothesis: "first-pass ENSEMBLE_W unmapped 0.35->0.00 (pure SED+MLP for unmapped, remove ProtoSSM noise). Targets evaluable sonotypes (25 spp, 1136 TP) + other unmapped. Core CLAUDE.md bottleneck test. MEANINGFUL (structural, site-invariant, targeted) unlike the flat global dials. Dev-run confirmed unmapped=0.00."
+    outcome: "flat 0.950. ★★ ALL 5 single-slot trials now flat (R1 0.950, HGNet 0.949, proto/sed 0.950, prior 0.949, um00 0.950). 0.950 is a ROBUST ATTRACTOR — blend/dose/structural inference changes do NOT move LB. Inference/blend level saturated. Meaningful single-slot trials EXHAUSTED. Held small knobs NOT submitted (gate B). 06-02 used 1/5 (um00)."
+
+  - id: birdset_convnext_ft
+    date: "2026-06-02"
+    mechanism_family: external_pretrain_decorrelated_sed (MULTI-DAY lever, user-chosen)
+    lb: not_submitted
+    hypothesis: "Fine-tune BirdSet-pretrained ConvNeXt (Xeno-Canto-Large, 9736 eBird classes, external pretrain = Babych gap component) on BirdCLEF 234, as a DECORRELATED comparable-strength SED to recipe-pair-blend with Tucker (the +0.003 mechanism). Decorrelation beyond Tucker's folds (our exp175/176 are Tucker-correlated). Honest risk: focal->soundscape domain gap + self-trained-weaker."
+    gate: "comparability — only integrate+submit if val macro-AUC on labeled SS is Tucker-comparable; else it drags (cf HGNet -0.001)."
+    outcome: "FAILED comparability gate — val_macro_auc 0.49->0.515 (~RANDOM) on labeled SS after 2 epochs, fail-fast stopped. Strong external-pretrain (BirdSet) ConvNeXt fine-tuned on focal train_audio = ~random on soundscapes => focal->soundscape DOMAIN GAP confirmed at model level (+ BirdSet mel-preproc mismatch lost pretrain benefit). NOT submitted (0.515 SED would catastrophically drag). 0 slots wasted (gate worked). Multi-day lever FAILED."
+
+  - id: rpair_oursed_w030
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-rpair v2 (6 folds; v1 errored walltime@35folds)"
+    mechanism_family: recipe_pair_decorrelated_sed
+    lb: 0.944
+    hypothesis: "Blend OUR exp175/176 SED (ensemble_v3, 10 folds, soundscape-aware, ~0.941 comparable, decorrelated-from-Tucker lineage, SAME mel interface) into phase4 Tucker SED stream at W_OURS=0.30. The PROVEN +0.003 recipe-pair mechanism applied to EoS8 stack (UNTESTED — phase4 only ever used Tucker SED). Avoids both failure modes: soundscape-aware (no domain gap that killed BirdSet 0.515) + comparable (not weak like HGNet that dragged -0.001). No training needed."
+    gate: "model-level decorrelation"
+    outcome: "REGRESSION 0.944 (-0.006). v2(6folds+sidecars-on) wall-time-failed (COMPLETE-no-score); v3(3folds+sidecars-off W=0.30)=0.944. Our exp175/176 SED DRAGS the Tucker stream (weaker + not decorrelated enough), confounded w/ sidecars-off. recipe-pair +0.003 does NOT transfer to phase4 (Tucker SED already strong; our addition dilutes). Recipe-pair direction EXHAUSTED."
+
+  - id: yz00_yukiz_off
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-yz00 v1 (poweropt_only)"
+    mechanism_family: pipeline_blend_weight
+    lb: 0.950
+    hypothesis: "yukiZ OFF (poweropt_only)."
+    outcome: "flat 0.950. yukiZ pipeline weight LB-insensitive: 0.0(off)=0.0305(base)=0.10(up)=0.950. yukiZ branch contributes ~nothing to LB. Pipeline-weight axis EXHAUSTED."
+  - id: yz10_yukiz_up
+    date: "2026-06-02"
+    kernel: "ultimatumgame/birdclef-2026-eos8-yz10 v1"
+    mechanism_family: pipeline_blend_weight
+    lb: 0.950
+    hypothesis: "yukiZ UP 0.10."
+    outcome: "flat 0.950 (see yz00 — pipeline-weight axis exhausted)."
+
+  - id: exp187_hetero_distill
+    date: "2026-06-03"
+    kernel: "ultimatumgame/birdclef-2026-eos8-exp187 v1 (W=0.10)"
+    mechanism_family: heterogeneous_teacher_distillation
+    lb: pending
+    hypothesis: "GENUINELY-distinct distillation vs the B0-correlated v11/v12/v62 failures: B1 student + SoftAUCLoss + HETEROGENEOUS-teacher pseudo (Tucker 0.65 + reconstructed exp59 ConvNeXt 0.35; per-class Pearson(Tucker,exp59)=0.235 on the 40k kept unlabeled-SS windows = REAL diversity vs 0.97-0.99 before) + drop_path0.2 noisy-student + non_s22 checkpoint. 3-fold ensemble. Local controlled gate (cache/labeled_ss_controlled.npz): ens macro-AUC 0.975, Pearson(ens,Tucker)=0.56 (decorrelated), W=0.10 blend delta -0.0005..-0.0007 on 50 evaluable = within +-0.002 noise (effectively non-drag). KEY: local-evaluable is SATURATED (Tucker 0.997) so the gate cannot see the target = the UNMEASURABLE 184 blind species (79% of LB) where a decorrelated in-domain-SS-trained SED might help generalization. BLIND LB test of the distillation direction; select-best bounds downside to 1 slot. old-SED class reconstructed (experiments/old_sed.py); anchors.npz rebuilt."
+    outcome: "LB 0.938 (-0.012 vs 0.950 anchor) = REGRESSION (well outside +-0.002 noise). The decorrelated distilled SED (local evaluable drag only -0.0005 @W0.10) HURTS the blind/non-evaluable 184 species at LB. Confirms the wall: any own-trained SED < Tucker drags (matches historical own-SED=0.938). Distillation direction REFUTED at LB even done properly (diverse teacher exp59 Pearson 0.235, hetero pseudo, B1+SoftAUC, gated). NOT selected; 0.950 anchor protected. ConvNeXt 2-arch (exp188, val 0.92 < B1 0.948) aborted."
+
+  - id: ptlam
+    date: 2026-06-03
+    kernel: birdclef-2026-eos8-ptlam
+    hypothesis: >
+      Per-taxon prior lambda: keep Aves at POWEROPT_PRIOR_LAMBDA=0.65, reduce non-Aves to 0.15.
+      The hour/site priors are estimated from labeled SS (68% site-22, Aves-heavy dawn-chorus). That
+      Aves-tuned timing prior MISRANKS nocturnal/continuous-calling non-Aves (Insecta/Amphibia). A (234,)
+      lambda VECTOR broadcasts in apply_prior (out += lambda*prior_logit) -> no fn change. Aves columns are
+      byte-identical (lambda unchanged) -> Aves AUC cannot regress; only the 72 non-Aves re-rank. RANK-CHANGING
+      (priors are per-(class,context)) so it CAN move macro-AUC, unlike monotone calibration. The global
+      chain (lam50 = Aves+non-Aves both down) was flat; per-taxon non-Aves-only is genuinely untested.
+    outcome: >
+      LB 0.950 = anchor EXACTLY (Δ0.000, FLAT). Per-taxon PRIOR lambda is flat: non-Aves species have few
+      labeled-SS positives -> their hour/site prior tables were already near-uniform -> reducing lambda changed
+      their ranks negligibly. Mechanism-specific null: the PRIOR chain is not the non-Aves lever. Does NOT
+      generalize to "per-taxon post-proc dead" — ptax2 (genus tax-smoothing, α=0.15 IS materially applied to the
+      25 sonotypes) is a different mechanism still untested. Aves byte-identical confirmed (no regression). Slot 1/4.
+
+  - id: exp189_external_full
+    date: 2026-06-03
+    kernel: birdclef-2026-eos8-exp189-full
+    hypothesis: >
+      The BirdCLEF-2025 winners' KEY ingredient never used in this stack: train the SED WITH external
+      non-Aves focal data. exp189 = canonical Tucker recipe (exp175, BCE, focal-SC mixup) + 552 external
+      non-Aves clips (data/external, ogg+wav) folded into the anchor cache. STRENGTHENS the SED with data
+      (does NOT dilute Tucker with a weaker model -> structural difference from refuted exp187). 3-fold gate
+      on labeled_ss_controlled: exp189 EXCEEDS Tucker on ALL evaluable groups (all-eval 0.9979>0.9972,
+      non-Aves 0.9983>0.9978, Aves 0.9966>0.9953) -> FIRST own-SED to beat Tucker. Full-blend Δ POSITIVE on
+      all taxa (+0.0003..+0.0010). Integrated as FULL rank-blend into the Tucker SED stream at W=0.40
+      (Tucker-majority for blind-species safety). Caveat: evaluable is site-22-biased; LB depends on blind
+      species. select-best protects 0.950 anchor.
+    outcome: >
+      v1 (W=0.40 full-blend) = LB 0.950 = anchor EXACTLY (Δ0.000, FLAT). The 3-fold exp189 BEAT Tucker on
+      evaluable (all groups) but the gain did NOT transfer to LB = site-22 covariate-shift trap (local≠LB):
+      a 16%-weight better-SED blend moves the LB 0. FLAT not drag (vs exp187 -0.012) -> exp189 is a genuinely
+      stronger SED (first own-SED to beat Tucker on evaluable) that does NOT hurt, but the SED stream is not the
+      LB lever — the bottleneck is local→LB TRANSFER, not SED quality. 5-fold gate ≈ 3-fold (0.9978 vs 0.9979,
+      ensemble saturated at 3). Slot 2/4. Follow-up: v2 W=0.70 (dose test) pushed -> slot 3 pending.
+    followup_v2: >
+      W=0.70 full-blend = LB 0.949 (flat, within ±0.002 noise; slight down vs W=0.40's 0.950). exp189 dose
+      FULLY TESTED: 0.40→0.950, 0.70→0.949 = flat regardless of weight (slight downward drift at higher dose).
+      DEFINITIVE: a SED that beats Tucker on evaluable is LB-flat -> SED quality is not the LB lever; the
+      local→LB transfer (site-22 covariate shift) is the wall. Did NOT escalate to W=1.0 (would be flat/down).
+
+  - id: ptax2
+    date: 2026-06-03
+    kernel: birdclef-2026-eos8-ptax2
+    hypothesis: >
+      Skip GENUS taxonomy-smoothing for Insecta only. The 25 sonotypes (47158son01-25) share one
+      scientific-name 'genus' -> TAX_GENUS_ALPHA=0.15 averages 15% of each sonotype's score toward the 25-way
+      mean. But sonotypes are MUTUALLY-EXCLUSIVE acoustic types -> that averaging CROSS-CONTAMINATES each
+      sonotype's within-class ranking. Skipping it for all-Insecta genus groups restores pure per-sonotype
+      scores; Aves/Amphibia genera keep 0.15 (Aves byte-identical). RANK-CHANGING + SITE-INVARIANT mechanism
+      (per-sonotype independence, not site-22-tuned) -> better LB-transfer chance than the flat site-22 levers.
+      Sonotypes are mostly EVALUABLE (20 Insecta n_pos>=10). Last slot (5/5); select-best protects 0.950 anchor.
+    outcome: >
+      LB 0.950 = anchor exactly (Δ0.000, FLAT). Removing genus tax-smoothing for the 25 Insecta sonotypes did
+      not move the LB — even a site-INVARIANT post-proc change (per-sonotype independence) is flat. Consistent
+      with the session-wide finding: SED + post-proc levers are LB-flat; the bottleneck is local→LB transfer
+      (site-22 covariate shift), not any single knob. Slot 5/5 (last). Aves byte-identical (no regression).

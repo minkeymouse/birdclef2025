@@ -1,7 +1,9 @@
 % BirdCLEF+ 2026 — Working Notes
-% Last updated: 2026-04-27
-% Production: v33 LB 0.932
-% Total LB submissions: 21 over ~2 months
+% WARNING: This file is STALE past ~line 50. Last substantive update: 2026-05-08.
+% Current production (2026-05-26): kojimar fork = LB 0.949 (all public components).
+% Own-weights best: v_kojimar_lever1 = LB 0.945.
+% Paper deadline: 2026-06-17. Comp deadline: 2026-06-03.
+% Content below v12 is accurate; v17+ was never ported here. See CLAUDE.md for current state.
 %
 % =====================================================================
 % EXECUTIVE SUMMARY
@@ -3392,3 +3394,1350 @@ pushed past us) shows the public LB is already commodity at 0.94+.
 The remaining lever family for top-100 LB is in-house SED training
 plus non-Aves data acquisition --- the same data engineering work that
 should have been done four months ago.
+
+
+% =====================================================================
+% SECTION: Silent Drift Discovery + Q-test Program (2026-05-08)
+% =====================================================================
+
+\section{Silent Drift in Fork-Based SED Development (2026-05-08)}
+
+After v22's regression (LB 0.937) confirmed that grafting Ulyanov's
+0.945 blend onto our exp174a SED gave no improvement, we performed a
+systematic audit of what Tucker's training notebook actually specifies
+versus what every one of our SED scripts (exp169 through exp175) was
+doing. The audit surfaced a $\sim 0.003$ LB gap explanation: we had
+been carrying multiple silent deviations from Tucker's recipe for five
+weeks via fork-based copy-paste.
+
+\subsection{The drift catalogue}
+
+Tucker's published training notebook uses
+\texttt{tf\_efficientnet\_b0.ns\_jft\_in1k} as backbone with
+\texttt{drop\_path\_rate=0.1} and \emph{no} \texttt{drop\_rate}.
+Our exp169 script (the source of the drift chain) constructs the
+backbone with \texttt{drop\_rate=0.1, drop\_path\_rate=0.1} --- i.e.,
+adds an extra dropout layer Tucker does not have. Subsequent scripts
+(exp169v2, exp170, exp171, exp172, exp173, exp174a, exp174b) all
+inherited this via \texttt{cp exp169.py exp170.py} or via importing
+\texttt{from exp171\_tucker\_exact import DistilledSED, ...}. Eight
+scripts in total carrying the same silent bug.
+
+A second silent drift: Tucker initializes the attention/classification
+heads (\texttt{att}, \texttt{cla}) with
+\texttt{xavier\_uniform\_(weight)} and \texttt{bias.fill\_(0.)}.
+Our scripts left these at PyTorch's default Conv1d initialization
+(Kaiming-like). All eight scripts.
+
+A third drift: Tucker's checkpoint-selection metric is
+\texttt{non\_s22\_macro\_auc} on the held-out fold's labeled-SS files
+\emph{excluding S22 site}. We use \texttt{val\_ss} (all sites
+included), or for exp169v2 even the wrong metric \texttt{val\_ta}
+(train\_audio val). All scripts.
+
+A fourth drift, structural rather than numerical: Tucker holds out a
+different SS subset per fold (1/5 of files, rotating). We hold out a
+fixed 11 files across all folds. With 88\% of SS files always in
+training, our model learns those distributions; with 12\% always in
+eval, our val\_ss estimate is anchored to the same 11 files. But more
+critically, several rare classes (\texttt{47158son05},
+\texttt{strher2}, \texttt{25073}, \texttt{47158son14}-\texttt{20}) have
+all their positive examples concentrated in those 11 files,
+meaning our SED \emph{never sees positive supervision for them}
+during training. Tucker's per-fold split exposes each rare class to
+training in 4 of 5 folds.
+
+\subsection{Refactor: \texttt{experiments/sed/} package}
+
+To prevent recurrence, all SED training infrastructure was consolidated
+into a single \texttt{experiments/sed/} package:
+
+\begin{itemize}
+\item \texttt{tucker\_spec.py}: a frozen \texttt{TuckerSpec} dataclass
+with all 62 canonical hyperparameters as the source of truth.
+
+\item \texttt{config.py}: \texttt{SedConfig} dataclass + pre-canned
+configs (\texttt{tucker\_canonical}, \texttt{exp169\_legacy} (which
+explicitly documents the 8 historical drifts as \texttt{SedConfig}
+fields), \texttt{exp175\_tucker\_actually}, \texttt{exp176\_per\_fold\_ss}).
+Each config has a \texttt{diff\_from\_tucker()} method that returns
+its deviations from the canonical reference.
+
+\item \texttt{silent\_drift\_check.py}: a static-analysis tool that
+greps every legacy SED script and every pre-canned config for
+deviations from \texttt{TuckerSpec}, printing a per-script and
+per-config diff table. CI-style: run before any new SED training.
+
+\item Single \texttt{model.py} (replaces 10 duplicates),
+\texttt{data.py} (replaces $\sim 10$), \texttt{train.py}, \texttt{export.py},
+\texttt{deploy.py}.
+
+\item \texttt{notebook\_state.py}: a declarative
+\texttt{NotebookState} dataclass with \texttt{apply\_state()} for
+idempotent notebook patching, replacing six previously-existing
+stateful patch scripts (\texttt{exp169\_patch\_notebook},
+\texttt{exp170\_add\_konbu\_head}, etc.).
+\end{itemize}
+
+The 27 archived SED scripts are preserved verbatim in
+\texttt{experiments/\_archive\_2026\_pre\_sed\_refactor/} with a README
+mapping each file to its \texttt{sed/} replacement.
+LOC reduction: $5{,}722 \to 1{,}748$ ($\sim 70\%$).
+
+\subsection{exp175 and exp176: closing the drift one variable at a time}
+
+\textbf{exp175\_tucker\_actually} fixes \texttt{drop\_rate} and
+\texttt{ATT\_CLA\_INIT} but retains the legacy \texttt{EVAL\_SS\_N\_FILES=11}
+and \texttt{CHECKPOINT\_CRITERION=val\_ss}. Trained 5-fold seed=42
+overnight 2026-05-08. Compared on full labeled-SS via mel inference
+against Tucker's published fold0:
+
+\begin{tabular}{lcc}
+& Macro AUC (75 valid cls) & $\Delta$ vs.\ Tucker \\\hline
+Tucker fold0 (public) & 0.9868 & --- \\
+Ours exp175 fold0     & 0.9831 & $-0.0037$
+\end{tabular}
+
+The $-0.0037$ local gap matches the persistent $-0.003$ LB gap to
+within stochasticity. Per-class breakdown: Tucker dominates strongly on
+rare classes ($\Delta > +0.05$ on \texttt{strher2}, \texttt{47158son05},
+\texttt{nacnig1}, \texttt{74113} --- all of which have $\le 11$ training
+positives). Our SED dominates only on \texttt{47158son01},
+\texttt{22961}, and \texttt{trsowl} --- classes where SS\_train has
+many positives that the fixed 11-file holdout did not exclude.
+
+\textbf{exp176\_per\_fold\_ss} fixes the third drift
+(\texttt{EVAL\_SS\_N\_FILES=None} = per-fold SS rotation, Tucker-correct).
+Trained 5-fold seed=42 starting after exp175 completed.
+Hypothesis: closing this drift specifically improves rare-class supervision
+because every SS file (and therefore every rare-class positive) is now
+in 4 of 5 fold training sets rather than always held out.
+
+\subsection{Q-test program: pre-pseudo subset diagnostics}
+
+Before committing to a $\sim 5$h pseudo-iteration retrain, we use 4
+LB slots to learn which class subsets are net positive vs.\ negative
+on macro AUC, by zeroing out subset columns at submission time. Macro
+AUC is per-class binary classification, so column-replacement to a
+constant 0.5 gives AUC$=0.5$ for those classes. Macro AUC drops by
+$(\text{true\_AUC} - 0.5) \times \text{subset\_fraction}$.
+
+\begin{itemize}
+\item \textbf{Q1 (v23)}: drop all 28 Insecta classes (12\% of macro).
+\item \textbf{Q2 (v24)}: drop all 35 Amphibia classes (15\%).
+\item \textbf{Q3 (v25)}: drop 42 rare classes ($n_{\text{train\_audio}} < 5$, 18\%).
+\end{itemize}
+
+LB results $\Delta$ vs.\ anchor (v5 = LB 0.938):
+\begin{itemize}
+\item Q1 $\Delta < 0$: Insecta predictions are net positive on hidden
+test. Pseudo iteration should prioritize Insecta supervision.
+\item Q1 $\Delta > 0$: Insecta predictions are net negative.
+val--LB anti-correlation manifests at the Insecta-class level. Exclude
+Insecta from pseudo.
+\item Same logic for Q2/Q3.
+\end{itemize}
+
+Numerical results:
+
+\begin{tabular}{lccccc}
+Test & v26 (Q1) & v27 (Q2) & v28 (Q3) & v30 (exp175) & v32 (exp176) \\
+LB ($\Delta$ vs 0.938) & 0.8810 ($\Delta{-0.057}$) & 0.8340 ($\Delta{-0.104}$) & 0.8370 ($\Delta{-0.101}$) & 0.9370 ($\Delta{-0.001}$) & 0.9370 ($\Delta{-0.001}$) \\
+\end{tabular}
+
+
+\subsection{Implications for the working note}
+
+Five weeks of SED-recipe iteration mostly debugged the wrong variable.
+The recipe difference between exp169 and exp175 is a single hidden
+\texttt{drop\_rate=0.1} that was carried forward unconsciously by
+\texttt{cp}-based development. The infrastructure failure was the
+absence of a canonical spec to diff against; the methodological
+failure was treating ``recipe replication'' as a flat list of named
+hyperparameters rather than a verified bit-equivalent transcription.
+
+The Q-test program is a small structural contribution: \emph{by using
+the LB itself as the validator for which class-subset signals
+transfer}, we sidestep the val-LB anti-correlation that prevented all
+labeled-SS-based selection from working. The cost is up to 4 LB slots,
+but the result directly informs whether pseudo iteration should
+prioritize Insecta, Amphibia, rare-class supervision, or none.
+
+
+\section{Public Notebook Audit: Search for Untried LB Levers (2026-05-09)}
+
+\subsection{Motivation}
+
+After confirming Tucker recipe replication is exhaustive (\S\ref{tucker_match})
+and that recipe-level fixes do not move LB beyond noise (exp175/exp176
+both 0.937, $\Delta -0.001$), we conducted a systematic audit of the
+top eight publicly available BirdCLEF 2026 notebooks (by vote count) to
+identify any technique we had not yet tried.
+
+\subsection{Notebooks examined}
+
+\begin{itemize}
+\item \texttt{dingjiarun/pantanal-distill-birdclef2026-onnx} (703 votes) — base structure
+\item \texttt{marynaborovska/birdclef-26-two-pass-ssm-advanced-pp} (341) — advanced PP
+\item \texttt{vyankteshdwivedi/birdclef-2026-onnx-perch-sequence-modeling} (338) — Mattia origin
+\item \texttt{ulyanovantonamaranta/birdclef-2026-gate-fake008-head0015} (307) — Ulyanov 0.945
+\item \texttt{hideyukizushi/bird26-reproduce-perch-protossm-resssm-inf-train} (233) — yukiZ
+\item \texttt{needless090/birdclef-2026-iter-pseudo-perch-sed-lb-0-934-s} (221) — quintet SED
+\item \texttt{ttahara/birdclef-2026-hgnetv2-b0-baseline-training} (163) — HGNet backbone
+\item \texttt{cliff376/bc26-public-gate-combo-pc010-v2} (150) — Mattia 0.941 verbatim
+\item \texttt{konbu17/bird26-wliilamsam-0943-with-train-audio-head} (119) — train\_audio head
+\end{itemize}
+
+\subsection{Techniques already in our Mattia fork}
+
+The following inference-time techniques are present in our notebook
+(\texttt{birdclef-2026-mattia-fork/notebook.ipynb}):
+
+\begin{itemize}
+\item Genus proxy logits for unmapped species (cell 10)
+\item Site / hour priors with shrinkage on logit scale, $\lambda = 0.4$ (cell 17)
+\item Per-taxon temperature scaling: Insecta/Amphibia $T = 0.95$, Aves $T = 1.10$ (cell 19)
+\item Isotonic regression + per-class F1 thresholds (cell 23)
+\item TTA via circular window shifts $\{0, \pm 1, \pm 2\}$ (cell 28)
+\item Top-$k$ file confidence scaling, rank-aware scaling, adaptive delta smoothing (cells 18/24/25)
+\item LightProtoSSM + ResidualSSM second-pass error correction (cells 27, 29)
+\item Vectorized MLP probes per species (cells 21, 22)
+\item Three-stage rescue blend: \texttt{fake\_only}, \texttt{proto\_continuity} ($\pm 3$
+window $t$-distribution), \texttt{sed\_only} (cell 39)
+\end{itemize}
+
+The Maryna ``advanced PP'' technique set is fully present in our notebook.
+There is no missing inference-time post-processing lever among the
+examined public notebooks.
+
+\subsection{Untried techniques}
+
+Three categories of untried techniques emerged:
+
+\paragraph{Inference-time (no retraining).}
+
+\begin{enumerate}
+\item \textbf{Sonotype mirroring} (Public 0.934, needless090).
+Hand-coded class-grouping for 10 anonymous Insecta sonotype labels:
+
+\texttt{("47158son15","47158son16")}, \texttt{("47158son09","47158son12")},
+\texttt{("47158son02","47158son14")},
+\texttt{("47158son13","47158son21","47158son22","47158son23")}.
+
+For each group, $\text{prob}_{\text{group}} \leftarrow \max_g \text{prob}_g$.
+Mechanism: classes within a group are likely indistinguishable acoustic
+signatures. Maximizing within-group raises the per-class AUC by allowing
+detection of any group member to support all members. The Q-test
+program (\S 5) confirmed Insecta is a high-AUC subset (mean $\sim 0.97$),
+so any Insecta-specific lever has high marginal utility.
+
+\item \textbf{konbu train\_audio head + simple 3-way (no rescues)}
+(\texttt{konbu17}, claims 0.943). Linear probe
+$\hat{y} = \sigma(W \cdot e_{\text{Perch}} + b)$ trained on
+\texttt{train\_audio}, then blended at 50\%/35\%/15\%
+ProtoSSM/SED/Head with the three Mattia rescues \emph{removed}. We
+attempted this with rescues kept (v6) and regressed $-0.005$. The
+single-variable difference (rescues removed) is untried.
+\end{enumerate}
+
+\paragraph{Training-time.}
+
+\begin{enumerate}
+\setcounter{enumi}{2}
+\item \textbf{5-scheme SED quintet} (Public 0.934). Train five SED
+checkpoints with different loss families: focal, BCE on seeds 1-2-3,
+BCE on seeds 4-5-6, pseudo iteration 1, pseudo iteration 2; combined
+with two backbones (B0, B3). Total: 10 SED ckpts. Diversity beyond
+multi-seed is the explicit design goal.
+
+\item \textbf{Mixup + CutMix hybrid} (Public 0.934 cell 8).
+\texttt{cutmix\_prob = 0.3} with time-axis cut on Perch embeddings.
+We currently use Mixup only (Tucker recipe).
+
+\item \textbf{HGNetV2-B0 backbone} (\texttt{ttahara}). Different backbone
+family from EfficientNet (HGNet's hierarchical token aggregation
+vs. EffNet's compound scaling). Backbone-family diversity at SED level.
+\end{enumerate}
+
+\subsection{Three narrowed candidates}
+
+We narrow to three candidates ranked by risk and falsifiability:
+
+\paragraph{Path A: Sonotype mirroring (Tier 1).}
+Risk LOW. Cost: 5-line notebook patch. Falsifiable: 1 LB submission.
+Expected $\Delta$ LB: $+0.001$ to $+0.005$ if our predictions for the
+10 Insecta sonotypes are noisy and grouping rescues borderline-positive
+cases.
+
+\paragraph{Path B: 5-scheme SED quintet (Tier 2).}
+Risk MEDIUM. Cost: 5--7 GPU days for 5 schemes $\times$ 5 folds. The
+pseudo iteration scheme has prior failure (v3 LB $-0.018$ from circular
+distillation), so we constrain to 2 schemes initially (focal + ce\_s123)
+to test diversity gain before expanding.
+
+\paragraph{Path C: konbu head + simple 3-way no rescues (Tier 3).}
+Risk MEDIUM. Cost: 30-min Kaggle re-run. Single-variable test of the v6
+regression hypothesis (rescues over-correct when head is added). If the
+hypothesis holds, $\Delta$ LB $> 0$; if rescues are not the issue,
+$\Delta < 0$ confirms the head itself is the regression source.
+
+\subsection{Bottleneck identification}
+
+The real bottleneck is not recipe-level Tucker replication (which is
+verified complete) and not inference-time post-processing (which the
+Mattia stack covers exhaustively). The remaining axes are:
+
+\begin{enumerate}
+\item Random seed luck $\to$ multi-seed ensemble (currently training).
+\item Class-group structure $\to$ sonotype mirroring (Path A).
+\item Training data + architecture diversity $\to$ 5-scheme quintet (Path B).
+\item Foundation model swap $\to$ AudioMAE failed; BirdNET / BEATs unexplored.
+\end{enumerate}
+
+The 0.951+ scorers on the public LB likely combine items 1, 3, and 4 at
+scale. The top score (0.959) probably involves all four.
+
+
+
+\subsection{BirdCLEF 2025 1st place: Multi-Iterative Noisy Student}
+
+The 2025 1st place winner (Nikita Babych) is currently positioned at
+2026 LB rank 4 with score 0.955, providing strong evidence for which
+techniques carry across the 2025/2026 task formulations (both 5-second
+multi-label macro-AUC, both Brazilian/Colombian neotropical
+soundscapes, Pantanal in 2026 vs.\ Middle Magdalena in 2025).
+
+Their disclosed stack:
+
+\begin{enumerate}
+\item \textbf{Architecture ensemble}: EfficientNet-L0, B4, B3 + RegNetY-016
++ RegNetY-008 + B0 (separately trained for amphibians and insects).
+Cross-family diversity.
+\item \textbf{SoftAUCLoss}: pairwise log-loss
+$\mathcal{L}_c = \mathbb{E}_{i: y_i = 1, j: y_j = 0}
+[\log(1 + e^{-(s_i - s_j)/T})]$
+directly optimizing AUC. Resistant to overfitting and supports soft labels.
+\item \textbf{Multi-iterative noisy student}: 4 rounds. Round 1 trains
+10 models on labeled portion; pseudo-labels generated for unlabeled
+soundscapes; round 2 trains on combined dataset; repeat.
+\item \textbf{External data}: +5,489 birds from Xeno Archive, +17,197
+insect/amphibian samples for ``other'' classes.
+\item \textbf{Power scaling}: monotonic transform of probabilities to
+sharpen ranking.
+\item \textbf{Separate insect/amphibian pipeline}.
+\end{enumerate}
+
+LB progression: baseline 0.872 $\to$ +pseudo 0.898 $\to$ +power scaling
++ more pseudo 0.930 $\to$ +separate insect/amphibian 0.933.
+
+\subsection{Implications for our pipeline}
+
+Two of the three techniques in the 1st place stack we have NOT tried
+in BirdCLEF 2026: SoftAUCLoss and multi-iterative noisy student with
+diverse teacher ensemble. Our memory notes earlier failures of
+DPO, focal, and contrastive losses, all variant-of-BCE; SoftAUCLoss
+is structurally different in that it directly minimizes the same
+quantity that the macro-AUC metric maximizes.
+
+Our pseudo-iteration v3 attempt regressed $-0.018$ LB. Examining the
+failure mode: pseudo source = single v33 model = circular distillation.
+The 1st place approach uses a 10-model ensemble teacher for pseudo
+generation, which averages out single-model site-fingerprint
+memorization. Our current 25-checkpoint multi-seed ensemble is
+larger than 10 and could plausibly serve the same teacher role.
+
+\subsection{Three narrowed candidates (final)}
+
+\paragraph{Path A: Sonotype mirroring (immediate, low-risk).}
+Implement \texttt{lib/sonotype\_mirror.py} as a lightweight notebook
+addition. Cost: 30 minutes. Falsifiable in 1 LB submission.
+
+\paragraph{Path B: SoftAUCLoss SED retrain.}
+Add \texttt{LOSS\_FAMILY = "softauc"} flag to \texttt{SedConfig};
+\texttt{exp178\_softauc()} pre-canned config replicates exp175
+geometry with single-variable change. Implementation in
+\texttt{model.softauc\_loss()}: pairwise softplus-of-difference
+masked by $y_i \cdot (1 - y_j)$ outer product within batch, mean over
+valid pairs per class, mean over classes. Cost: 1--2 GPU days.
+Falsifiable: train 2 folds, evaluate per-class macro AUC on labeled SS
+vs.\ exp175 BCE-trained twins. If $\Delta < +0.003$, abort.
+
+\paragraph{Path C: Multi-iterative noisy student.}
+Use the 25-checkpoint ensemble (current chain output) as the noisy-
+student teacher. Generate pseudo-labels on all 10,658 unlabeled
+soundscapes; filter by \texttt{prob > 0.5 AND ensemble\_agreement > 0.7}
+with per-class caps to prevent imbalance. Train new SED on combined
+dataset. Round 2 if Round 1 LB $\geq$ 0.940. Cost: 2--3 GPU days.
+
+\subsection{Why these three?}
+
+These align with 1st-place 2025 evidence (B and C), with one
+inference-time technique (A) for fast sanity validation. Risk
+spectrum: A (very low) $\to$ B (moderate, single-recipe deviation)
+$\to$ C (moderate, mitigates v3 circularity via ensemble teacher).
+The total LB-slot budget for testing all three is 3--5 submissions, fitting
+within a single day's competition rate limit.
+
+
+\subsection{Two more sub-paths discovered (2026-05-09 03:30)}
+
+After deeper inspection of two more public notebooks, two additional
+sub-paths emerged:
+
+\paragraph{Path D: Frame $>$ Clip fusion.}
+Source: \texttt{youssef\_abukhalifa/edits-on-birdclef-protossm-efficientnet-sed}
+cell 2. Tucker default fuses SED clip and frame outputs equally:
+\[
+\text{prob} = 0.5 \cdot \sigma(\text{clip\_logits}) + 0.5 \cdot \sigma(\text{frame\_max})
+\]
+The youssef edit changes this to $0.35 \cdot \sigma(\text{clip})
++ 0.65 \cdot \sigma(\text{frame\_max})$. Rationale: frame\_max captures
+temporal precision (which 5-second sub-window fires) which is more
+discriminative than clip-level aggregate for taxa with strong temporal
+peaks (insect calls, frog choruses). Tucker's 0.5/0.5 may be too
+clip-heavy.
+
+Cost: 1-line change in notebook cell 37. Inference-time only.
+This is a Path A.5 — sub-Path A in priority but trivial to test.
+
+\paragraph{Path E: Per-taxon prior $\lambda$ + smoothing $\sigma$.}
+Source: \texttt{yuriygreben/birdclef-26-protossm-mlp-ensemble-perch-v2}.
+Yuriy's CFG uses different hyperparameters for ``texture'' (Insecta,
+Amphibia) and ``event'' (Aves) taxa:
+\begin{itemize}
+\item $\lambda_{\text{event}} = 0.4$, $\lambda_{\text{texture}} = 1.0$ for site/hour priors
+\item $\sigma_{\text{event}} = 0.15$, $\sigma_{\text{texture}} = 0.35$ for delta-smoothing
+\item $\lambda_{\text{proxy\_texture}} = 0.8$ for genus proxies
+\end{itemize}
+
+Mechanism: Insecta/Amphibia calls are continuous, repetitive,
+locally-stationary; heavier prior + smoothing exploits this. Aves
+calls are short events; light smoothing preserves the peak.
+
+Our current notebook uses uniform $\lambda = 0.4$ across all taxa.
+Cost: handful of config changes. Inference-time only. Risk: low.
+
+\paragraph{Updated path priority.}
+
+Paths D and E are inference-time, low-risk, fast-to-test additions.
+After the multi-seed ensemble result, the priority becomes:
+
+\begin{enumerate}
+\item Path A (sonotype mirror) — single-variable test
+\item Paths D + E together — small parameter tweaks, single-variable A vs.\ A+D+E
+\item Path B (SoftAUCLoss retrain)
+\item Path C (multi-iter NS)
+\end{enumerate}
+
+The sub-paths D and E are bookmarked for after the main 3-candidate
+ladder concludes.
+
+
+\section{Late-Breaking: needless090 0.946 ``MirrorRare'' + CLAP (2026-05-08)}
+
+While monitoring the ensemble training chain, a search of recent
+public notebooks (sorted by run date) revealed two new public LB
+0.946 paths from needless090 published 2026-05-08:
+
+\paragraph{0.946 path 1: MirrorRare} (notebook
+\texttt{bc2026-mr1-c3-mirrorrare-needless0946-trick} cell 42).
+A combination of two inference-time post-processing steps:
+
+\begin{enumerate}
+\item \emph{Mirror Pairs}: 4 hand-coded Insecta sonotype groups
+(10/234 anonymous classes) with within-group max-pooling
+(\S\ref{sonotype}).
+\item \emph{Rare suppression}: For each species $c \in \{\text{Amphibia,
+Mammalia, Reptilia}\}$, suppress predictions below
+$\mu_c + 0.05$ by a factor of 0.9:
+\[
+p_c \leftarrow \begin{cases}
+p_c & \text{if } p_c \geq \mu_c + 0.05 \\
+0.9 \cdot p_c & \text{otherwise}
+\end{cases}
+\]
+\end{enumerate}
+
+Mechanism (rare suppression): For taxa with low prior probability,
+the noise floor is wide. Subtracting the per-class mean and
+multiplicatively suppressing values below $\mu + 0.05$ cleans the
+noise floor while preserving rank order on the high-confidence tail.
+The threshold $\mu + 0.05$ is conservative enough not to suppress
+true positives.
+
+This combination is reproduced independently by kosuke123
+(\texttt{bc2026-mr1-c3-mirrorrare-needless0946-trick}) and
+yaroslav (\texttt{0-946-replay-with-robust-inputs}). Both attribute the
+LB lever to needless090's discovery.
+
+\paragraph{0.946 path 2: CLAP 5th stream}
+(\texttt{birdclef-2026-perch-sed-lb-0-946-clap} cell 41).
+A separate path: add LAION CLAP audio embedding probe as a 5th stream
+in the final blend.
+
+\begin{itemize}
+\item Encoder: HuggingFace \texttt{laion/clap-htsat-fused} (LAION
+CLAP-HTSAT base, public weights, $\sim$564 MB).
+\item Audio: 48 kHz, 5-second windows, 60-second files.
+\item Embedding: get\_audio\_features → 512-d, L2-normalized.
+\item Probe: linear $\hat{y} = \sigma(W \cdot e + b)$ where $W: 512
+\rightarrow 234$, $b: 234$.
+\item Blend: $\text{pred} = 0.35 \cdot \text{Proto} + 0.40 \cdot
+\text{SED} + 0.15 \cdot v_5 + 0.10 \cdot \text{CLAP}$.
+\item Dynamic abort: 45-min budget; if exceeded, partial coverage
+falls back to 4-way blend for remaining files.
+\end{itemize}
+
+The probe fit is competition-derived (needless090's private dataset
+\texttt{birdclef2026-clap-probe} returns 403 forbidden). To reproduce
+this lever with academic-integrity-clean own-weights, we must fit our
+own probe:
+\begin{enumerate}
+\item Download CLAP-HTSAT-fused weights (HuggingFace public).
+\item Extract CLAP embeddings on \texttt{train\_audio} 5-sec mid-windows.
+\item Fit per-species linear probe (sklearn LogisticRegression) on the
+234 BirdCLEF labels.
+\item Save $W$, $b$, fitmask.
+\item At inference: extract CLAP on test, apply probe, blend at 10\%.
+\end{enumerate}
+
+Why CLAP and not AudioMAE (which we tested and saw $-0.022$ LB)?
+\begin{itemize}
+\item CLAP trained contrastively on audio-text pairs (LAION-Audio-630K,
+633k pairs) — semantic structure, bird names in vocabulary.
+\item AudioMAE was self-supervised on AudioSet (60\% music/speech) —
+no semantic alignment, music/speech bias.
+\item CLAP's text tower can theoretically be queried zero-shot on
+species names, providing a non-trivial inductive bias different from
+Perch's bird-only supervised pretraining.
+\end{itemize}
+
+The risk profile: foundation-swap is a known failure mode on this
+competition (AudioMAE), so independent CLAP confirmation from
+needless090's 0.946 LB is necessary before committing 3+ GPU hours of
+extraction.
+
+\subsection{Updated path priority}
+
+\begin{enumerate}
+\item Path A+G = MirrorRare (sonotype mirror + rare suppression) —
+$\sim$15-line patch, idempotent, public-validated 0.946. \emph{Highest
+priority for the next LB slot after the multi-seed ensemble.}
+\item Path F = CLAP 5th stream — $\sim$3 GPU hours probe fit + 1 LB slot.
+Public-validated 0.946 (separate path).
+\item Path B = SoftAUCLoss SED retrain — 1--2 GPU days, Babych 2025
+1st place.
+\item Path C = Multi-iterative noisy student — 2--3 GPU days, Babych
+2025 1st place.
+\end{enumerate}
+
+\subsection{2026-05-11 axis decomposition: closing the own-vs-public 0.003 gap}
+
+The 4-month plateau between our own-weights anchor (v5 LB 0.938) and
+the Tucker public-weights reference (v57 LB 0.941) was the central
+open question. We hypothesised in \texttt{CLAUDE.md} that the gap was
+not a recipe difference per se (audit-confirmed 2026-05-08) but a
+\emph{recipe-variance orthogonality} effect addressable by
+multi-seed $\times$ multi-arch ensembling. The 8-hour LB push of
+2026-05-11 tested this with a single ensemble dataset
+(\texttt{bc2026-ensemble-v3-sed}) containing 25 own-trained
+checkpoints, and five fold-filter variants pushed back-to-back. The
+result was a clean axis decomposition.
+
+\begin{table}[h]
+\small
+\centering
+\begin{tabular}{lllrr}
+\toprule
+Slot & Subset & Adds vs single-recipe baseline & ckpts & LB \\
+\midrule
+S2 v43 & exp175 seeds 42/43/44 & multi-seed (same B0 + Tucker recipe) & 15 & 0.938 \\
+S3 v44 & exp175 + exp177-B1 & multi-arch (B0+B1, same recipe) & 10 & 0.938 \\
+S4 v45 & exp175 + exp176 & \textbf{multi-recipe} (Tucker + per-fold-SS) & 10 & \textbf{0.941} \\
+S5 v46 & S4 + exp177-B1 & multi-recipe + multi-arch & 15 & 0.937 \\
+\bottomrule
+\end{tabular}
+\caption{2026-05-11 8-hour LB push. Anchor v5 = LB 0.938. S1 (mega 25)
+exceeded the Kaggle wall-time budget and never completed. S4 first
+achieves own-weights LB 0.941, matching the Tucker public reference.}
+\end{table}
+
+\paragraph{Single-axis isolation.} The three obvious variance-reduction
+axes have asymmetric LB contributions:
+\begin{itemize}
+\item Seed averaging (3 seeds of identical Tucker recipe): $\Delta = 0$.
+\item Backbone averaging (EfficientNet-B0 + B1, identical recipe): $\Delta = 0$.
+\item \textbf{Recipe pair} (Tucker-canonical + per-fold-SS): $\Delta = +0.003$.
+\end{itemize}
+Multi-seed and multi-arch contribute nothing when the rest of the
+training pipeline is identical; the \emph{only} active axis is recipe
+diversity --- and concretely the diversity comes from a single
+hyperparameter, \texttt{EVAL\_SS\_N\_FILES} ($11$ in exp175,
+\texttt{None} in exp176), which controls how the soundscape holdout is
+constructed during 5-fold training.
+
+\paragraph{Mechanism: head-layer divergence under different
+ckpt-selection objectives.} The training recipe of exp175 and exp176 is
+identical except for the soundscape evaluation split. exp175 holds out
+the same 11 SS files across every fold; exp176 uses a 5-fold rotating
+split where every SS file is in exactly one hold-out fold. The
+checkpoint criterion in both is \texttt{val\_ss}, so each fold's best
+ckpt is the one that best fits its specific holdout. The five-fold
+ckpt distributions confirm this manifests as a much wider best-epoch
+and best-val\_SS spread for exp176:
+\begin{itemize}
+\item exp175 5-fold best-epoch range: $17$--$23$, val\_SS $0.861$--$0.875$
+($\Delta = 0.014$).
+\item exp176 5-fold best-epoch range: $6$--$18$, val\_SS $0.828$--$0.928$
+($\Delta = 0.100$, $7\times$ wider).
+\end{itemize}
+
+Measuring parameter cosine similarity between exp175 fold0 and exp176
+fold0 (same seed=42, same fold split, identical recipe except
+\texttt{EVAL\_SS\_N\_FILES}):
+\begin{itemize}
+\item Whole-model averaged cosine: $0.9917$ --- nearly identical.
+\item \texttt{backbone.conv\_head.weight}: $0.9295$
+\item \texttt{backbone.blocks.6.0.conv\_pwl.weight}: $0.9383$
+\item \texttt{bottleneck.1.weight}: $\mathbf{0.6046}$
+\item \texttt{distill\_head.2.weight}: $\mathbf{0.5518}$
+\item Mel filterbank (frozen): $1.0000$
+\end{itemize}
+
+The backbone trajectories are essentially the same. The task-specific
+adapter layers (\texttt{distill\_head}, the 1536-d Perch-emulation
+projection, and \texttt{bottleneck}, the backbone-to-attention link)
+are barely half-overlapping. The ensemble averaging gain is
+\emph{entirely concentrated in these adapter layers}: different
+holdouts cause different ckpt-selection optima, which retain different
+high-level error modes while preserving the same low-level
+representations. Multi-seed and multi-arch (S2, S3) do not produce
+this because they share the same ckpt-selection objective; their
+adapter layers converge to functionally equivalent solutions.
+
+\paragraph{Why S5 (multi-recipe + B1) regressed to 0.937.} Adding
+exp177 (B1 backbone, same Tucker recipe and 11-file holdout as
+exp175) to the S4 base produced $-0.004$ relative to S4. S3 had
+already shown B1 alone was LB-neutral, so the regression is not noise
+but an active interaction. Mattia's rank-percentile blend uses
+thresholds calibrated to a B0-derived rank distribution
+($\texttt{PROTO\_CONT\_RANK\_THR}=0.88$,
+$\texttt{SED\_ONLY\_RANK\_THR}=0.95$). B1 outputs have a different
+calibration profile; mixing them shifts the rank cdf and triggers the
+rescue rules at the wrong thresholds. The conclusion is that
+heterogeneous backbones must \emph{not} be mixed inside Mattia's
+rank-blend stack without recalibrating its rescue thresholds.
+
+\paragraph{Implication for the running thesis.} The
+\texttt{CLAUDE.md} iteration meta-pattern --- that all historical
+$+0.003$+ LB jumps have been architectural moves and that recipe
+sweeps cumulatively contribute $\approx 0$ over 60+ attempts --- is
+confirmed once more, with a slightly refined statement: the active
+ensemble-diversity dimension is not seed and not backbone, it is
+\emph{ckpt-selection objective}. The own-vs-public 0.003 gap was
+never a recipe difference; it was the variance bandwidth of a single
+hyperparameter that controls how best-ckpts encode site fingerprints.
+Averaging two different ckpt-selection objectives captures both error
+modes; multi-seed or multi-arch within one objective does not.
+
+This generalises to a falsifiable prediction for future ensemble
+diversification on this competition: ensemble members must differ in
+\emph{what error patterns their training selects against}, not just
+in weight initialisation or backbone capacity. Examples that satisfy
+this criterion include alternative loss families (BCE vs SoftAUC,
+exp178), alternative training-data subsets (e.g.\ multi-region
+external supervision), and alternative checkpoint criteria
+(val\_SS vs val\_TA vs combined). Examples that do not: re-running
+the same recipe with a new seed, or swapping B0 for B1 on the same
+recipe.
+
+\subsection{Original path-priority note (pre-2026-05-11, superseded)}
+
+If MirrorRare reproduces (LB $\geq 0.940$), CLAP becomes the next
+single-variable test. If CLAP also reproduces, our LB closes to
+$0.945$+ on own weights, beating the previous Ulyanov-blend run
+of 0.937--0.938 and approaching the Tucker public-weights reference
+of 0.941.
+
+\emph{Update 2026-05-12}: Both paths were locally audited and skipped
+without consuming LB slots --- CLAP probe sub-random on labeled SS
+(0.48 macro AUC, 25/46 classes worse than random), MirrorRare has no
+transferable mechanism on our SED's rare-class baseline distribution.
+The own-weights LB 0.941 came instead from the recipe-pair ensemble
+(2026-05-11 axis decomposition, $\S$ above).
+
+% =====================================================================
+\subsection{Thesis summary in QPHSE form (2026-05-12)}
+\label{sec:qphse}
+
+This subsection compresses the entire research thread into Question /
+Problem / Hypothesis / Statement / Evidence form, intended as a
+scaffold for the CLEF working note. The structure is:
+
+\paragraph{Q (Question).} In a cross-region bioacoustic monitoring
+task where the hidden test set is drawn from different recording sites
+than the labeled training data, which model interventions actually
+improve hidden-test performance, and how do they differ from
+interventions that only improve in-distribution metrics?
+
+\paragraph{P (Problem).} Standard ML practice assumes train and eval
+share a distribution. Here, the labeled soundscape (SS) holdout shares
+its 5-site Pantanal distribution with training; the Kaggle hidden test
+is from different sites. Empirically, conventional "raise local metric"
+heuristics anti-correlate with leaderboard at the margin; sixty-plus
+recipe-level experiments over four months produced cumulative LB
+$\approx 0$, while five architectural moves produced all of the
+$+0.003+$ gains. The problem is which interventions are which, and why.
+
+\paragraph{H1 (anti-correlation invariant).} Locally measurable
+metrics (val\_SS, Val-A, LOSO-site, train\_audio val\_TA) anti-correlate
+with LB at the margin because they reward site-specific structure
+learned at training time, which is precisely what does not transfer
+to the unseen-site test distribution.
+
+\paragraph{H2 (iteration meta-pattern).} All historical $+0.003+$ LB
+jumps have been \emph{architectural} moves that add a new information
+channel; all stagnations have been \emph{recipe sweeps} that re-tune
+mixing weights within a fixed channel set. The asymmetry is
+$1\text{ arch move} > 60\text{ recipe moves cumulative}$.
+
+\paragraph{H3 (active axis of ensemble diversity).} The dimension of
+ensemble diversity that actually transfers to LB is not seed and not
+backbone capacity; it is \emph{ckpt-selection objective} (the criterion
+used to pick the best checkpoint during training). Its measurable
+signature is low cosine similarity ($\leq 0.7$) on the task-adapter
+layers (\texttt{distill\_head}, \texttt{bottleneck}) between
+ensemble members --- even when whole-model cosine is $0.99+$.
+
+\paragraph{S (statement / mechanism).} Each successful architectural
+move added a channel the prior stack physically did not have:
+v12 Perch v2 multi-region prior; v24 exp50 BG mixing (domain
+randomization); v33 file-max coherence (universal acoustic physics);
+v57 Mattia rank-percentile + 3 rescue rules (fusion architecture);
+v45 recipe-pair ensemble (exp175 fixed-11-file holdout + exp176
+per-fold-rotating holdout, differing in a single hyperparameter
+\texttt{EVAL\_SS\_N\_FILES}). Recipe sweeps do not add channels;
+they tune mixing weights inside a fixed channel set bounded by Pearson
+0.97-0.99 between SED variants.
+
+\paragraph{E1 (anti-correlation evidence, $\sim$10 data points).}
+Multi-experiment table:
+val\_SS $0.838 \to$ LB $+0.001$ (exp50);
+val\_SS $0.851 \to -0.012$ (exp121);
+val\_SS $0.867 \to -0.014$ (exp123);
+val\_SS $0.907 \to -0.018$ (exp136b);
+local macro AUC $+0.024 \to$ LB $-0.002$ (v\_mel = v34);
+LOSO-site CV 0.97 $\to$ 5 LB submissions all regressed
+($-0.012$ to $-0.017$, exp99-100 / v38-v41);
+6-test refutation of iVAE/iVDFM on Perch features;
+CLAP probe train AUC $0.74 \to$ SS AUC $0.48$ (sub-random,
+2026-05-12). Each data point is documented in
+\texttt{experiments/lb\_registry.yaml} and the corresponding
+\texttt{memory/project\_*.md}.
+
+\paragraph{E2 (iteration asymmetry, 4-month cumulative).}
+Architectural moves (5/5 hit rate, each in $[+0.001,+0.009]$):
+v12, v24, v33 each $+0.001$; v57 (Tucker public) $+0.009$;
+v45 (own-weights recipe-pair) $+0.003$.
+Recipe sweeps (60+ attempts, mean $\approx 0$, range $[-0.027,+0.001]$):
+DPO/RL variants (exp112-119, exp122), AudioMAE (exp143-146),
+LR-correction (exp99-100), iVAE/iVDFM (exp43e-o, exp78),
+silent-drift retrain (exp175 seed42), seed averaging (v43 = S2),
+arch averaging (v44 = S3), per-class LR/threshold (v38-v41),
+post-hoc lookups (v22), pseudo-iteration (exp136b/exp172/exp173).
+
+\paragraph{E3 (active ensemble axis, 2026-05-11 8h push).}
+5-slot orthogonal axis decomposition on a single dataset of 25
+own-weights checkpoints:
+S2 multi-seed (3 seeds, same recipe) $= 0.938$ ($\Delta = 0$);
+S3 multi-arch (B0+B1, same recipe) $= 0.938$ ($\Delta = 0$);
+S4 multi-recipe (exp175 + exp176, B0 only) $\mathbf{= 0.941\, (\Delta = +0.003)}$;
+S5 multi-recipe + multi-arch (S4 + B1) $= 0.937$ ($\Delta = -0.004$
+vs S4, B1 disrupts rank-blend rescue thresholds).
+Mechanism measurement on exp175 fold0 vs exp176 fold0 (same seed,
+same backbone, same training recipe, only \texttt{EVAL\_SS\_N\_FILES}
+differs):
+whole-model parameter cosine $0.9917$,
+\texttt{backbone.conv\_head.weight} cosine $0.9295$,
+\texttt{bottleneck.1.weight} cosine $\mathbf{0.6046}$,
+\texttt{distill\_head.2.weight} cosine $\mathbf{0.5518}$,
+mel filterbank (frozen) cosine $1.0000$.
+Best-epoch spread: exp175 range 17--23 (val\_SS range $0.014$),
+exp176 range 6--18 (val\_SS range $0.100$, $7\times$ wider).
+
+\paragraph{Open question.} How different is the hidden test's site
+distribution from our 5-site labeled SS? This sets the strength of
+the anti-correlation invariant. We cannot measure it directly
+(Kaggle hidden); we estimate it indirectly through LB submissions,
+which is rate-limited and noisy. A direct measurement would require
+the comp organizers to release test-site metadata, or a parallel
+unsupervised analysis of test-soundscape audio that does not look
+at labels.
+
+\paragraph{Falsifiable predictions for future work.} (1) Foundation
+swap candidates (BirdNET v2.4, Perch v3, BEATs, wav2vec2-XLS-R)
+should be screened by a probe macro-AUC sanity on labeled SS
+\emph{before} an LB slot is consumed; any candidate with SS macro
+AUC $\leq 0.55$ on fit classes is predicted to regress at the
+leaderboard. (2) Any ensemble-diversity proposal must be screened
+by computing task-adapter cosine similarity between members; if
+\texttt{distill\_head} or \texttt{bottleneck} cosine $\geq 0.95$,
+the proposal is predicted to be LB-noise.
+
+
+\section{2026-05-15 to 2026-05-17: pipeline swap, calibration tautology, two-axis OOD model}
+
+The closing two weeks of competition development produced three additional data points
+and one structural revision of the gap-source model.
+
+\subsection{2026-05-15: Imaad/mtoshi pipeline swap (v53 = LB 0.943, +0.002 over v45)}
+
+Public 0.947 was identified as Imaad Mahmood v4 pipeline (= the ``mtoshi\_947''
+fork \texttt{mtoshidesu/birdclef-2026-0-947-lb-public-pipeline-reproduced}).
+We forked it and swapped the SED component to our own-weights v45 ensemble
+(exp175 + exp176 = 10 ckpts). v52 (SED\_W=0.40) gave 0.942; a dose grid
+established v53 (SED\_W=0.30) as the peak at \textbf{0.943}, with v54
+(SED\_W=0.20) regressing to 0.942. v55 (fold filter [0..4] only, 5 ckpts)
+returned 0.942, confirming the v45 multi-recipe-ensemble lever persists
+under the new pipeline. v56 attached BirdNET v2.4 as a third stream;
+LB unchanged at 0.943 (BirdNET contribution = 0 at this precision).
+
+The +0.002 v45 $\to$ v53 jump is attributable to additional invariance
+sources stacked onto the Mattia rank-fusion architecture:
+ResidualSSM + SelectiveSSM, Site-Hour joint priors (rather than
+independent site and hour priors), and Insecta sonotype mirroring at
+the prediction-level. None of these required SED retraining.
+
+\subsection{2026-05-16: v57 = LB 0.947 $\times 3$, v58 calibration failure}
+
+\paragraph{v57 reproduction.} mtoshi\_947 was pushed verbatim (Tucker
+public SED, no own SED, no BirdNET) and submitted three times. All
+three returned LB 0.947 exactly, confirming the public 0.947 baseline
+is reproducible end-to-end on our kernel slug and is not a single-sample
+lucky variance. v57 is \emph{not} eligible as competition-final
+(third-party weights), but serves as an upper reference: own-weights
+v53 (0.943) is exactly $-0.004$ below this reference.
+
+\paragraph{Audit on labeled SS.} Of all 66 labeled SS files (5-site
+Pantanal), we ran Tucker 5-fold ensemble vs. our 10-ckpt ensemble:
+macro AUC = $0.998$ vs $0.998$ (\emph{identical}), Pearson
+on flattened predictions $0.9824$, top-1 agreement $81.6\%$.
+On the disagreement window subset (136 of 739 rows), $90.4\%$ were
+``both correct'' multi-label situations (Tucker's top-1 species AND
+ours' top-1 species both present in the row's positive label set).
+
+\paragraph{Calibration tautology.} The audit also reported a rank-cdf
+shape mismatch (Tucker $p_{99}$ on flattened scores $= 0.764$, ours
+$=0.799$, $\Delta=+0.034$). We hypothesized that Mattia/Imaad's six
+raw-probability rescue gates (\texttt{SED\_LOW\_THR}$=0.05$,
+\texttt{SED\_CONT\_LOW\_THR}$=0.12$, etc.) triggered at different
+frequencies under our scale, and proposed v58: a per-class quantile
+mapping $f_c(x) = ICDF_{\text{tucker}}^{(c)}(CDF_{\text{ours}}^{(c)}(x))$
+fit on the 739 labeled SS windows. We restored SED\_W=0.40 (Tucker's
+default) because calibration was expected to unblock it. \textbf{v58
+returned LB 0.941 $\times 3$, a $-0.002$ regression from the v53 anchor.}
+
+The hypothesis was a tautology at design time: per-class quantile
+mapping is by construction monotonic in each class, hence
+\emph{AUC-preserving}. The audit measured AUC IDENTICAL. A monotonic
+transformation on an AUC-IDENTICAL system cannot move AUC-anchored
+downstream metrics; only the gate-trigger frequencies could change,
+and even then the change is constrained to be small because Pearson
+was already $0.98$. The $-0.002$ regression is consistent with the
+confounded SED\_W=0.40 dose change (own SED dose grid peaks at $0.30$,
+so this alone contributes $\approx -0.001$); the calibration mapping
+itself appears to have contributed roughly another $-0.001$, plausibly
+because fit data for ultra-rare classes was sparse and the tail
+percentiles were noisy. We retract the audit-based attribution
+``calibration is the gap source'' as a tautology.
+
+\subsection{2026-05-17 OPQHEF sprint: two-axis OOD model}
+
+The retraction forced re-examination of the labeled SS audit.
+Phase B of the sprint enumerated per-class baseline distributions
+(mean raw probability on negative rows) across the 234 classes and
+ran the comparison on broader unlabeled SS as well. The reconciliation
+required two distinct mechanisms.
+
+\paragraph{Axis-1 (common-bird p99 shape, in-domain measurable).}
+Per-site rank-cdf $p_{99}$ on labeled SS:
+
+\begin{table}[h]\centering
+\begin{tabular}{lrrrr}
+\hline
+site & $n_\text{rows}$ & Tucker $p_{99}$ & Ours $p_{99}$ & $\Delta$ (ours $-$ Tucker) \\
+\hline
+S23 & 36 & 0.734 & 0.384 & $-0.350$ \\
+S19 & 36 & 0.723 & 0.478 & $-0.245$ \\
+S13 & 24 & 0.502 & 0.321 & $-0.181$ \\
+S22 (main) & 477 & 0.810 & 0.837 & $+0.028$ \\
+S08 & 60 & 0.800 & 0.876 & $+0.076$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The Mattia rank-blend uses rank-percentile per class across all rows
+of the submission. Sites where our SED $p_{99}$ is much lower than
+Tucker's (S23, S19, S13) propagate to lower rank-position contribution,
+and the rescue gates---calibrated against Tucker's $p_{99}$
+distribution---trigger at altered frequencies.
+
+\paragraph{Axis-2 (ultra-rare class baseline elevation, OOD-only).}
+On labeled SS (in-domain 5-site Pantanal), per-class baseline mean
+(on negative rows) ratios us/tucker for the rarity bins are
+$0.77\text{--}0.92\times$ \emph{across all bins}---our SED baseline
+is uniformly lower or comparable. However, on the broader unlabeled
+SS (200 file sample, drawing more diverse sites and times), the
+ratio inverts dramatically for the ultra-rare ($n_\text{train}=0$)
+bin: ours $p_{99} = 0.152$ vs. Tucker $p_{99} = 0.068$ (ratio
+$2.24\times$). Specific class divergences include
+$47158\text{son}22: +0.339$, $47158\text{son}25: +0.329$,
+$47158\text{son}23: +0.322$ (all Insecta sonotypes, $n_\text{train}=0$).
+
+\paragraph{Why macro AUC IDENTICAL was misleading.}
+The \texttt{per\_class\_auc} computation excludes classes with zero
+positive samples in the labeled SS (the standard scikit-learn
+guard). Of our 234 classes, $\approx 154$ have positive samples
+in the labeled SS, so AUC is computed only on this subset. Most
+$n_\text{train}=0$ Insecta sonotypes also have zero positives in
+labeled SS---i.e., they are entirely excluded from the $0.998$
+average. The audit-window narrowness, not the model quality, is
+what produced the apparent ``identical model'' result.
+
+\paragraph{Standing causal model H8.}
+The $-0.004$ gap is the accumulation of two independent OOD axes
+which manifest in non-overlapping evaluation subsets:
+\begin{itemize}
+\item Axis-1 manifests on labeled SS sites $\{S23, S19, S13\}$ as a
+$p_{99}$ shape mismatch on common Aves;
+\item Axis-2 manifests on broader unlabeled SS as ultra-rare class
+baseline elevation.
+\end{itemize}
+Each requires a different fix. v59 (zero-train species rank\_sed
+$\times 0.5$ down-weight in cell 34, pushed 2026-05-16 03:50 UTC,
+submit pending UTC midnight quota reset) targets axis-2 only.
+Option C (per-site rank renormalization, design notes in
+\texttt{experiments/\_audits\_2026\_05\_12\_clap\_mr\_mel/tucker\_vs\_ours/axis1\_per\_site\_renorm\_design.md})
+remains to be implemented and tested for axis-1.
+
+\paragraph{Pseudo label v10 (sprint Phase F output).}
+Building on the axis-2 finding, we filtered the existing pseudo
+labels v7 (241k rows, $n_\text{ultra-rare}/n_\text{total}=30.9\%$)
+using a multi-tier criterion that demands higher confidence
+agreement for rare classes. The output v10 (147k rows) shrinks
+the ultra-rare share to $3.7\%$ while retaining $87\%$ of common-class
+supervision and $73\%$ of moderate-rare supervision. Spontaneous
+sonotype co-occurrence patterns ($47158\text{son}21+22+23+13$ frequently
+co-firing in $312\text{--}974$ windows each) validate the notebook's
+\texttt{MIRROR\_PAIRS} grouping. A v10-supervised SED variant
+(exp180\_pseudo\_v10) is in training as of sprint end; results
+will be reported when local axis-2 metrics (unlabeled SS p99 ratio
+of ours-trained-on-v10 vs Tucker) are measured.
+
+\subsection{Methodological lessons from the sprint}
+
+Two falsifiability invariants were added:
+\begin{enumerate}
+\item \textbf{No monotonic transforms on AUC-IDENTICAL systems.}
+The v58 reasoning chain---``audit found AUC IDENTICAL''
+$\Rightarrow$ ``ours and Tucker are functionally equivalent except
+calibration'' $\Rightarrow$ ``per-class quantile mapping fixes
+calibration'' $\Rightarrow$ ``LB will improve''---is logically
+unsound: a monotonic transform preserves AUC by definition, so on
+an AUC-IDENTICAL audit data, it cannot improve any AUC-anchored
+downstream evaluation. Future calibration proposals must use
+non-monotonic methods (e.g., site-dependent mappings, threshold
+re-derivation against specific gate logic) or be rejected at design
+time.
+\item \textbf{Audit window scope must be measured.}
+The labeled SS 66-file audit window is in-domain saturated
+(macro AUC 0.998 on the valid-class subset). It cannot detect
+$n_\text{train}=0$ behavior (excluded from AUC averaging) nor
+broader-pool OOD behavior (the 5 Pantanal sites are insufficient
+coverage). Any candidate proposed on the basis of a single audit
+metric must report whether that metric is measurable in the
+hidden test's distribution shift axis---if not, the candidate
+cannot be screened.
+\end{enumerate}
+
+
+\subsection{2026-05-17 sprint axis quantification (site $\times$ hour bucket)}
+
+A follow-up measurement at the level of site $\times$ hour buckets on
+the labeled SS (\texttt{axis1\_site\_hour\_targeted.py}) refined the
+two-axis model. Of the 24 buckets with $\geq 12$ rows (covering
+736 of 739 total labeled SS rows):
+
+\begin{itemize}
+\item \textbf{Axis-1 buckets} (Tucker $> $ ours, $\Delta_{p99} < -0.05$):
+5 buckets, 84 rows ($11.4\%$ of total). All five are OOD-site buckets
+(S23, S19, S18). Largest: S23\_h3 with $\Delta_{p99} = -0.372$.
+\item \textbf{Axis-2-like buckets} (ours $>$ Tucker, $\Delta_{p99} > +0.05$):
+6 buckets, 177 rows ($24.0\%$). \emph{All but one are in the in-domain
+site S22}---specifically S22\_h18 ($\Delta_{p99} = +0.190$), S22\_h4
+($+0.166$), S22\_h0, S22\_h20, plus S03\_h20 and S08\_h7. Our SED
+over-predicts in S22 at specific hours rather than overall.
+\item \textbf{Saturated buckets} ($|\Delta_{p99}| \leq 0.05$):
+13 buckets, 475 rows ($64.3\%$). Two models match.
+\end{itemize}
+
+The labeled SS coverage suggests $11.4\%$ of rows are axis-1 fixable
+and $24.0\%$ are axis-2 fixable. If hidden test bucket composition
+mirrors labeled SS, the upper-bound macro improvement from per-bucket
+renormalization is approximately $+0.0015$---well below the $-0.004$
+LB gap. This implies either (a) hidden test contains a higher proportion
+of OOD bucket rows than labeled SS, or (b) the two known axes are not
+the sole gap source.
+
+\paragraph{Additional axis search.} Three additional axes were tested
+on the same labeled SS predictions:
+\begin{itemize}
+\item \textbf{Per-hour} (axis-3): hour 18 with $n=12$ rows shows
+ours $p_{99} = 0.776$ vs. Tucker $0.586$ ($\Delta = +0.190$). Sparse
+data, but consistent with the bucket-level finding (S22\_h18 = same
+group). Hour 7 with $n=36$ rows shows the lowest top-1 agreement (0.444)
+with Pearson 0.986, suggesting tied-class ambiguity rather than scale
+mismatch.
+\item \textbf{Per-window-position} (axis-4): all 12 window positions
+within the 60-s file show Pearson $0.98$ and $\Delta_{p99} \in [+0.01,
++0.05]$. \emph{Negative result}: window position is NOT an OOD axis.
+\item \textbf{Per-taxon excluding ultra-rare} (axis-5, refining axis-2):
+Aves common (159 classes) has $\Delta_{p99} = -0.00018$ (essentially
+identical). \emph{Amphibia common (8 classes) has $\Delta_{p99} = +0.047$
+on negative rows}---a clear over-prediction pattern that the existing
+notebook Gate 5 rare-suppression ($\times 0.9$) already partially
+addresses. Insecta common (1 class) and Mammalia common (2 classes)
+are essentially identical. The axis-2 over-prediction extends beyond
+ultra-rare ($n_\text{train} = 0$) Insecta sonotypes to common Amphibia
+classes as a whole.
+\end{itemize}
+
+\paragraph{Implications for v59 patch.} The v59 \texttt{rank\_sed
+[:, zero\_train\_mask] *= 0.5} addresses only the $n_\text{train}=0$
+subset of axis-2 (Insecta sonotypes). The axis-2 over-prediction on
+Amphibia common (covering $\approx 24\%$ of labeled SS rows according
+to the bucket analysis) is targeted only indirectly via the existing
+notebook Gate 5 rare-suppression $\times 0.9$. A complete axis-2 fix
+would either tighten Gate 5 (e.g., $\times 0.8$) or introduce a
+taxon-aware per-class multiplier rather than the binary zero-train mask.
+
+
+\subsection{2026-05-17 Phase E extension: axis collapse to recording-year}
+
+A per-year analysis of the labeled SS Tucker-vs-ours predictions
+collapses much of the earlier site-based interpretation:
+
+\begin{table}[h]\centering
+\begin{tabular}{rrrrr}
+\hline
+year & $n_\text{rows}$ & Pearson & top-1 agree & $\Delta_{p99}$ \\
+\hline
+2021 & 288 & 0.986 & 0.819 & $+0.046$ \\
+2022 & 252 & 0.994 & 0.905 & $+0.047$ \\
+\textbf{2024} & \textbf{60} & \textbf{0.922} & \textbf{0.500} & $\mathbf{-0.262}$ \\
+2025 & 139 & 0.982 & 0.784 & $+0.012$ \\
+\hline
+\end{tabular}
+\end{table}
+
+The 2024 60 rows comprise 5 files: 2 from S19 and 3 from S23. These
+are \emph{exactly} the same files that defined the axis-1 buckets in
+the earlier per-site analysis (S23\_h3, S23\_h4, S19\_h19). i.e.,
+axis-1 is not a site phenomenon \emph{per se}—it is a 2024
+recording-year phenomenon, mediated by site because the 2024 BC2026
+data exclusively appears at sites S19 and S23.
+
+Labeled SS training data year distribution: 2021 (576 rows), 2022
+(504), \textbf{2024 (120, $\approx 8\%$)}, 2025 (278). Our SED is
+relatively under-trained on the 2024 recording protocol; Tucker,
+with the same spec recipe but different random initialization,
+happens to generalize to 2024 better.
+
+\paragraph{Hypothesis revision (Phase E final).} The $-0.004$ LB gap
+is best characterized as a \emph{recording-era under-fit}. Whether
+hidden test predominantly samples 2024+ recordings is unknown
+(competition private; cannot be verified directly). If yes, the
+direct fix is to oversample 2024 SS rows in SED training
+(\texttt{MIN\_SAMPLE} extended to year strata, or year-weighted
+batch sampler). An inference-time partial fix would apply year-aware
+logit bias to the SED stream for 2024 S19/S23 test files, but its
+upper bound is restricted to what labeled-SS macro AUC measures, and
+the Phase E simulation showed naive multiplicative correction is
+non-trivial to implement correctly (catastrophic AUC drop from rank
+saturation at the $1.0$ cap).
+
+\paragraph{Tucker's mechanism of advantage (informed speculation).}
+Given Tucker's recipe is spec-identical to our exp175 (verified by
+\texttt{silent\_drift\_check.py}, $0$ deviations from the canonical
+hyperparameter set), the 2024 generalization advantage must arise
+from one of three sources:
+\begin{enumerate}
+\item Random initialization seed luck producing distillation features
+that happen to capture 2024-specific acoustic invariants;
+\item Numerical precision micro-details in the training stack (CUDA
+math, BF16 reductions, etc.) yielding $0.001$-level differences that
+amplify on under-supervised samples;
+\item A still-undetected recipe deviation in our code that the
+silent-drift checker misses (false-negative coverage).
+\end{enumerate}
+The first two are not directly remediable; the third merits one
+additional drift audit pass focused on numerical reproducibility
+(e.g., \texttt{torch.manual\_seed}, \texttt{deterministic=True},
+mixed-precision flags).
+
+
+\subsection{2026-05-17 sprint final unification: single mechanism behind all three axes}
+
+A row-level analysis of the 30 disagreement rows within the 2024 60-row
+subset of labeled SS produces the most parsimonious account so far.
+On these rows, Tucker and our SED disagree on the top-1 prediction;
+of those disagreements:
+
+\begin{itemize}
+\item \textbf{Both correct (multi-label)}: 21 rows. Tucker's top-1
+species and ours' top-1 species are both in the row's positive label
+set—the multi-label resolution is non-unique.
+\item \textbf{Tucker only correct}: 9 rows. Tucker picks an ultra-rare
+Insecta sonotype (47158son14/04/25/10) or Amphibia (25073) that is
+indeed in the positive label set; ours picks an incorrect common
+species. In every one of these nine cases, ours' top-1 is either
+\texttt{fepowl} (Aves nocturnal owl, $n_\text{train}=497$) or
+\texttt{43435} (Mammalia, $n_\text{train}=14$)—both plausible-looking
+at the 03:20--04:00 night hour but incorrect.
+\item \textbf{Ours only correct}: \textbf{0 rows}.
+\item \textbf{Neither correct}: 0 rows.
+\end{itemize}
+
+Our SED never produces a unique correct answer that Tucker misses; in
+every 2024-disagree row, ours either matches or loses to Tucker. This
+is the strongest evidence yet that ours' weights have a uniform
+deficit relative to Tucker's, manifesting as wrong picks rather than
+class-coverage tradeoffs.
+
+\paragraph{Mechanism unification.} All three OOD axes identified in
+the sprint reduce to a single root cause:
+
+\begin{itemize}
+\item \textbf{Axis-1 (site \texttimes hour p99 mismatch)}: when an
+ultra-rare positive row appears (concentrated at S23 03:00--04:00,
+S19 19:00), ours' top-1 goes to a plausible common species
+(\texttt{fepowl}, nocturnal owl). This depresses ours' rank-percentile
+at the actual ultra-rare positive class, producing the apparent
+$p_{99}$ mismatch.
+\item \textbf{Axis-2 (ultra-rare baseline elevation on broader OOD)}:
+on rows where the ultra-rare class is not actually present (the
+negative-row population in unlabeled SS 200f), ours' SED has slight
+baseline elevation ($\Delta p_{99} = +0.084$ relative to Tucker on
+$n_\text{train}=0$ classes). This is a uniform low-level false-positive
+signal that contaminates rare-class rankings.
+\item \textbf{Axis-7 (2024 recording-year weakness)}: 2024 BC2026 data
+exists only at S19 and S23, and ours' SED has trained on 120 rows of
+2024 labeled SS (vs. 576 for 2021, 504 for 2022). The 2024 recording
+protocol is under-represented in our training distribution; Tucker,
+with the same spec recipe but different random initialization,
+happens to fit it better.
+\end{itemize}
+
+All three are consequences of ours' SED not having specialized as
+strongly as Tucker's on ultra-rare Insecta sonotype acoustic features.
+
+\paragraph{Implication for v59.} The v59 patch
+(\texttt{rank\_sed[:, zero\_train\_mask] *= 0.5}) targets the
+zero-train mask (28 classes, mostly Insecta sonotypes 47158son*).
+Under the unified mechanism account, this multiplier has a
+\emph{mixed} directional effect:
+\begin{enumerate}
+\item On negative rows (where ultra-rare class is not actually
+present), dampening ours' rank reduces the false-positive contribution
+that the baseline-elevation effect (axis-2) produces. (+ effect on
+macro AUC for negative rows)
+\item On positive rows (where ultra-rare class is actually present),
+dampening ours' rank further suppresses an already-under-confident
+true-positive signal (axis-1/7). (− effect on macro AUC for positive
+rows)
+\end{enumerate}
+The net LB effect depends on the hidden test's positive-versus-negative
+distribution for ultra-rare classes. If hidden test contains 2024
+S19/S23-like positive rows (genuine Insecta-sonotype detection
+opportunities), v59 hurts more than it helps. If hidden test is
+predominantly negative-row exposure to ultra-rare classes (common
+in any noisy field recording), v59 helps.
+
+This is the opposite of the original v59 design rationale, which
+treated axis-2 as a pure baseline-elevation phenomenon and
+recommended uniform down-weighting. v59 was pushed before this
+unification was discovered; the LB result will be informative either
+way (per Branch C of the decision tree document, v59 LB $\leq 0.942$
+would falsify even the partial-fix interpretation).
+
+\paragraph{Direction of the true fix.} The unified mechanism account
+implies the productive direction is to \emph{boost} ours' ultra-rare
+class confidence (not dampen it), either at inference time (per-class
+gain on the actual-positive predictions) or, more soundly, by
+retraining the SED weights with cleaner ultra-rare supervision. The
+sprint-output pseudo label v10 was designed for this purpose
+(\texttt{Tier C/sonotype} = 5,373 rows where cosine-similarity
+agreement on ultra-rare sonotypes is strong, plus removal of v7's
+noisy ultra-rare confusion-mapping rows). The v10-supervised SED
+variant \texttt{exp180\_pseudo\_v10} is in training at sprint end;
+local validation against axes 1, 2, and 7 will follow.
+
+
+\subsection{2026-05-17 sprint Phase E: \texttt{conditional\_boost\_sim.py} and a local-screening invariant}
+
+We tested three classes of inference-time intervention targeting only
+ultra-rare classes on labeled SS:
+\begin{enumerate}
+\item Conditional raw-probability scale: \texttt{raw\_prob *= scale}
+if \texttt{raw\_prob $\geq$ thr};
+\item Conditional logit shift: \texttt{logit += offset} if
+\texttt{raw\_prob $\geq$ thr};
+\item Top-K row boost: scale the K rows with highest raw\_prob per
+ultra-rare class.
+\end{enumerate}
+Across a sweep of $\{$thr, scale, offset, K$\}$ values, every variant
+produces $\Delta \text{macro AUC} \in [-0.0004, +0.0005]$
+(neutral)---no candidate exceeds the screening threshold.
+
+\paragraph{New falsifiability invariant.} \texttt{macro\_auc} as
+implemented (\texttt{sklearn.metrics.roc\_auc\_score} with a
+\texttt{0 < positives < n} guard) silently excludes classes that have
+zero or full positives in the evaluation set. For our labeled SS,
+this excludes most $n_\text{train}=0$ Insecta sonotypes; an
+intervention that affects only these classes is therefore invisible
+to macro AUC averaging. Local screening cannot reject or accept such
+interventions. Consequence: every candidate that targets only ultra-rare
+classes consumes one LB slot without pre-screening, while candidates
+that also touch common classes (e.g., taxon-wide reweighting,
+weights-level retrain) remain screenable.
+
+This is added to the falsifiability invariant list of \S 2026-05-17:
+\begin{enumerate}
+\item No monotonic transforms on AUC-IDENTICAL systems (v58 lesson).
+\item Audit-window scope must be measured and reported with the
+candidate (cf. macro AUC IDENTICAL artifact).
+\item \textbf{(NEW)} Ultra-rare-targeted inference fixes are
+local-invisible; either accept the LB-slot cost or expand the
+candidate to also affect common classes.
+\end{enumerate}
+
+
+\subsection{2026-05-17 sprint Phase G result: \texttt{exp180\_pseudo\_v10} local validation FAILED}
+
+The Phase F output (v10 pseudo label, 147k rows from 71k unique windows
+with multi-tier filter) was used to train a new SED variant via
+\texttt{experiments/sed/train.py --config exp180\_pseudo\_v10 --fold 0
+--seed 42} for 25 epochs (Tucker-spec recipe). Best epoch was epoch 18
+(\texttt{val\_TA}=0.9692, \texttt{val\_SS}=0.9002, comparable to the
+exp175/exp176 baseline trajectory). The local validation script
+\texttt{exp180\_v10\_local\_validation.py} produced:
+
+\begin{table}[h]\centering
+\begin{tabular}{lccc}
+\hline
+metric & Tucker & v53 (10-ckpt baseline) & v10 (exp180 fold0) \\
+\hline
+Labeled SS macro AUC & 0.998 & 0.998 & \textbf{0.973 ($-$0.025)} \\
+Pearson (flat) vs Tucker & --- & 0.982 & \textbf{0.876} \\
+Top-1 agreement vs Tucker & --- & 0.816 & \textbf{0.447} \\
+Unlabeled SS ultra-rare $p_{99}$ & 0.067 & 0.123 (1.83$\times$) & \textbf{0.021 (0.31$\times$)} \\
+\hline
+\end{tabular}
+\end{table}
+
+The two metrics dissociate: the axis-2 metric (broader-pool ultra-rare
+$p_{99}$ ratio) substantially improves and even crosses below Tucker's
+absolute level, but macro AUC drops by $-0.025$ on labeled SS, and
+top-1 agreement with Tucker collapses from $0.816$ to $0.447$.
+
+\paragraph{Diagnosis.} The v10 filter design retains only 7.2\% of v7's
+ultra-rare rows (\texttt{Tier C}). During training, the resulting
+supervision teaches the SED that ultra-rare classes should have
+uniformly low confidence---i.e., the model internalizes
+``ultra-rare = absent'' rather than ``ultra-rare = rare but distinct.''
+This crushes the model's ability to fire on actual ultra-rare positives,
+which is exactly the deficit that the sprint's F9 unification identified
+as the root cause of the $-0.004$ LB gap.
+
+\paragraph{Confirms F9.} The v10 result is a controlled experiment that
+confirms the unified mechanism account: suppressing ultra-rare class
+confidence (the direction implicit in v59 down-weighting and v10
+filter-based training) does reduce false-positive baseline, but it
+does so at the expense of the actual-positive signal that closes the
+LB gap. The productive direction is the opposite---to amplify the
+ultra-rare positive signal while leaving the false-positive baseline
+intact. Filter-based supervision design is not the right tool for
+this; class-weighted loss or per-class boosting during training is
+more appropriate.
+
+\paragraph{Forward action.} v10 is not deployed to LB. A successor
+design (v11) would retain Tier C rows fully but apply a class-balanced
+loss weight (2--3$\times$) on actual-positive ultra-rare samples
+during training, so the model learns ``ultra-rare positives are real
+and worth high confidence'' rather than ``ultra-rare windows should
+be ignored.''
+
+
+\subsection{2026-05-17 sprint Phase H result: \texttt{exp182\_pos\_boost} (v11 boost direction) ALSO fails}
+
+After the Phase G v10 (filter-direction) failure, Phase H tested the
+symmetric inverse: pos\_weight boost on rare and ultra-rare classes
+during BCE training. Configuration: \texttt{pos\_weight\_ultra\_rare=3.0}
+(42 classes) and \texttt{pos\_weight\_rare=2.0} (22 classes), with
+\texttt{exp175\_tucker\_actually} as the otherwise-identical recipe.
+Training proceeded normally (best epoch 19, \texttt{val\_TA}=0.9746,
+\texttt{val\_SS}=0.8729). Local validation:
+
+\begin{table}[h]\centering
+\begin{tabular}{lcccc}
+\hline
+metric & Tucker & v53 baseline & v10 (filter) & v11 (boost) \\
+\hline
+Labeled SS macro AUC & 0.998 & 0.998 & 0.973 ($-0.025$) & 0.986 ($-0.012$) \\
+Pearson vs Tucker & --- & 0.982 & 0.876 & 0.942 \\
+Top-1 agreement vs Tucker & --- & 0.816 & 0.447 & 0.670 \\
+Unlabeled SS ultra-rare $p_{99}$ ratio & 1.00$\times$ & 1.83$\times$ & 0.31$\times$ & \textbf{3.09$\times$} \\
+\hline
+\end{tabular}
+\end{table}
+
+The unlabeled SS ultra-rare $p_{99}$ ratio for v11 reaches $3.09\times$
+(Tucker reference $1.00\times$), making it the worst of the three
+own-weights SED variants tested on axis-2. Whereas v10 over-suppressed
+ultra-rare confidence (ratio $0.31\times$), v11 over-amplifies the
+baseline---the model spikes on ultra-rare classes even when they are
+absent (negative-row rows in the broader unlabeled SS pool).
+
+\paragraph{F11 sprint terminal finding.} Both single-stream SED loss-
+or filter-based interventions fail at opposite ends. The original v53
+ensemble ($1.83\times$ ratio, macro AUC $0.998$) is the closest to
+Tucker's $1.0\times$ ratio of any own-weights variant. The F9 unified
+mechanism account (under-confidence on ultra-rare positives) is
+confirmed by both failure modes, but the deficit is structural at
+the weights level and not reachable via per-class re-weighting nor
+row-level filtering. Tucker's $\sim 0.004$ LB advantage appears to
+be a random initialization $\times$ distillation effectiveness micro-detail
+that our current training stack cannot replicate by post-hoc
+adjustment of the loss landscape.
+
+\paragraph{Narrowed candidate space.} Three remaining avenues:
+\begin{enumerate}
+\item \emph{Multi-SED ensemble averaging} v10 (over-suppressed) + v53
+(baseline) + v11 (over-amplified). Opposing directional errors on
+the axis-2 baseline may cancel, producing a $\sim 1.0\times$ ratio
+without retraining. This is the most tractable remaining lever and
+should be tested with one LB slot.
+\item \emph{Foundation swap} to BirdNET v2.4 as a primary stream rather
+than auxiliary (the v56 test attached it post-blend with $\mathbf{0}$
+effect; primary-stream use is untested). Other foundations (Perch v3
+if released, AudioCLIP) similar.
+\item \emph{Accept the gap as structural} and shift effort to Mattia
+pipeline refinements (per-site temperature, additional rescue gates,
+site $\times$ hour conditioned thresholds) where the lever is the
+fusion logic, not the SED weights.
+\end{enumerate}
+
+This concludes the sprint Phase H. The v59 LB result (auto-submit
+$\sim 7\,$h post-sprint at UTC midnight + 3\,min) will further
+inform whether axis-2 suppression has any LB value, though the local
+v10/v11 results both falsifying suggest the answer is likely "no".

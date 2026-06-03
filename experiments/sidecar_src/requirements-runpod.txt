@@ -1,0 +1,13 @@
+numpy
+pandas
+scipy
+scikit-learn
+pyarrow
+tqdm
+pyyaml
+soundfile
+librosa
+timm
+torchmetrics
+kaggle
+

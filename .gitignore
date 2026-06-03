@@ -70,3 +70,24 @@ experiments/_scratch_logs/
 iVDFM/
 # Example/discussion external content
 example_and_discussion/
+
+# Dead 2026 experiment notebooks (redundant phase4 forks; results recorded in lb_registry.yaml).
+# The 4 key notebooks (verbatim/phase4/exp189-full/mattia-fork) stay tracked at notebooks/ top-level.
+notebooks/_archive_2026/
+
+# Auto-generated artifacts (deploy.py, q_test_runner.py)
+notebooks/**/_last_pushed_version.txt
+experiments/_audits_post_v26/q_subsets*.json
+experiments/_audits_post_v26/*_preds.npz
+experiments/_audits_post_v26/*_results.json
+
+# Session-specific audit artifacts
+experiments/_audits_post_v26/_2026_*_session/*.npz
+experiments/_audits_post_v26/_2026_*_session/*.json
+
+# External model weights (large binaries)
+external_weights/
+
+# Exceptions: config files that should be tracked despite broad rules above
+!experiments/lb_registry.yaml
+!notebooks/*/kernel-metadata.json

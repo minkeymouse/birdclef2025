@@ -1,23 +1,51 @@
 % =====================================================================
-% STATE NOTE (updated 2026-05-04):
-% This file is the formal paper draft. It now covers:
-%   - exp3-exp39, LB ladder v6-v12 (up to LB 0.929)
-%   - The four-month plateau at v33 = LB 0.932 (Sec. \ref{sec:plateau})
-%   - The public Mattia fork bringing LB to 0.941
-%     (Sec. \ref{sec:mattia-fork})
-%   - The Tucker SED training recipe: backbone distillation onto Perch
-%     with stop-gradient (Sec. \ref{sec:tucker-recipe})
-%   - Seven cognitive biases behind the plateau
-%     (Sec. \ref{sec:meta-lessons})
+% STATE NOTE (updated 2026-05-12):
+%
+% WARNING — THIS FILE IS STALE.
+% Last technical content date: 2026-05-04. Covers v3-v12 experiments only.
+% Major results from May 5-12 (recipe-pair ensemble breakthrough,
+% CLAP/MirrorRare audits, v45 = own-weights LB 0.941) are NOT here yet.
+% Do NOT cite this file as the current state of the work.
+%
+% Authoritative current state (in decreasing order of recency):
+%   1. CLAUDE.md "CURRENT STATE" — production anchor v45 = LB 0.941
+%      (recipe-pair ensemble), axis decomposition framework,
+%      untested-axis enumeration.
+%   2. paper/exp_current.tex § "2026-05-11 axis decomposition" —
+%      mechanism writeup of own-vs-public gap closure (exp175 + exp176,
+%      distill_head cos=0.55 vs whole-model cos=0.99).
+%   3. memory/project_2026_05_11_axis_decomposition.md — same mechanism.
+%   4. memory/project_2026_05_12_clap_failure.md — LAION CLAP probe SS
+%      macro AUC 0.48 (sub-random), AudioMAE-style anti-correlation
+%      caught at local validation (0 LB slots burned).
+%   5. memory/project_2026_05_12_mirrorrare_failure.md — needless090
+%      sonotype+rare-suppression has no transferable mechanism on our
+%      SED (rare baseline 0.003 vs Tucker's ≥0.05 assumed threshold).
+%   6. experiments/lb_registry.yaml — full LB record, anchor=v45.
+%
+% This file ALREADY covers (kept as-is, accurate for v3-v12):
+%   - exp3–exp39, LB ladder v6–v12 (up to LB 0.929)
+%   - The plateau at v33 = LB 0.932 (Sec. \ref{sec:plateau})
+%   - The Mattia public fork → LB 0.941 (Sec. \ref{sec:mattia-fork})
+%   - The Tucker SED training recipe (Sec. \ref{sec:tucker-recipe})
+%   - Seven cognitive biases behind the plateau (Sec. \ref{sec:meta-lessons})
 %   - Forward plan for exp169 (Sec. \ref{sec:exp169-plan})
-% Other reference files:
-%   - paper/exp_current.tex   older running notes (stops near v36)
-%   - CLAUDE.md "CURRENT STATE"  authoritative LB ladder + invariants
-%   - experiments/README.md     code-side navigation
-% Author TODO before CLEF 2026-06-17 working-note deadline: port the
-% pseudo-label circular-distillation finding (v46), the AudioMAE
-% foundation swap (v49/v50 -0.022/-0.027), and the synthetic-data
-% domain-randomisation experiments (exp154-exp156).
+%
+% TODO for CLEF 2026-06-17 working note (DEADLINE):
+%   - Port v17–v50 LB regressions (anti-correlation invariant: 10+ data points)
+%   - Port pseudo-label circular-distillation finding (v46-era, exp136b/exp142)
+%   - Port AudioMAE foundation swap (v49/v50 −0.022/−0.027)
+%   - Port synthetic-data domain randomisation (exp154–exp156)
+%   - Port the 2026-05-11 axis decomposition (v45 = own-weights LB 0.941)
+%   - Port the 2026-05-12 CLAP failure + falsifiable-foundation bar
+%     (SS macro AUC ≥0.65 + Pearson ≤0.95 with existing SED)
+%   - Port the iteration meta-pattern (1 architectural move > 60 recipe moves)
+%   - Adopt the Q/P/H/S/E thesis structure from exp_current.tex
+%     § "Thesis summary in QPHSE form"
+%
+% Until those ports are done, ANY claim in this file about "current state"
+% or "where we are now" is wrong. The file is kept for the v3-v12 sections
+% that don't need to change.
 % =====================================================================
 
 \section{Experiments}
