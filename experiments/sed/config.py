@@ -612,8 +612,8 @@ def exp188_convnext_hetero_pseudo() -> SedConfig:
 
 def exp189_tucker_external_nonaves() -> SedConfig:
     """exp189 = canonical Tucker recipe (exp175) + EXTERNAL non-Aves focal data folded into the anchor
-    cache (experiments/_data_pipelines/exp189_outputs/anchors.npz = exp169v2 + ~555 external non-Aves
-    clips from data/external). The BirdCLEF-2025 winners' KEY ingredient (external non-Aves supervision)
+    cache (experiments/_data_pipelines/exp189_outputs/anchors.npz = exp169v2 + 552 external non-Aves
+    clips from data/external, ogg+wav). The BirdCLEF-2025 winners' KEY ingredient (external non-Aves supervision)
     that this stack never used. This STRENGTHENS the SED with data — it does NOT dilute Tucker with a
     weaker model, the structural difference from the refuted exp187. BCE keeps it calibrated/blendable
     like Tucker (avoids exp187's SoftAUC logit-scale blend distortion). Site-safe checkpoint selection."""

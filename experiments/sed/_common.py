@@ -3,11 +3,13 @@
 Single source of truth for:
 - Repository root and notebook paths
 - Kaggle slug and dataset references
-- Anchor commit (LB 0.938 baseline)
+- Anchor LB baseline (production = eos8-verbatim 0.950)
 - Kaggle CLI helpers (try_submit, kernel_status, get_pushed_version)
-- Eval helpers (macro_auc) shared across audit scripts
+- Eval helpers (macro_auc)
 
-Imported by all sed/ orchestration scripts and most _audits_post_v26 audits.
+NOTE: this module + the lb_poller/lb_processor/deploy* orchestration target the LEGACY mattia-fork lineage
+(superseded by the eos8 pipeline). Kept for reference; the current deploy path is the top-level
+experiments/exp189_patch_notebook.py against eos8-phase4.
 """
 from __future__ import annotations
 import os
@@ -40,8 +42,10 @@ EXP169_SED_DATASET = "ultimatumgame/exp169-distilled-sed"
 EXP175_SED_DATASET = "ultimatumgame/bc2026-exp175-sed"
 
 # ── Anchor ────────────────────────────────────────────────────────────
-ANCHOR_COMMIT = "c4df217"  # v5 = LB 0.938 (own-weights, no konbu/Ulyanov)
-ANCHOR_LB = 0.938
+# Production never-fall-below anchor = eos8-verbatim LB 0.950 (used by lb_processor for delta classification).
+# (Legacy own-weights SED anchor was c4df217 = LB 0.938, pre-eos8 — kept for reference only.)
+ANCHOR_COMMIT = "c4df217"
+ANCHOR_LB = 0.950
 LB_NOISE_BAND = 0.002
 
 # ── Kaggle CLI helpers ────────────────────────────────────────────────

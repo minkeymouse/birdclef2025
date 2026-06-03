@@ -32,22 +32,16 @@ sed/
 ├── data.py                    # CachedDataset, PseudoDataset, TwoStreamBatchSampler
 ├── train.py                   # train_one_fold(SedConfig, fold) → ckpt; CLI w/ --config / --seed
 ├── export.py                  # ONNX export wrapper
-├── deploy.py                  # generic deploy (export → upload → notebook patch → push)
-├── deploy_exp175.py           # exp175-specific deploy (legacy)
-├── deploy_exp176.py           # exp176-specific deploy (legacy)
-├── deploy_ensemble.py         # multi-seed + multi-arch ensemble deploy (current)
-│
-│ === Orchestration (current) ===
-├── auto_deploy_ensemble.py    # Wait for ensemble chain → deploy → submit
 ├── one_shot_submit.py         # Generic submit with --version + --message
 ├── lb_poller.py               # Dump submissions CSV every 10min
-├── lb_processor.py            # Auto-fill lb_registry when new LB scores arrive
-├── memory_update.py           # Write project memory entry once results arrive
-├── paper_update.py            # Patch paper section once results arrive
-└── orch_status.py             # Single-shot orchestration status snapshot
+└── lb_processor.py            # Auto-fill lb_registry when new LB scores arrive
 ```
 
-(Q-test scripts moved to `_archive_2026_pre_sed_refactor/_post_qtest_2026_05_08/` after Q1/Q2/Q3 LB results recorded in registry.)
+> LEGACY — target the superseded mattia-fork / ensemble_v3 lineage (LB 0.938, NOT production):
+> `deploy.py` + `deploy_ensemble.py` remain at top level but are legacy; `deploy_exp175/176.py`,
+> `auto_deploy_ensemble.py`, `memory_update.py`, `paper_update.py`, `orch_status.py` are in `sed/_archive/`.
+> The CURRENT deploy path is the top-level `experiments/exp189_patch_notebook.py` (blend an external-data SED
+> into `eos8-phase4`).
 
 ## Quick reference — running things
 
@@ -109,7 +103,10 @@ uv run python -m experiments.sed.deploy_ensemble
 Pulled Tucker's published training notebook from Kaggle and confirmed:
 - All architecture, hyperparam, augmentation, optimizer, scheduler, loss settings MATCH
 - Recipe-level Tucker replication is COMPLETE
-- The 0.003 LB gap (ours 0.937 vs Tucker 0.941) is NOT in any spec hyperparam — it's random seed luck + numerical micro-detail in training run.
+- The 0.003 LB gap (ours 0.937 vs Tucker 0.941) is NOT in any spec hyperparam.
 - See `memory/project_tucker_recipe_match.md` for full audit table.
 
-The path to close the gap is multi-seed + multi-arch ensemble averaging out random seed variance.
+> ⚠ REFUTED (2026-06-03): the "multi-seed + multi-arch ensemble closes the gap" hypothesis was tested and
+> failed — ensemble_v3 (multi-seed 15 = multi-arch 10) = LB 0.938, and exp189 (a SED that actually BEAT Tucker
+> on local eval) was LB-flat. The 0.950→0.963 gap is local→LB TRANSFER (site-22 covariate shift), not seed
+> variance. See top-level `experiments/README.md` + `lb_registry.yaml`.

@@ -1,9 +1,17 @@
 # Next directions — beyond the 0.950 local optimum (2026-06-02)
 
-Deep-research synthesis from 4 parallel scout agents (Hugging Face Papers + arXiv + venue
-proceedings). Goal: find levers OUTSIDE our current local optimum (Perch v2 frozen + ProtoSSM
-+ Tucker SED → LB 0.950; public top 0.963). Deadline 2026-06-03 23:59 UTC (~2 days; one SED
-training ≈ 3 h; 5 LB submits/day → ~10 slots).
+> ⚠ HISTORICAL candidate menu, written 2026-06-02 BEFORE the final-day LB tests. Several headline claims here
+> were empirically REFUTED on 06-03 — flagged so a 2027 reader doesn't act on them:
+> - "the non-Aves bottleneck (zero Perch prototypes) is directly fixable" / "external data closes the gap":
+>   exp189 (external non-Aves data, beat Tucker on every evaluable group) was **LB-flat (0.950)**.
+> - Tier 2a "multi-teacher distill → fresh SED = highest LB-proven upside": exp187 ran exactly this →
+>   **LB 0.938 (regression)**.
+> The bottleneck is local→LB **TRANSFER** (cross-region covariate shift), not coverage/recipe. The scout-agent
+> IDs below are stale (not re-queryable). Canonical account: `covariate_shift_findings_2026_06_03.md`.
+
+Deep-research synthesis from 4 parallel literature scouts (Hugging Face Papers + arXiv + venue
+proceedings), June 2026. Goal: find levers OUTSIDE the local optimum (Perch v2 frozen + ProtoSSM
++ Tucker SED → LB 0.950; public top 0.963).
 
 Scout agent IDs (re-queryable via SendMessage for deeper follow-up):
 - Track A foundation models: `a6d0024d9167d90f1`

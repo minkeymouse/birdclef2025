@@ -1,9 +1,13 @@
 # BirdCLEF 2026 — Structural Analysis of the 0.950 Plateau
 
-_Generated 2026-06-02. Corrected multi-label parse of `train_soundscapes_labels.csv` (`primary_label` is semicolon-separated). Companion data for the CLEF working note (thesis: covariate shift in cross-region bioacoustic monitoring)._
+_Generated 2026-06-02. Corrected multi-label parse of `train_soundscapes_labels.csv` (`primary_label` is semicolon-separated). Supporting data for `covariate_shift_findings_2026_06_03.md` (the canonical working-note doc) — these are the raw source numbers; see README for read order._
+
+> Note on thresholds: this doc counts evaluable = **≥1 TP window → 75 species** on the 1478-window multi-label
+> substrate. The master doc's controlled eval uses the stricter **≥10 positives → 50 species** on its 739-window
+> aligned substrate. Both are correct (different thresholds/substrates), not a discrepancy.
 
 ## 1. Evaluability by taxonomic class
-Macro-AUC skips classes with no true positives. Of 234 species, **75 are evaluable** in the labeled soundscapes (have ≥1 TP window across 1478 windows / 66 files).
+Macro-AUC skips classes with no true positives. Of 234 species, **75 are evaluable** in the labeled soundscapes (≥1 TP window across 1478 windows / 66 files).
 
 | Class | total | evaluable | TP windows | Perch-mapped | train_audio |
 |---|---|---|---|---|---|
@@ -30,4 +34,11 @@ Every evaluable species falls into one of two already-closed buckets, under a ca
 2. **Untrainable but SED-handled** — the 25 sonotypes have no supervised data yet are scored ~0.85 AUC by the distilled SED learned from soundscape labels; improving them needs test-distribution data we lack.
 3. **Calibration trap** — the only labeled soundscape data is 65% S22 while the test is unseen S05, so label-fitted per-class corrections anti-correlate with the hidden test.
 
-This explains why independent public pipelines (EoS.9, Karnakbayev, ours) all converge to LB ≈ 0.950. Closing the gap requires the components the 2025 winner had and this line lacks (dedicated extended-species models, multi-round Noisy Student, large external pretraining) — multi-day work, not inference levers.
+This explains why independent public pipelines (EoS.9, Karnakbayev, ours) all converge to LB ≈ 0.950.
+
+> ⚠ UPDATE 2026-06-03: the "closing the gap requires the 2025-winner components (external data, multi-round
+> Noisy Student / multi-teacher distill)" hypothesis was tested and REFUTED. exp189 (external non-Aves data,
+> beat Tucker on every evaluable group) was LB-flat (0.950); exp187 (heterogeneous multi-teacher distill +
+> SoftAUC, the winner recipe) was LB 0.938. Even a strictly-better-locally SED moved the LB by 0.000 → the
+> operative ceiling is local→LB TRANSFER (this §3 calibration trap), NOT the missing data/recipe components.
+> See `covariate_shift_findings_2026_06_03.md` Findings 3–3c.

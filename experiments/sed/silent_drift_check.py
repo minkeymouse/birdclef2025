@@ -11,8 +11,9 @@ from . import config as cfg_mod
 from .tucker_spec import TUCKER
 
 ROOT = Path(__file__).resolve().parents[2]
-# Legacy SED scripts live in the pre-sed-refactor archive (since 2026-05-08).
-# Drift check still scans them so historical context is preserved.
+# NOTE: the legacy-script scan below is now DEFUNCT (this dir no longer exists; the .exists() guard makes it
+# a no-op). The LIVE drift check is the SedConfig-vs-tucker_spec diff further down — that is what matters
+# before a new SED run. Repoint DP if you reintroduce legacy training scripts.
 DP = ROOT / "experiments" / "_archive_2026_pre_sed_refactor"
 
 

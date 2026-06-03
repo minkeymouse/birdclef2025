@@ -27,7 +27,8 @@ experiments/
 ├── perch_embed_extract.py       Perch v2 ONNX embedding extraction
 ├── local_validator.py           pre-submit sanity (Δ macro-AUC vs anchor; catches NaN/shape/all-zeros)
 ├── lb_registry.yaml             EVERY LB submission (hypothesis + outcome). Single source of truth.
-├── _scratch_logs/               run logs + autonomous_2026_06_02_plan.md + SESSION_SUMMARY_2026_06_02.md
+├── _scratch_logs/               gitignored working run logs (NOT in git — deletable)
+├── _records_2026/               session logs preserved IN GIT (SESSION_SUMMARY, decision log) — survives delete
 └── _archive_2026/               2026 one-off lever scripts (emcent/ptlam/ptax2/hg/r1/rpair patches, distill
                                  pseudo builders, poll utils, probes) — kept for "what we tried" reference
 ```

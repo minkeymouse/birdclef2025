@@ -1,7 +1,7 @@
 # CLEF working-note findings — covariate shift in cross-region bioacoustic monitoring (2026-06-03)
 
 Raw, quantified material from the BirdCLEF+ 2026 effort, framed for the covariate-shift thesis. All numbers
-are from this repo's rigorous local evals + the LB. Competition deadline 06-03; paper 06-17.
+are from this repo's rigorous local evals + the LB. Competition closed 2026-06-03; paper due 2026-06-17.
 
 ## Thesis
 Cross-region passive-acoustic monitoring exhibits a **covariate shift** between the training/validation
@@ -19,7 +19,7 @@ fail to transfer. We give a clean, quantified case study.
   the scored surface barely overlap.
 
 ## Finding 2 — Site covariate shift drives the local↔LB anti-correlation
-- **68% of the labeled soundscape windows come from a single site (site-22)**; the hidden test is multi-site
+- **~65% of the labeled soundscape windows come from a single site (site-22)** (954/1478; rounded to ~two-thirds); the hidden test is multi-site
   (incl. unseen site S05). Local-validation gains concentrate on site-22 acoustics.
 - Documented anti-correlation: multiple interventions raised labeled-SS macro-AUC yet were flat/negative at LB
   (e.g. an inference mel-fix: +0.024 local → flat LB; LOSO cross-site +0.067 → LB 0.000). Site-22-fitted
@@ -76,7 +76,7 @@ deployment-distribution gain.
 The only intervention that moved the LB at all was the one that was *worse* locally (exp187), and it moved it
 **down**. Every positive local Δ — whether +0.0006 or +0.067 — produced **zero** LB movement. Under this
 cross-region covariate shift, the sign and magnitude of a local-CV change carry essentially no information about
-the test distribution. (Root cause: labeled validation is 68% one site; the test is multi-site incl. unseen
+the test distribution. (Root cause: labeled validation is ~65% one site; the test is multi-site incl. unseen
 sites — see Finding 2.)
 
 ## Finding 4 — only rank-changing operators can move a skip-empty macro-AUC; calibration is a no-op
